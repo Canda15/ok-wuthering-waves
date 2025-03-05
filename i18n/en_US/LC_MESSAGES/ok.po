@@ -21,6 +21,9 @@ msgstr ""
 msgid "Boss3"
 msgstr ""
 
+msgid "Sleep Time"
+msgstr ""
+
 msgid "Choose Forward for Dreamless, Backward for Jue"
 msgstr ""
 
