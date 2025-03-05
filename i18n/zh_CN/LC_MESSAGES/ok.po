@@ -24,6 +24,9 @@ msgstr "第2个Boss"
 msgid "Boss3"
 msgstr "第3个Boss"
 
+msgid "Sleep Time"
+msgstr "延迟T"
+
 msgid "Click Start in Game World"
 msgstr "在游戏世界点击开始"
 
