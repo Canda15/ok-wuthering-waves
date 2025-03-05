@@ -113,7 +113,7 @@ class FarmWorldBossTask(BaseCombatTask):
                             dropped = self.walk_find_echo()
                         self.incr_drop(dropped)
 
-            if count <= 2:
+            if count == 0:
                 self.log_error('Must choose at least 3 Boss to Farm', notify=True)
                 return
 
