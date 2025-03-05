@@ -280,6 +280,9 @@ class BaseCombatTask(CombatCheck):
         self.logger.debug(f'{box_name} has_cd {has_cd} {invalid_count} {number_count} {has_dot}')
         return has_cd
 
+    def get_config_option(self, key, default=None):
+    return self.config.get(key, default)
+    
     def get_current_char(self, raise_exception=True) -> BaseChar:
         for char in self.chars:
             if char and char.is_current_char:
