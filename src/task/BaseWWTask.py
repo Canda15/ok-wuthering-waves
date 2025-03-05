@@ -31,6 +31,7 @@ class BaseWWTask(BaseTask):
         self.pick_echo_config = self.get_global_config(pick_echo_config_option)
         self.monthly_card_config = self.get_global_config(monthly_card_config_option)
         self.next_monthly_card_start = 0
+        self.sleep_time = self.get_config_option("Sleep Time", default=3)
         self._logged_in = False
         self.bosses_pos = {
             'Bell-Borne Geochelone': [0, 0, False],
@@ -527,7 +528,7 @@ class BaseWWTask(BaseTask):
         step = (0.75 - y) / 6
 
         self.click_relative(x, y + step * index)
-        self.sleep(1)
+        self.sleep(self.sleep_time)
         self.log_info(f'index after scrolling down {index}')
         self.click_relative(0.89, 0.91)
         self.sleep(1)
@@ -538,7 +539,7 @@ class BaseWWTask(BaseTask):
             self.click_relative(0.92, 0.91)
             self.sleep(1)
             self.click_relative(0.68, 0.6)
-        self.wait_in_team_and_world(time_out=120)
+        self.wait_in_team_and_world(time_out=160)
         self.sleep(0.5)
 
     def openF2Book(self):
