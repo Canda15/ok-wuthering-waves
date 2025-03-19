@@ -511,7 +511,7 @@ class BaseWWTask(BaseTask):
         step = (0.75 - y) / 6
 
         self.click_relative(x, y + step * index)
-        self.sleep(1)
+        self.sleep(110)
         self.log_info(f'index after scrolling down {index}')
         self.click_relative(0.89, 0.91)
         self.sleep(1)
@@ -522,7 +522,7 @@ class BaseWWTask(BaseTask):
             self.click_relative(0.92, 0.91)
             self.sleep(1)
             self.click_relative(0.68, 0.6)
-        self.wait_in_team_and_world(time_out=120)
+        self.wait_in_team_and_world(time_out=140)
         self.sleep(0.5)
 
     def openF2Book(self):
