@@ -1,0 +1,88 @@
+name: Build launcher
+
+# 启动器（NoNo.exe）是 Tauri 编出来的 Rust 程序，PE 版本信息里写着它的产品名。
+# 上游发布的那份写的是 ok-ww，所以由我们自己用 pyappify 编一次，把名字写进去。
+#
+# 产出挂在一个固定 tag 的 release 上（目前是 launcher-1），build.yml 的
+# BASE_EXE_URL 就钉在那个地址：便携包不再自己编启动器，只下载它。
+# 需要重建时手动触发本工作流；如果换了 tag（launcher-2），记得同步改 BASE_EXE_URL。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LAUNCHER_TAG: launcher-1
+  # 钉住 pyappify 版本：启动器是发布产物的地基，不能跟着上游 master 漂移。
+  PYAPPIFY_VERSION: v1.2.4
+
+jobs:
+  launcher:
+    name: 1 · Build launcher
+    runs-on: windows-latest
+
+    steps:
+      - name: Configure runner
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the launcher executable
+        id: build
+        uses: ok-oldking/pyappify-action@master
+        with:
+          version: ${{ env.PYAPPIFY_VERSION }}
+          # 只编 exe：离线安装包已经从产物里去掉，NSIS 那几分钟纯属浪费。
+          build_exe_only: true
+
+      - name: Verify the executable carries our name
+        shell: pwsh
+        run: |
+          $exe = '${{ steps.build.outputs.exe-path }}'
+          if (-not (Test-Path $exe)) { throw "没有找到启动器产物: $exe" }
+          $info = (Get-Item $exe).VersionInfo
+          "FileDescription : $($info.FileDescription)"
+          "ProductName     : $($info.ProductName)"
+          "CompanyName     : $($info.CompanyName)"
+          "FileVersion     : $($info.FileVersion)"
+          "OriginalFilename: $($info.OriginalFilename)"
+          # 这条检查就是本工作流存在的理由：名字必须真的写进 PE,而不是只在文件名上。
+          foreach ($field in @('FileDescription', 'ProductName', 'CompanyName', 'OriginalFilename')) {
+            if ("$($info.$field)" -match 'ok-ww|ok-script') {
+              throw "PE 元数据 $field 仍是上游名字: $($info.$field)"
+            }
+          }
+
+          # 便携包那边按 <解压目录>/<exe> 的结构取用,所以这里也打成同构的 zip。
+          New-Item -ItemType Directory -Force -Path 'launcher\NoNo' | Out-Null
+          Copy-Item $exe 'launcher\NoNo\NoNo.exe'
+          Compress-Archive -Path 'launcher\NoNo' -DestinationPath 'NoNo-win32.zip' -Force
+          $hash = (Get-FileHash 'NoNo-win32.zip' -Algorithm SHA256).Hash.ToLower()
+          "$hash  NoNo-win32.zip" | Set-Content -Encoding ascii 'NoNo-win32-sha256.txt'
+          "launcher 大小: {0:N2} MB" -f ((Get-Item 'NoNo-win32.zip').Length / 1MB)
+
+      - name: Publish the launcher
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.LAUNCHER_TAG }}
+          name: Launcher
+          # 不能设为 latest:否则 /releases/latest 会解析到启动器,而不是应用版本。
+          make_latest: 'false'
+          fail_on_unmatched_files: true
+          body: |
+            NoNo 的启动器（由 pyappify ${{ env.PYAPPIFY_VERSION }} + 本仓库的 `pyappify.yml` 编译）。
+
+            `build.yml` 的 `BASE_EXE_URL` 指向这里：便携包不自带编译步骤，启动器从本 release 下载。
+            **不要删除本 release 的 `NoNo-win32.zip`**，删了下次发版会在下载启动器这一步 404。
+          files: |
+            NoNo-win32.zip
+            NoNo-win32-sha256.txt
