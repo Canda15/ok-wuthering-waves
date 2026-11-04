@@ -1,7 +1,7 @@
 {
   "package": "ok-script",
-  "version": "3.0.1",
-  "wheel_sha256": "b170babcc3cda3e0014ad02dbf890b29a32b4a52e39eddade0b03dda5c317531",
-  "tree_sha256": "34373fb3b271eed9da784e459d39c3b8c6390a44e5388366f8c7c1c53bf261ee",
-  "source_url": "https://files.pythonhosted.org/packages/50/d2/0d625e5d141dac2dc5bc7160273c1a145d1f1be7753ecf8d578a7fd6cd40/ok_script-3.0.1-py3-none-any.whl"
+  "version": "3.0.3",
+  "wheel_sha256": "0b43c31e86989c71961fe36d24d672baae8577ba864ca55a07170c9d67de30c0",
+  "tree_sha256": "14d7e1241a60d529c5cc13904ea0566df5fe3059cba40cc1bbc335afacb541ff",
+  "source_url": "https://files.pythonhosted.org/packages/bd/6e/d799bcf16b60dd4725cfa0816d152f9f0557e7e5df96fd7f7e95adcbb385/ok_script-3.0.3-py3-none-any.whl"
 }

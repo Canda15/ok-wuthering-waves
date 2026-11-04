@@ -12,9 +12,9 @@ dependencies = [
     "onnxocr-ppocrv5>=0.0.23",
     "openvino",
     "opencv-python",
-    "pyappify>=1.0.13"
+    "pyappify>=1.0.13",
     # >>> generated: vendored ok-script dependencies (scripts/sync_ok.py)
-    # 来源: ok-script 3.0.1 的 wheel 元数据,由 scripts/sync_ok.py 生成。
+    # 来源: ok-script 3.0.3 的 wheel 元数据,由 scripts/sync_ok.py 生成。
     "pywin32!=312,>=306",
     "typing-extensions>=4.11.0",
     "requests>=2.32.3",
@@ -33,6 +33,4 @@ dev = [
 ]
 docs = [
     "mkdocs-material>=9.5,<10",
-]
-web-test = [
 ]
