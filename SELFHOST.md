@@ -43,6 +43,9 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
    `task_tab_query` 在 3.0 被整体移除，全仓库无任何引用，留着就是一枚"被 import 就炸"的地雷。
 8. 新增 `selfhost/`（自有差异目录，见下节），`main.py` 在构造 `OK()` 前调用
    `selfhost.overrides.apply(config)`，`deploy.txt` 增加 `selfhost` 一行。
+9. `build.yml` 的 `package` job 不再调用 `ok-oldking/pyappify-action`，改为"下载上一次发布里的
+   启动器 → 跑一次 setup → 打成便携 zip"，并删掉 SignPath 签名与 NSIS 安装包那条链路
+   （详见"产物与构建耗时"）。
 
 ## 自有差异放在哪（重要）
 
@@ -103,10 +106,10 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 能不能在新框架下站起来、`kit.*` 的 API 有没有漂移，上游全绿也覆盖不到。红了就不推，等于把
 "合并干净、构建成功、启动 ImportError"挡在发版之前。
 
-标签必须沿用上游版本号本身（`v3.7.17`），不能加 `+xmod` 之类的后缀。约束来自打包器而不是
+标签必须沿用上游版本号本身（`v3.7.17`），不能加 `+xmod` 之类的后缀。约束来自启动器而不是
 `ok/util/version.py`：`pyappify` 认标签的正则是 `^v?\d+\.\d+\.\d+(-alpha|beta|rc\.\d+)?$`，
-`ok-ww.exe -c setup --setup-version v3.7.17+xmod` 会直接报 `Invalid setup version tag`，构建在
-打包 China profile 时失败；而客户端拉版本列表用同一个正则，带后缀的标签也进不了列表，等于自更新
+`ok-ww.exe -c setup --setup-version v3.7.17+xmod` 会直接报 `Invalid setup version tag`，便携包
+在 setup 这一步就失败；而客户端拉版本列表用同一个正则，带后缀的标签也进不了列表，等于自更新
 永远看不到新版本。所以 fork 里同名标签被改指到自己的合并提交，语义是"同一版本号 + 我们的补丁"。
 
 第 6 步的显式派发同样不是可选项：用 `GITHUB_TOKEN` 推的 tag 不会触发 push 类工作流
@@ -117,13 +120,13 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 `pyappify.yml` 的 `git_url` 指向的不是源码仓库，而是 `Canda15/ok-ww-update`——一个只含
 部署树的镜像仓库（与上游的 `ok-ww-update` 同构）。
 
-原因是打包器的行为：`pyappify-action` 会为**每一个 profile** 生成一个离线安装包，把克隆下来的
-整棵树当 NSIS 载荷塞进去（`index.js` 里的 `Processing profile: X` → `setupProfile` → `tauri bundle`）。
-我们只保留一个 profile，所以只压一次。
-直接克隆源码仓库时，光 `ok_templates/` 就有 839 MB（工作树），makensis 会报
-`Internal compiler error #12345: error mmapping datablock to ...`；同一棵树上还有 180+ 字符的
-素材文件名，让 libgit2 报 `path too long`（默认 `core.longpaths = false`，`build.yml` 的
-`package` job 仍保留了 `git config --global core.longpaths true` 作为防御）。
+原因是启动器的行为：`ok-ww.exe -c setup` 会把 `git_url` 指向的仓库**整棵克隆**到
+`data/apps/ok-ww/repo`，这棵树随后原样进了便携包。
+直接指向源码仓库时，光 `ok_templates/` 就有 839 MB（工作树）、`tests/` 124 MB，便携包会白白
+胖出近 1 GB；同一棵树上还有 180+ 字符的素材文件名，让 libgit2 报 `path too long`
+（默认 `core.longpaths = false`，`build.yml` 的 `package` job 保留了
+`git config --global core.longpaths true` 作为防御）。
+镜像仓库只有部署树，两件事一起消失。
 
 于是 `build.yml` 的 `synchronize` job 用 `ok-oldking/partial-sync-repo@master` 按 `deploy.txt`
 白名单把文件复制到镜像仓库（源里不存在的项从目标删除）、提交、把同名 tag 重新打到新提交上并强推。
@@ -135,43 +138,58 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 | 仓库 | 作用 |
 | --- | --- |
 | `Canda15/ok-wuthering-waves` | 源码、CI、tag 与 Release 产物 |
-| `Canda15/ok-ww-update` | 安装器与客户端自更新实际克隆的树（只有 `deploy.txt` 白名单内容） |
+| `Canda15/ok-ww-update` | 便携包与客户端自更新实际克隆的树（只有 `deploy.txt` 白名单内容） |
 
 `deploy.txt` 因此是"发布内容"的唯一权威：新增一个需要随包下发的目录（比如 `selfhost`），
 必须同时加进 `deploy.txt`，否则该目录不会出现在镜像里，运行时 `ImportError`。
 
-## 构建耗时（实测 v3.7.17）
+## 产物与构建耗时
 
-| 阶段 | 两个 profile（实测） | 单 profile（预估） | 说明 |
-| --- | --- | --- | --- |
-| validate（checkout / pip install / 跑测试） | 3.1 min | 3.1 min | |
-| synchronize（推镜像仓库） | 1.6 min | 1.6 min | |
-| package（复用启动器 + 打离线包） | 10.9 min | ~7.0 min | NSIS 压缩 224 MB 载荷 |
-| publish（上传 Release 资产） | 0.6 min | 0.6 min | |
-| **合计** | **16.2 min** | **~12.3 min** | |
+每次发布只有一个能用的包：
 
-更早的一版是 29.3 分钟：`package` 里含一次 9m17s 的 Tauri 冷编译，两个 profile 再各压一次 224 MB。
+| 资产 | 用途 |
+| --- | --- |
+| `ok-ww-win32-portable.zip` | 便携版，解压即用，整个目录可以直接搬走 |
+| `ok-ww-win32.zip` | 启动器（4.7 MB，里面只有 `ok-ww.exe`），同时是下一次构建的底座 |
+| `win32_sha256.txt` | 便携包的 SHA-256 |
 
-三个可调的开关：
+便携版由 `package` job 自己拼，不再经过 `ok-oldking/pyappify-action`：
+下载上一次发布里的启动器 → 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
+`ok-ww.exe -c setup -p China --setup-version <tag>` → 删掉 `cache/` 与 `data/logs/` → 打包成 zip。
 
-- `USE_RELEASE`（已开启）复用上一次发布里的 `ok-ww-win32.zip` 当启动器，省掉那 9 分多钟的
-  Rust 编译。启动器与版本号无关（版本由 pyappify 在 setup 时按 tag 生成），但它的二进制会
-  因此冻结——要重建就临时注释掉这行、跑一次 build、再恢复。
-- 只保留一个 profile（已完成，删掉了 `Global`）：少一次 NSIS 压缩、少一个 224 MB 安装包。
-  上游两个 profile 的区别只在 `git_url`（国内镜像 vs GitHub），我们两边指向同一仓库后，
-  第二个的其余字段会继承第一个，两个包行为一致，纯属重复劳动。
+之所以成立：启动器的路径全部相对自身所在目录（`utils/path.rs` 用 `current_dir`，
+`lib.rs` 启动时强制 `set_current_dir(exe_dir)`），既不写注册表也不写 `%APPDATA%`，
+NSIS 安装包只是把这个目录复制到 Program Files——那我们直接发这个目录就行。
+`pyappify.yml` 必须和 exe 放在一起：启动器在 cwd 里读它（`app.rs:198 read_embedded_app`），
+读不到就退回 pyappify 自带的默认配置，setup 会跑去克隆上游。
 
-剩下的部分是刚性的：一个离线安装包仍要把 Python 运行时、site-packages 和整个部署树压进
-NSIS，压缩时间与载荷体积成正比，不能靠缓存消掉（可缓存的部分是 pip 依赖，三个 job 的
-`actions/setup-python` 都已带 `cache: pip`）。
+| 阶段 | v3.7.17（旧流程，两个 profile） | 现在（单 profile + 便携包，待实测） |
+| --- | --- | --- |
+| validate（checkout / pip install / 跑测试） | 3.1 min | 3.1 min |
+| synchronize（推镜像仓库） | 1.6 min | 1.6 min |
+| package | 10.9 min | 预估 3~5 min |
+| publish（上传 Release 资产） | 0.6 min | 0.6 min |
+| **合计** | **16.2 min** | **预估 8~10 min** |
+
+旧流程的 `package` 里 7.7 分钟是 makensis：每个 profile 都要把 224 MB 载荷压成一个 NSIS
+离线安装包。现在没有 NSIS，剩下的成本只有 setup（克隆镜像仓库 + pip 装依赖）和一次压缩。
+更早还有一版 29.3 分钟，那时 `package` 里含一次 9m17s 的 Tauri 冷编译，启动器复用之后
+这段也不再出现。
+
+启动器二进制仍然是冻结的（一直是首次发布的那份）：它与版本号无关（版本由 setup 按 tag
+生成），但要重建就得本地跑一次 `pnpm tauri build`，或者临时把 `BASE_EXE_URL` 换成上游
+release 里的 `ok-ww-win32.zip`。
+
+能缓存的只有 pip 依赖：三个 job 的 `actions/setup-python` 都带 `cache: pip`。
+便携目录每次内容都变（版本号、源码），压缩产物没有缓存价值。
 
 ## 尚未完成
 
 - 构建参数（`pip_args`、`PYTHONOPTIMIZE`、`opencv-python-headless` 等）保持上游默认。评估过
   后两项：收益是包体/启动速度的百分比级，代价是 `requirements.txt`（上游也在改的文件）上多一条
   需要长期维护的合并覆盖规则，不划算。
-- SignPath 签名步骤仍在 `build.yml` 里，但 `SIGN_BUILD` 固定为 `'false'`，整条签名链路不会执行
-  （上游证书绑 ok-oldking 组织，自维护分支没有也不需要）。要真正的签名得换成自己的证书。
+- SignPath 相关步骤已从 `build.yml` 删除（上游证书绑 ok-oldking 组织，自维护分支没有也不需要）。
+  代价是产物未签名，首次运行时可能被 SmartScreen 提示；要签名得换成自己的证书。
 - `secrets.UPDATE_TOKEN` 是有期限的 PAT，过期后 `synchronize` job 会推不动镜像仓库、打包会失败。
   换 token 时同时更新 secret 即可，仓库里没有任何硬编码凭据。
 - fork 的 schedule 在仓库 60 天无活动后会被 GitHub 自动禁用，手动跑一次即可恢复。
