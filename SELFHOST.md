@@ -162,17 +162,22 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 NSIS 安装包只是把这个目录复制到 Program Files——那我们直接发这个目录就行。
 `pyappify.yml` 必须和 exe 放在一起：启动器在 cwd 里读它（`app.rs:198 read_embedded_app`），
 读不到就退回 pyappify 自带的默认配置，setup 会跑去克隆上游。
+启动器是 GUI 子系统的 exe，PowerShell 里必须 `Start-Process -Wait -PassThru` 再读
+`ExitCode`——用 `&` 调用不会等待，`$LASTEXITCODE` 还是空，会把失败当成功。
 
-| 阶段 | v3.7.17（旧流程，两个 profile） | 现在（单 profile + 便携包，待实测） |
+| 阶段 | v3.7.17（旧流程，两个 profile） | 现在（便携包，实测 run 41852651983） |
 | --- | --- | --- |
-| validate（checkout / pip install / 跑测试） | 3.1 min | 3.1 min |
-| synchronize（推镜像仓库） | 1.6 min | 1.6 min |
-| package | 10.9 min | 预估 3~5 min |
-| publish（上传 Release 资产） | 0.6 min | 0.6 min |
-| **合计** | **16.2 min** | **预估 8~10 min** |
+| validate（checkout / pip install / 跑测试） | 3.1 min | 2.8 min |
+| synchronize（推镜像仓库） | 1.6 min | 1.5 min |
+| package（下载启动器 / setup / 打 zip） | 10.9 min | 1.4 min |
+| publish（上传 Release 资产） | 0.6 min | 0.3 min |
+| **合计** | **16.2 min** | **6.2 min** |
 
 旧流程的 `package` 里 7.7 分钟是 makensis：每个 profile 都要把 224 MB 载荷压成一个 NSIS
-离线安装包。现在没有 NSIS，剩下的成本只有 setup（克隆镜像仓库 + pip 装依赖）和一次压缩。
+离线安装包。现在没有 NSIS，`package` 只剩三件事：下载启动器（3 秒）、跑一次 setup
+（克隆镜像仓库 + pip 装依赖 + 下载 Python 运行时）、`7z -mx=5` 压一次。
+便携目录实测 697 MB，压出来是 329 MB 的 zip；`-mx=9` 大约能再省几十 MB，但压缩时间翻倍，
+对自用不值得。
 更早还有一版 29.3 分钟，那时 `package` 里含一次 9m17s 的 Tauri 冷编译，启动器复用之后
 这段也不再出现。
 
