@@ -235,7 +235,7 @@ class AboutTab(QWidget):
             return url.strip().lower().rstrip('/') if url else ""
 
         current = normalize(get_localized_app_config(config.get('links') or {}, 'github'))
-        return [project for project in projects if normalize(project['url']) != current]
+        return []  # NoNo:自维护分支不展示框架作者的其他项目(见 selfhost/framework_patches.py)
 
     @staticmethod
     def tr_static(text):

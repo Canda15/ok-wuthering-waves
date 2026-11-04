@@ -191,7 +191,7 @@ if os.name == "nt":
     _instances: dict[int, "Win32GdiOverlay"] = {}
     _class_lock = threading.Lock()
     _class_registered = False
-    _window_class_name = "ok-script.Win32GdiOverlay"
+    _window_class_name = "OverlayWindow"
 
 
 def _rgb(red, green, blue):

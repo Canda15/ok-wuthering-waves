@@ -51,6 +51,10 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
     ——`gui_title`、两个日志文件名、`links`、`update_pyappify`——全部在 `overrides.apply_branding()`
     里改，不改上游 `config.py`。`deploy.txt` 里那行 `ok-ww.exe` 是上游残留（根目录没有该文件），
     一并删掉。
+11. `selfhost/framework_patches.py`：`ok/` 源码里有几处字符串改 config 根本来不及（通知的
+    AppUserModelID 在构造时就被交给 Windows，窗口类名在 `RegisterClass` 时写进内核），
+    只能改源码。它们是"补丁清单"而不是手改：`sync_ok.py` 每次替换完 `ok/` 会自动重放，
+    并在算 pin 哈希之前施加，所以补丁丢失会被 `--check` 与冒烟测试同时发现。
 
 ## 自有差异放在哪（重要）
 
@@ -59,13 +63,21 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 `git merge upstream/<tag>` 不会在这里产生任何冲突；反之，往 `config.py` 里插三行，
 上游每改一次该文件我们就要手工解一次冲突。
 
+`selfhost/` 现在是三件东西：
+
+| 文件 | 作用 | 何时生效 |
+| --- | --- | --- |
+| `overrides.py` | 运行时改 config dict：把上游取消注册的两个页面加回 `custom_tabs`，并改品牌项 | `main.py` 里 `OK(config)` 之前 |
+| `framework_patches.py` | vendored `ok/` 源码的文字补丁清单（品牌标识） | `scripts/sync_ok.py` 每次内联时 |
+| `ok_pin.json` | 框架版本与两个哈希的权威来源 | 同步 / 校验时 |
+
 当前 `selfhost/overrides.py` 负责把上游取消注册的两个页面（角色代码、多账号配置）加回
 `config['custom_tabs']`。时序上必须在 `OK(config)` 之前——`OK.__init__` 按引用保存这个
 dict，`MainWindow` 读的是同一个对象。
 
-`tests/TestSelfhostSmoke.py` 是为这个补丁面准备的三条冒烟断言（框架 import 链、注册键仍被
-`MainWindow` 消费、两个页面能在 offscreen 下实例化）。上游每次发版后由 CI 执行，红了就不许
-合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
+`tests/TestSelfhostSmoke.py` 是为这个补丁面准备的五条冒烟断言（框架 import 链、注册键仍被
+`MainWindow` 消费、两个页面能在 offscreen 下实例化、品牌 override 生效、源码补丁已施加）。
+上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
 
 ## 不许做的事
 
@@ -85,11 +97,15 @@ python scripts/sync_ok.py --dry-run  # 只看差异
 python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 ```
 
-`sync_ok.py` 做五件事，替代了原先的手工步骤：按 pin 从 PyPI 取 wheel、核对 SHA-256 与 pin 一致
+`sync_ok.py` 做六件事，替代了原先的手工步骤：按 pin 从 PyPI 取 wheel、核对 SHA-256 与 pin 一致
 （不一致直接中止，这是供应链断点）、把 wheel 内的 `ok/` **整树替换**（不是逐文件覆盖，否则上游删掉的
-模块会以旧文件形式残留）、按 wheel METADATA 重写 `pyproject.toml` 的依赖生成块、更新 pin。
+模块会以旧文件形式残留）、按 `selfhost/framework_patches.py` 重新施加品牌补丁、按 wheel METADATA
+重写 `pyproject.toml` 的依赖生成块、更新 pin。
 
-手改了 `ok/` 里的某个文件时，`--check` 会红。这不等于是错误，但要求把新哈希登记回 pin，
+补丁清单里的原文在新版本里找不到（或出现多次）时，同步会直接失败并要求人工核对：
+宁可停下来，也不要静默地少打一个补丁——那种情况没有任何报错，只是名字又回来了。
+
+手改了 `ok/` 里别的文件时，`--check` 会红。这不等于是错误，但要求把新哈希登记回 pin，
 免得下次同步把改动悄悄覆盖掉。
 
 ## 上游发版后由 CI 接手
@@ -220,8 +236,11 @@ release 里的 `ok-ww-win32.zip`。
 
 - **exe 内嵌的 PE 版本信息**（文件属性/任务管理器里的"ok-ww"）由 Rust 启动器编译时写入，
   要改必须重建启动器，收益远小于代价。
-- **通知 app_id 前缀** `ok-script.`（`ok/notification/system.py:84`）与进程名
-  `ok-script-*.pid` 在 `ok/` 框架里硬编码，改它们就得动内联框架并登记。
+- **通知 app_id 前缀** `ok-script.`、通知/叠层窗口的 Win32 类名、`%TEMP%` 下的
+  `ok-script-*.pid`、计划任务 XML 的作者、邮件通知的默认主题：这些都在 `ok/` 框架里硬编码，
+  已由 `selfhost/framework_patches.py` 改成中性名或 `NoNo`（见上文"落地改动"第 11 条）。
+  刻意不动的只剩"只在本机自己看得到"的那几个：日志首行的 `ok-script init ...`、MCP 服务名、
+  skills 的 `ok-script://` scheme。
 - 关于页"其他项目"列表（`ok/ui/qt/about/AboutTab.py:212-232`）是框架硬编码的，其中仍列有
   上游项目——属于对原作者的署名，保留。
 - `pyproject.toml` / `setup.py` 的分发名、README 与 docs、i18n（所有 `.po`/`.mo` 里没有

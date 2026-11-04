@@ -10,6 +10,11 @@
 生成块:内联之后 ok-script 不再是 pip 的解析来源,少写一条依赖不会报错,
 只会等到某个功能跑起来才炸。
 
+替换之后会把 selfhost/framework_patches.py 里的品牌补丁重新施加一遍:那里面
+是"必须改在源码里、改 config 来不及"的字符串(通知 app_id、窗口类名等)。
+补丁在计算 pin 哈希之前施加,所以 ok/ 的 tree_sha256 描述的是"打完补丁的树",
+补丁丢失会被 --check 立刻发现。
+
 用法:
     python scripts/sync_ok.py              # 按 selfhost/ok_pin.json 同步
     python scripts/sync_ok.py --dry-run    # 只报告差异,不落盘
@@ -39,6 +44,9 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# 补丁清单住在 selfhost/ 里(与运行时配置覆盖同目录),脚本只是施加者。
+sys.path.insert(0, str(REPO_ROOT))
+from selfhost import framework_patches  # noqa: E402  (必须在 REPO_ROOT 之后)
 OK_DIR = REPO_ROOT / "ok"
 PIN_FILE = REPO_ROOT / "selfhost" / "ok_pin.json"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
@@ -320,6 +328,13 @@ def do_check() -> int:
     if not OK_DIR.is_dir():
         print("ok/ 不存在,先运行同步")
         return 1
+    absent = framework_patches.missing(OK_DIR)
+    if absent:
+        print("这些源码补丁没有生效(ok/ 被手改或未重新施加):")
+        for rel in absent:
+            print(f"  ok/{rel}")
+        print("跑一次 python scripts/sync_ok.py 会重新施加。")
+        return 1
     actual = tree_digest(hash_tree(OK_DIR))
     expected = pin.get("tree_sha256", "")
     if actual != expected:
@@ -355,6 +370,8 @@ def do_sync(version_override: str | None, dry_run: bool) -> int:
         wheel_path.write_bytes(payload)
 
         package_root = extract_ok_package(wheel_path, staging / "unpacked")
+        applied, already = framework_patches.apply_to(package_root)
+        print(f"  源码补丁: 新施加 {len(applied)} 处,已生效 {len(already)} 处")
         incoming = hash_tree(package_root)
         current = hash_tree(OK_DIR) if OK_DIR.is_dir() else {}
 

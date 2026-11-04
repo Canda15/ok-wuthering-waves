@@ -81,7 +81,7 @@ class WindowsSystemNotifier:
     def __init__(self, app_name="ok-script", app_icon=None):
         self.app_name = str(app_name or "ok-script")
         self.app_icon = self._resolve_icon(app_icon)
-        self.app_id = "ok-script." + re.sub(r"[^A-Za-z0-9._-]+", ".", self.app_name).strip(".")
+        self.app_id = re.sub(r"[^A-Za-z0-9._-]+", ".", self.app_name).strip(".")
         self._ready = threading.Event()
         self._closed = False
         self._hwnd = 0
@@ -136,7 +136,7 @@ class WindowsSystemNotifier:
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(self.app_id)
             except (AttributeError, OSError):
                 pass
-            class_name = f"ok-script.SystemNotifier.{id(self)}"
+            class_name = f"{self.app_id}.SystemNotifier.{id(self)}"
 
             def on_destroy(_hwnd, _message, _wparam, _lparam):
                 win32gui.PostQuitMessage(0)

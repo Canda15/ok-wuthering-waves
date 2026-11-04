@@ -313,7 +313,7 @@ def check_mutex(wait_time=5, kill_wait_time=3, gui=False):
     path = os.getcwd()
     # Try to create a named mutex
     mutex_name = hashlib.md5(path.encode()).hexdigest()
-    owner_file = os.path.join(tempfile.gettempdir(), f'ok-script-{mutex_name}.pid')
+    owner_file = os.path.join(tempfile.gettempdir(), f'{mutex_name}.pid')
     mutex = _CreateMutex(0, False, mutex_name)
     if not mutex:
         raise ctypes.WinError()

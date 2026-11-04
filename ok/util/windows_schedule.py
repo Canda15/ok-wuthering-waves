@@ -1234,7 +1234,7 @@ class WindowsScheduleManager:
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>2024-01-01T00:00:00</Date>
-    <Author>ok-script</Author>
+    <Author>NoNo</Author>
     <Description>{description}</Description>
   </RegistrationInfo>
   <Triggers>

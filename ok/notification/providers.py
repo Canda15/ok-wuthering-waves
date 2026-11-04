@@ -185,7 +185,7 @@ class SmtpProvider:
             return False
 
         msg = EmailMessage()
-        msg['Subject'] = str(title or 'ok-script Notification')
+        msg['Subject'] = str(title or 'NoNo Notification')
         msg['From'] = str(sender or self.default_sender)
         msg['To'] = self.default_recipient
         msg.set_content(str(message or ''))

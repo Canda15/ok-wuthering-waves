@@ -1,9 +1,10 @@
 """守住 selfhost 补丁面的最小冒烟集。
 
-上游的测试覆盖的是"没有我们补丁"的树,测不到三件事:随 pin 重新内联的 ok/
+上游的测试覆盖的是"没有我们补丁"的树,测不到四件事:随 pin 重新内联的 ok/
 是否还认这些 API、被我们重新注册的两个页面是否还能实例化、改名相关的 override
-是否还压得住上游的默认值。四条断言、几十秒,由 .github/workflows/sync-upstream.yml
-在每次自动合并后执行——它是整套自动同步唯一的闸门,红了就不许推送。
+是否还压得住上游的默认值、以及施加在 ok/ 源码里的品牌补丁是否还在。
+五条断言、几十秒,由 .github/workflows/sync-upstream.yml 在每次自动合并后执行
+——它是整套自动同步唯一的闸门,红了就不许推送。
 """
 
 import inspect
@@ -81,6 +82,16 @@ class TestSelfhostSmoke(unittest.TestCase):
         declared = re.search(r'^name:\s*"?([^"\n]+)"?', pyappify, re.MULTILINE)
         self.assertIsNotNone(declared, 'pyappify.yml 里找不到 name 字段')
         self.assertEqual(declared.group(1).strip('"'), APP_NAME)
+
+    def test_framework_branding_patches_are_applied(self):
+        """ok/ 每次发版都会被整树替换,补丁只可能靠 sync_ok.py 重新施加。
+
+        补丁丢了的后果是"品牌标识悄悄回来了",没有任何运行时错误,所以只能在这里拦。
+        """
+        from selfhost import framework_patches
+        repo_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(framework_patches.missing(repo_root / 'ok'), [],
+                         'ok/ 里的品牌补丁没生效,跑一次 python scripts/sync_ok.py')
 
     def test_registered_tabs_instantiate_against_current_framework(self):
         """页面能实例化,才说明框架契约(name/icon/add_after_default_tabs)没变。"""
