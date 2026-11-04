@@ -119,6 +119,7 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 
 原因是打包器的行为：`pyappify-action` 会为**每一个 profile** 生成一个离线安装包，把克隆下来的
 整棵树当 NSIS 载荷塞进去（`index.js` 里的 `Processing profile: X` → `setupProfile` → `tauri bundle`）。
+我们只保留一个 profile，所以只压一次。
 直接克隆源码仓库时，光 `ok_templates/` 就有 839 MB（工作树），makensis 会报
 `Internal compiler error #12345: error mmapping datablock to ...`；同一棵树上还有 180+ 字符的
 素材文件名，让 libgit2 报 `path too long`（默认 `core.longpaths = false`，`build.yml` 的
@@ -141,30 +142,34 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 
 ## 构建耗时（实测 v3.7.17）
 
-一次发布 29 分钟，其中 22.7 分钟集中在 `package` job 的 `Build portable executable` 一步：
+| 阶段 | 两个 profile（实测） | 单 profile（预估） | 说明 |
+| --- | --- | --- | --- |
+| validate（checkout / pip install / 跑测试） | 3.1 min | 3.1 min | |
+| synchronize（推镜像仓库） | 1.6 min | 1.6 min | |
+| package（复用启动器 + 打离线包） | 10.9 min | ~7.0 min | NSIS 压缩 224 MB 载荷 |
+| publish（上传 Release 资产） | 0.6 min | 0.6 min | |
+| **合计** | **16.2 min** | **~12.3 min** | |
 
-| 阶段 | 耗时 | 原因 |
-| --- | --- | --- |
-| validate（checkout / pip install / 跑测试） | 2.5 min | |
-| synchronize（推镜像仓库） | 1.2 min | |
-| pnpm install + cargo 编译 Tauri 启动器 | ~12 min（编译本体 9m17s） | 全新 runner 没有 cargo 缓存，每次都冷编译 |
-| China profile 打包 | 5.6 min | NSIS 压缩 224 MB 载荷 |
-| Global profile 打包 | 6.2 min | 同上，两个 profile 各压一次 |
-| publish（上传 Release 资产） | 1.0 min | |
+更早的一版是 29.3 分钟：`package` 里含一次 9m17s 的 Tauri 冷编译，两个 profile 再各压一次 224 MB。
 
-两个可调的开关：
+三个可调的开关：
 
 - `USE_RELEASE`（已开启）复用上一次发布里的 `ok-ww-win32.zip` 当启动器，省掉那 9 分多钟的
   Rust 编译。启动器与版本号无关（版本由 pyappify 在 setup 时按 tag 生成），但它的二进制会
   因此冻结——要重建就临时注释掉这行、跑一次 build、再恢复。
-- 只保留一个 profile 可以再省 ~6 分钟（少打一个 224 MB 安装包），代价是少一种安装包。
+- 只保留一个 profile（已完成，删掉了 `Global`）：少一次 NSIS 压缩、少一个 224 MB 安装包。
+  上游两个 profile 的区别只在 `git_url`（国内镜像 vs GitHub），我们两边指向同一仓库后，
+  第二个的其余字段会继承第一个，两个包行为一致，纯属重复劳动。
 
-剩下的部分是刚性的：两个 profile 的离线安装包各自要把 Python 运行时、site-packages 和整个
-部署树压进 NSIS，压缩时间与载荷体积成正比，不能靠缓存消掉。
+剩下的部分是刚性的：一个离线安装包仍要把 Python 运行时、site-packages 和整个部署树压进
+NSIS，压缩时间与载荷体积成正比，不能靠缓存消掉（可缓存的部分是 pip 依赖，三个 job 的
+`actions/setup-python` 都已带 `cache: pip`）。
 
 ## 尚未完成
 
-- 本机构建/编译参数（`pip_args`、`PYTHONOPTIMIZE` 等）目前保持上游默认，可后续按需加到 profile 里。
+- 构建参数（`pip_args`、`PYTHONOPTIMIZE`、`opencv-python-headless` 等）保持上游默认。评估过
+  后两项：收益是包体/启动速度的百分比级，代价是 `requirements.txt`（上游也在改的文件）上多一条
+  需要长期维护的合并覆盖规则，不划算。
 - SignPath 签名步骤仍在 `build.yml` 里，但 `SIGN_BUILD` 固定为 `'false'`，整条签名链路不会执行
   （上游证书绑 ok-oldking 组织，自维护分支没有也不需要）。要真正的签名得换成自己的证书。
 - `secrets.UPDATE_TOKEN` 是有期限的 PAT，过期后 `synchronize` job 会推不动镜像仓库、打包会失败。

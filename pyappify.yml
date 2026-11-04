@@ -4,11 +4,21 @@ icon: "icons/icon.png"
 website: "http://ok-script.com/ok-ww"
 
 profiles:
-  # 自维护分支:两个 profile 都指向自己的更新仓库 ok-ww-update,不再从上游
+  # 自维护分支:只保留一个 profile,指向自己的更新仓库 ok-ww-update,不再从上游
   # 更新通道拉取。该仓库只有部署树(deploy.txt 白名单,发版时由 build.yml 的
   # partial-sync-repo 步骤推送),不含 ok_templates/tests 等开发素材。
   # 不能直接指向源码仓库:打包器会把被克隆的整棵树塞进 NSIS 离线安装包
   # (ok_templates 单个目录就 839 MB),makensis 会因体积超限失败。
+  #
+  # 上游有 China / Global 两个 profile,区别原本只在 git_url 指向国内镜像还是
+  # GitHub。我们把两边都指向同一个镜像仓库后,第二个 profile 的其余字段会通过
+  # pyappify 的 apply_profile_inheritance() 全部继承自第一个(见 pyappify 的
+  # src-tauri/src/app.rs),也就是两个安装包行为一致、只是同一份 224 MB 载荷被
+  # NSIS 压了两遍,每次构建多花约 4 分钟。单机自用只需要一份,故删掉 Global。
+  #
+  # 名字保留 "China" 是为了兼容已有安装(profile 名会写进安装目录与
+  # PYAPPIFY_APP_PROFILE,改名会让老安装回落到 default)。默认 profile 就是
+  # 列表里的第一个。
   - name: "China"
     git_url: "https://github.com/Canda15/ok-ww-update.git"
     admin: true
@@ -19,10 +29,3 @@ profiles:
     pip_args: "--no-deps"
     show_add_defender: true
     # PYTHONPATH: "your/default/path" # Optional, will be "" if missing
-
-  - name: "Global"
-    git_url: "https://github.com/Canda15/ok-ww-update.git"
-    main_script: "main.py"
-    requirements: "requirements.txt"
-
-
