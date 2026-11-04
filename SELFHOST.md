@@ -1,6 +1,6 @@
 # 自维护单仓说明
 
-本仓库是 ok-ww 的自用分支。与上游最大的差别：**框架库 ok-script 不再作为 PyPI 依赖，而是以源码形式内联在 `./ok`**。
+本仓库是 ok-ww 的自用分支，对外名字已改为 **NoNo**。与上游最大的差别：**框架库 ok-script 不再作为 PyPI 依赖，而是以源码形式内联在 `./ok`**。
 
 ## 为什么改成内联
 
@@ -46,6 +46,11 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 9. `build.yml` 的 `package` job 不再调用 `ok-oldking/pyappify-action`，改为"下载上一次发布里的
    启动器 → 跑一次 setup → 打成便携 zip"，并删掉 SignPath 签名与 NSIS 安装包那条链路
    （详见"产物与构建耗时"）。
+10. 改名成 NoNo：`pyappify.yml` 的 `name`（决定 exe 名、解压目录、`data/apps/<name>`、资产名）
+    与 `selfhost/overrides.py` 的 `APP_NAME`（决定窗口标题等）必须一致。config 侧的品牌项
+    ——`gui_title`、两个日志文件名、`links`、`update_pyappify`——全部在 `overrides.apply_branding()`
+    里改，不改上游 `config.py`。`deploy.txt` 里那行 `ok-ww.exe` 是上游残留（根目录没有该文件），
+    一并删掉。
 
 ## 自有差异放在哪（重要）
 
@@ -121,7 +126,7 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 部署树的镜像仓库（与上游的 `ok-ww-update` 同构）。
 
 原因是启动器的行为：`ok-ww.exe -c setup` 会把 `git_url` 指向的仓库**整棵克隆**到
-`data/apps/ok-ww/repo`，这棵树随后原样进了便携包。
+`data/apps/NoNo/repo`，这棵树随后原样进了便携包。
 直接指向源码仓库时，光 `ok_templates/` 就有 839 MB（工作树）、`tests/` 124 MB，便携包会白白
 胖出近 1 GB；同一棵树上还有 180+ 字符的素材文件名，让 libgit2 报 `path too long`
 （默认 `core.longpaths = false`，`build.yml` 的 `package` job 保留了
@@ -149,13 +154,19 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 
 | 资产 | 用途 |
 | --- | --- |
-| `ok-ww-win32-portable.zip` | 便携版，解压即用，整个目录可以直接搬走 |
-| `ok-ww-win32.zip` | 启动器（4.7 MB，里面只有 `ok-ww.exe`），同时是下一次构建的底座 |
-| `win32_sha256.txt` | 便携包的 SHA-256 |
+| `NoNo-win32-portable.zip` | 便携版，解压即用，整个目录可以直接搬走 |
+| `NoNo-win32-sha256.txt` | 便携包的 SHA-256 |
+| `ok-ww-win32.zip` | **不再是产物**：只留在 v3.7.17 那次 release 里，被 `env.BASE_EXE_URL` 钉住当启动器来源 |
 
 便携版由 `package` job 自己拼，不再经过 `ok-oldking/pyappify-action`：
-下载上一次发布里的启动器 → 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
-`ok-ww.exe -c setup -p China --setup-version <tag>` → 删掉 `cache/` 与 `data/logs/` → 打包成 zip。
+下载启动器（改名为 `NoNo.exe`）→ 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
+`NoNo.exe -c setup -p China --setup-version <tag>` → 删掉 `cache/` 与 `data/logs/` → 打包成 zip。
+启动器不自我重命名（Rust 侧只用 `current_exe()` 重启自己），所以改文件名是安全的；
+而 `data/apps/<name>` 那个目录名来自 `pyappify.yml`，与文件名无关。
+
+`BASE_EXE_URL` 钉死在 `v3.7.17` 而不是 `latest`：改名后发布页上的资产都叫 `NoNo-*`，唯一的
+`ok-ww-win32.zip` 只存在于那次 release，用 `latest` 会 404。代价是这个 4.7 MB 启动器从此不随
+构建更新（它不含应用逻辑，版本号由 setup 按 tag 生成），**但那份资产绝对不能删**。
 
 之所以成立：启动器的路径全部相对自身所在目录（`utils/path.rs` 用 `current_dir`，
 `lib.rs` 启动时强制 `set_current_dir(exe_dir)`），既不写注册表也不写 `%APPDATA%`，
@@ -198,6 +209,29 @@ release 里的 `ok-ww-win32.zip`。
 - `secrets.UPDATE_TOKEN` 是有期限的 PAT，过期后 `synchronize` job 会推不动镜像仓库、打包会失败。
   换 token 时同时更新 secret 即可，仓库里没有任何硬编码凭据。
 - fork 的 schedule 在仓库 60 天无活动后会被 GitHub 自动禁用，手动跑一次即可恢复。
+
+## 改名的边界
+
+改的是"程序自己报出的名字"：exe 文件名、解压目录、窗口标题与任务栏、关于页标题、
+日志文件名、通知名、计划任务文件夹（`\NoNo`）、诊断包名、发布资产名。
+
+改不了或刻意不改的：
+
+- **exe 内嵌的 PE 版本信息**（文件属性/任务管理器里的"ok-ww"）由 Rust 启动器编译时写入，
+  要改必须重建启动器，收益远小于代价。
+- **通知 app_id 前缀** `ok-script.`（`ok/notification/system.py:84`）与进程名
+  `ok-script-*.pid` 在 `ok/` 框架里硬编码，改它们就得动内联框架并登记。
+- 关于页"其他项目"列表（`ok/ui/qt/about/AboutTab.py:212-232`）是框架硬编码的，其中仍列有
+  上游项目——属于对原作者的署名，保留。
+- `pyproject.toml` / `setup.py` 的分发名、README 与 docs、i18n（所有 `.po`/`.mo` 里没有
+  `OK-WW` 这个 msgid，窗口名来自 config，所以不用重编翻译）。
+
+对新旧安装的影响：
+
+- 旧目录（`ok-ww/`）不会被改名，它读自己那份 `pyappify.yml`，更新照旧走镜像仓库的 tag；
+  想迁到新名字就下载新的便携包，把旧目录的 `configs/` 拷进新的 `NoNo/configs/`。
+- 首次用新名字启动是一次全新 setup（`data/apps/NoNo` 重新克隆 + 装依赖），几分钟，一次性。
+- 计划任务文件夹从 `\OK-WW` 变成 `\NoNo`：改名前的定时任务不会自动迁移，需要在界面里重建。
 
 ## 许可
 

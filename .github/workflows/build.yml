@@ -22,12 +22,17 @@ env:
   PYTHON_VERSION: '3.12'
   PYTHONIOENCODING: 'UTF-8'
   PYTHONLEGACYWINDOWSSTDIO: 'UTF-8'
-  # 便携产物的底座:上一次发布里的启动器(4.7 MB,里面只有一个 ok-ww.exe)。
+  # 便携产物的底座:一个 pyappify 启动器(4.7 MB,解压后只有一个 exe)。
   # 我们不再用 ok-oldking/pyappify-action——它每次都先用 cargo 重新编译 Tauri
   # 启动器(9m17s),再用 makensis 把整棵树压成 NSIS 安装包(两遍,共约 8 分钟)。
   # 便携版不需要 NSIS:启动器的所有路径都相对自身所在目录,setup 出来的目录
   # 本身就是便携版(详见 package job 的注释)。
-  BASE_EXE_URL: 'https://github.com/Canda15/ok-wuthering-waves/releases/latest/download/ok-ww-win32.zip'
+  #
+  # 这里钉死到具体 tag 而不是 /latest/:改名后发布页上的资产叫 NoNo-*,而唯一的
+  # ok-ww-win32.zip 只存在于 v3.7.17 那次发布里,用 latest 会 404。改名的代价就是
+  # 这个 4.7 MB 的启动器从此不会随构建更新(启动器本身不含应用逻辑,冻结无害)。
+  # 注意:那份资产不能删,删了构建立刻断。
+  BASE_EXE_URL: 'https://github.com/Canda15/ok-wuthering-waves/releases/download/v3.7.17/ok-ww-win32.zip'
 
 jobs:
   validate:
@@ -214,11 +219,8 @@ jobs:
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'base-launcher.zip'
           Invoke-WebRequest -Uri $env:BASE_EXE_URL -OutFile $archive
-          # zip 里只有一个 ok-ww/ok-ww.exe
+          # zip 里只有一个 ok-ww/ok-ww.exe(上游包装时的目录名,与本仓库无关)
           Expand-Archive -LiteralPath $archive -DestinationPath 'pyappify_dist' -Force
-          # 原样留一份当本次发布的资产:发布页上的 ok-ww-win32.zip 就是下次构建
-          # BASE_EXE_URL 的来源,少传它下一次构建会 404。
-          Copy-Item $archive 'pyappify_dist\ok-ww-win32.zip'
           Get-ChildItem 'pyappify_dist' -Recurse | Select-Object FullName, Length
 
       - name: Build portable bundle
@@ -226,9 +228,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $bundle = 'pyappify_dist\ok-ww-portable'
+          $bundle = 'pyappify_dist\NoNo'
           New-Item -ItemType Directory -Force $bundle | Out-Null
-          Copy-Item 'pyappify_dist\ok-ww\ok-ww.exe' $bundle
+          # 启动器不自我重命名(pyappify 的 Rust 侧只用 current_exe 重启自己),
+          # 所以这里把 exe 改成与 pyappify.yml 的 name 一致的文件名;
+          # data/apps/<name> 那个目录名由 pyappify.yml 决定,不依赖文件名。
+          Copy-Item 'pyappify_dist\ok-ww\ok-ww.exe' (Join-Path $bundle 'NoNo.exe')
 
           # 启动器在 cwd 读 pyappify.yml(app.rs:198 read_embedded_app),读不到就
           # 退回 pyappify 自带的默认配置——那样既没有我们的 profile 也没有镜像仓库
@@ -240,7 +245,7 @@ jobs:
           # 于是"假装成功了"。必须 Start-Process -Wait 并读 ExitCode。
           $stdout = Join-Path $env:RUNNER_TEMP 'setup.stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'setup.stderr.log'
-          $launcher = Join-Path $bundle 'ok-ww.exe'
+          $launcher = Join-Path $bundle 'NoNo.exe'
           $setupArgs = @('-c', 'setup', '-p', 'China', '--setup-version', $env:RELEASE_TAG)
           $process = Start-Process -FilePath $launcher -ArgumentList $setupArgs `
             -WorkingDirectory $bundle -Wait -PassThru -NoNewWindow `
@@ -250,7 +255,8 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "启动器 setup 失败,退出码 $($process.ExitCode)" }
 
           # data\apps\<name>\repo 就是部署树;没有它说明 setup 没真正跑完。
-          $repo = Join-Path $bundle 'data\apps\ok-ww\repo'
+          # <name> 来自 pyappify.yml,改名后要与它保持一致。
+          $repo = Join-Path $bundle 'data\apps\NoNo\repo'
           if (-not (Test-Path (Join-Path $repo 'main.py'))) { throw "setup 结束但 $repo\main.py 不存在" }
 
           # pip 缓存和运行日志是运行期产物:pip 缓存动辄上百 MB,不随包分发。
@@ -267,27 +273,28 @@ jobs:
         run: |
           Push-Location 'pyappify_dist'
           try {
-            $zip = 'ok-ww-win32-portable.zip'
+            $zip = 'NoNo-win32-portable.zip'
             $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
             if (Test-Path $sevenZip) {
               # 7z 比 Compress-Archive 快一个数量级(便携目录有几万个文件),
               # 压缩率也更好。这里用标准 zip 容器,Windows 资源管理器可直接解压。
-              & $sevenZip a -tzip -mx=5 -bsp1 $zip 'ok-ww-portable'
+              & $sevenZip a -tzip -mx=5 -bsp1 $zip 'NoNo'
               if ($LASTEXITCODE -ne 0) { throw "7z 打包失败,退出码 $LASTEXITCODE" }
             } else {
-              Compress-Archive -Path 'ok-ww-portable' -DestinationPath $zip -CompressionLevel Optimal
+              Compress-Archive -Path 'NoNo' -DestinationPath $zip -CompressionLevel Optimal
             }
           } finally {
             Pop-Location
           }
 
-          # 只留发布要用的三样:便携包、启动器、校验文件。
-          Remove-Item 'pyappify_dist\ok-ww-portable' -Recurse -Force
+          # 只留发布要用的两样:便携包与校验文件(启动器不再随发布分发,
+          # 它的来源是 env.BASE_EXE_URL 钉住的那份固定资产)。
+          Remove-Item 'pyappify_dist\NoNo' -Recurse -Force
           Remove-Item 'pyappify_dist\ok-ww' -Recurse -Force
 
-          $file = 'ok-ww-win32-portable.zip'
+          $file = 'NoNo-win32-portable.zip'
           $hash = (Get-FileHash "pyappify_dist\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $file" | Set-Content 'pyappify_dist\win32_sha256.txt' -Encoding ascii
+          "$hash  $file" | Set-Content 'pyappify_dist\NoNo-win32-sha256.txt' -Encoding ascii
           Get-ChildItem 'pyappify_dist' | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
 
       - name: Stage release assets
@@ -324,7 +331,7 @@ jobs:
             ### 更新日志 ${{ needs.synchronize.outputs.start_tag }} -> ${{ needs.synchronize.outputs.end_tag }}:
               ${{ needs.synchronize.outputs.changes }}
             ### 便携版
-              下载 `ok-ww-win32-portable.zip`,解压到任意目录后双击 `ok-ww.exe`。
+              下载 `NoNo-win32-portable.zip`,解压到任意目录后双击 `NoNo\NoNo.exe`。
               Python 运行时、依赖、脚本、配置和日志都在解压出来的目录里,
               整个目录可以直接搬走或做备份,不需要安装。
             ### Install from source

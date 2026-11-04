@@ -19,6 +19,10 @@ from ok import Logger
 
 logger = Logger.get_logger(__name__)
 
+# 对外只用一个名字,必须与 pyappify.yml 的 name 一致:那个决定 exe 名与解压
+# 目录名,这个决定窗口标题。两边不一致时用户会看到"程序叫 NoNo、目录叫别的"。
+APP_NAME = "NoNo"
+
 # 顺序即侧边栏顺序,与上游删除前的注册顺序保持一致。
 CUSTOM_TABS = (
     ("src.gui.CharacterCodeTab", "CharacterCodeTab"),
@@ -33,6 +37,35 @@ def apply(config):
     引用,MainWindow 读的是同一个对象,所以必须在 ``OK(config)`` 构造之前调用,
     构造之后再改就不会生效了。
     """
+    apply_branding(config)
+    return apply_custom_tabs(config)
+
+
+def apply_branding(config):
+    """改写所有由 config 决定的对外名字,并关掉会指回上游的两处运行时行为。
+
+    gui_title 是品牌信息的源头:窗口标题与任务栏名(ok/__init__.py:326-328)、
+    关于页大标题(ok/ui/qt/about/AboutTab.py:180)、通知 app_id
+    (ok/notification/system.py:84)、诊断包名(ok/ui/qt/shell/diagnostics.py:43)、
+    计划任务文件夹 ``\\<gui_title>``(ok/util/windows_schedule.py:319-320)。
+    """
+    config["gui_title"] = APP_NAME
+    config["log_file"] = f"logs/{APP_NAME}.log"
+    config["error_log_file"] = f"logs/{APP_NAME}_error.log"
+
+    # 必须删:ok/ui/qt/MainWindow.py:495-501 在窗口首次显示时按这个键把启动器
+    # 换成上游 v3.5.30 的 ok-ww-win32.zip。我们的 exe 已改名为 NoNo.exe,留着它
+    # 会凭空多出一个 ok-ww.exe,而且版本会被降级回上游。
+    config.pop("update_pyappify", None)
+
+    # 关于页那排按钮(github / discord / faq)原本全部指向上游项目与社区,
+    # 清空后 AboutTab 逐个取不到地址就直接跳过(ok/ui/qt/about/AboutTab.py:192-195),
+    # 不会留下空按钮。更新不受影响:更新走 pyappify 读镜像仓库的 tag,与本键无关。
+    config["links"] = {}
+
+
+def apply_custom_tabs(config):
+    """把上游取消注册的两个 Qt 页面挂回侧边栏。"""
     tabs = list(config.get("custom_tabs") or [])
     registered = {tuple(tab) for tab in tabs}
     for module_name, class_name in CUSTOM_TABS:
