@@ -247,6 +247,14 @@ jobs:
           if ($info.ProductName -match 'ok-ww|ok-script') {
             throw "启动器的 PE 元数据仍是上游名字: $($info.ProductName)"
           }
+          # 外壳的名字是编译期烘进 exe 的,改 pyappify.yml 的 name 不会自动跟进。
+          # 这里直接比对两边的名字:一旦名字改了却没重编外壳,打包会立刻失败并
+          # 告诉你去跑哪个工作流,而不是产出一个属性还是旧名字的安装包。
+          $appName = (Select-String -Path 'pyappify.yml' -Pattern '^name:\s*"([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($info.ProductName -ne $appName) {
+            throw "启动器的名字($($info.ProductName))与 pyappify.yml 的 name($appName)不一致:先在 Actions 里跑一次 Build launcher,再把 BASE_EXE_URL 指向新的 launcher release"
+          }
 
       - name: Build portable bundle
         shell: pwsh
