@@ -120,10 +120,11 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 第 6 步的显式派发同样不是可选项：用 `GITHUB_TOKEN` 推的 tag 不会触发 push 类工作流
 （GitHub 禁止 token 递归触发），不派发就会出现"源码合了、包没编译"。
 
-### 更新仓库：部署树镜像 `Canda15/ok-ww-update`
+### 更新仓库：部署树镜像 `Canda15/nono-update`
 
-`pyappify.yml` 的 `git_url` 指向的不是源码仓库，而是 `Canda15/ok-ww-update`——一个只含
-部署树的镜像仓库（与上游的 `ok-ww-update` 同构）。
+`pyappify.yml` 的 `git_url` 指向的不是源码仓库，而是 `Canda15/nono-update`——一个只含
+部署树的镜像仓库（与上游的 `ok-ww-update` 同构）。它原名 `ok-ww-update`，改名应用时一并
+改成中性名；GitHub 对旧名保留重定向，所以改名之前装出去的客户端仍能照常更新。
 
 原因是启动器的行为：`ok-ww.exe -c setup` 会把 `git_url` 指向的仓库**整棵克隆**到
 `data/apps/NoNo/repo`，这棵树随后原样进了便携包。
@@ -143,7 +144,7 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 | 仓库 | 作用 |
 | --- | --- |
 | `Canda15/ok-wuthering-waves` | 源码、CI、tag 与 Release 产物 |
-| `Canda15/ok-ww-update` | 便携包与客户端自更新实际克隆的树（只有 `deploy.txt` 白名单内容） |
+| `Canda15/nono-update` | 便携包与客户端自更新实际克隆的树（只有 `deploy.txt` 白名单内容） |
 
 `deploy.txt` 因此是"发布内容"的唯一权威：新增一个需要随包下发的目录（比如 `selfhost`），
 必须同时加进 `deploy.txt`，否则该目录不会出现在镜像里，运行时 `ImportError`。

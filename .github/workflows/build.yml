@@ -165,7 +165,7 @@ jobs:
           "is_release=$($isRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Release version: $isRelease"
 
-      # 把部署树(deploy.txt 白名单)推到更新仓库 ok-ww-update,并同步 tag。
+      # 把部署树(deploy.txt 白名单)推到更新仓库 nono-update,并同步 tag。
       # 更新源必须是一个只含部署树的仓库:启动器 setup 时会整棵克隆它,
       # 直接指向源码仓库会连带下载 ok_templates(839 MB)和 tests(124 MB),
       # 既拖慢 setup 也可能撞上 Windows 长路径限制。
@@ -178,7 +178,7 @@ jobs:
         uses: ok-oldking/partial-sync-repo@master
         with:
           repos: |
-            https://x-access-token:${{ secrets.UPDATE_TOKEN }}@github.com/Canda15/ok-ww-update.git
+            https://x-access-token:${{ secrets.UPDATE_TOKEN }}@github.com/Canda15/nono-update.git
           sync_list: 'deploy.txt'
           tag: ${{ github.ref_name }}
           gitignore_file: '.update_repo_gitignore'
