@@ -136,6 +136,17 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 第 6 步的显式派发同样不是可选项：用 `GITHUB_TOKEN` 推的 tag 不会触发 push 类工作流
 （GitHub 禁止 token 递归触发），不派发就会出现"源码合了、包没编译"。
 
+### 在 Actions 页面手动点哪个
+
+| 想做的事 | 点哪个工作流 | 说明 |
+| --- | --- | --- |
+| 现在就要跟上上游最新 release | **Sync upstream release** | 自己取上游 `releases/latest`，合并、重建 `ok/`、跑冒烟、推 master、改 tag、派发打包，一条龙。该 tag 已合并时直接退出，勾 `force` 才会重来一遍 |
+| 只是重新打一次已有的版本 | **Windows Release** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
+| 重新编启动器 | **Build launcher** | 约 12 分钟，全在 Tauri 冷编译；只有改名字/图标/UAC 才需要 |
+
+`Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
+源码打包，用的是 `pyappify.yml` 里 `git_url` 指向的镜像仓库里已有的那份部署树。
+
 ### 更新仓库：部署树镜像 `Canda15/nono-update`
 
 `pyappify.yml` 的 `git_url` 指向的不是源码仓库，而是 `Canda15/nono-update`——一个只含

@@ -41,6 +41,21 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # 手动触发时 GitHub 允许选任意 ref,而版本号取自 github.ref_name:
+      # 选到分支会得到一个叫 master 的“版本”,启动器 setup 会因
+      # `Invalid setup version tag 'master'` 失败,镜像仓库还会多一个同名 tag。
+      # 所以第一件事就把 ref 钉死成发布用的版本 tag,后面所有步骤都能假设
+      # RELEASE_TAG 形如 v3.7.17(与 pyappify 的标签正则一致)。
+      - name: Require a version tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+            throw "这个工作流必须以 tag 为 ref 运行(当前 $env:GITHUB_REF)。要在 Actions 里手动跑,请把 Branch 下拉切到某个 tag;要合并上游并发布新版本,请手动运行 'Sync upstream release'。"
+          }
+          if ($env:GITHUB_REF_NAME -notmatch '^v?\d+\.\d+\.\d+$') {
+            throw "tag '$env:GITHUB_REF_NAME' 不是发布用的版本 tag(pyappify 只接受 vX.Y.Z)"
+          }
+
       - name: Configure runner
         shell: pwsh
         run: |
