@@ -147,6 +147,26 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 `Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
 源码打包，用的是 `pyappify.yml` 里 `git_url` 指向的镜像仓库里已有的那份部署树。
 
+### 只留三个工作流
+
+上游仓库面向社区，带了一堆对我们无意义的自动化。仓库的 Actions 侧状态刻意只留 `active` 三个：
+
+| 保留 | 作用 |
+| --- | --- |
+| `Windows Release` | tag 一推就打包（由 `Sync upstream release` 派发） |
+| `Sync upstream release` | 12 小时轮询上游 release |
+| `Build launcher` | 手动重编启动器 |
+
+其余全部在 GitHub 侧 `disabled_manually`：`Documentation`、`close_stale_issues`、
+`issue-triage.lock`、`pull-request-review.lock`、`sync_issue_labels`、`sign_exe`、
+`mirrorchyan_uploading`、`mirrorchyan_release_note`、`test`。它们要么需要上游的
+`COPILOT_GITHUB_TOKEN` / SignPath 证书 / MirrorChyan 账号，要么面向 issue、PR、Pages 这些
+本仓库没有的东西（`has_issues` 是关的）。
+
+只改 GitHub 侧状态、不删文件：删掉上游跟踪的文件，等于在每次上游改动它时制造一次
+"deleted by us" 冲突。万一上游合并把这些工作流改回 `active`（比如改了 YAML 里的触发条件），
+重停一次即可：Actions 页面左侧选中该工作流 → 右上角 `...` → `Disable workflow`。
+
 ### 更新仓库：部署树镜像 `Canda15/nono-update`
 
 `pyappify.yml` 的 `git_url` 指向的不是源码仓库，而是 `Canda15/nono-update`——一个只含
