@@ -236,13 +236,22 @@ jobs:
           Copy-Item 'pyappify.yml' $bundle
 
           # 把 Python 运行时、依赖、部署树(镜像仓库的 tag)一次性装进 $bundle。
-          Push-Location $bundle
-          try {
-            & .\ok-ww.exe -c setup -p China --setup-version $env:RELEASE_TAG
-            if ($LASTEXITCODE -ne 0) { throw "启动器 setup 失败,退出码 $LASTEXITCODE" }
-          } finally {
-            Pop-Location
-          }
+          # 启动器是 GUI 子系统的 exe:用 & 调用不会等待,$LASTEXITCODE 还是空,
+          # 于是"假装成功了"。必须 Start-Process -Wait 并读 ExitCode。
+          $stdout = Join-Path $env:RUNNER_TEMP 'setup.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'setup.stderr.log'
+          $launcher = Join-Path $bundle 'ok-ww.exe'
+          $setupArgs = @('-c', 'setup', '-p', 'China', '--setup-version', $env:RELEASE_TAG)
+          $process = Start-Process -FilePath $launcher -ArgumentList $setupArgs `
+            -WorkingDirectory $bundle -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          if ($process.ExitCode -ne 0) { throw "启动器 setup 失败,退出码 $($process.ExitCode)" }
+
+          # data\apps\<name>\repo 就是部署树;没有它说明 setup 没真正跑完。
+          $repo = Join-Path $bundle 'data\apps\ok-ww\repo'
+          if (-not (Test-Path (Join-Path $repo 'main.py'))) { throw "setup 结束但 $repo\main.py 不存在" }
 
           # pip 缓存和运行日志是运行期产物:pip 缓存动辄上百 MB,不随包分发。
           foreach ($dir in @('cache', 'data\logs')) {
