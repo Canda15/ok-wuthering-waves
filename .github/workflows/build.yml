@@ -28,11 +28,12 @@ env:
   # 便携版不需要 NSIS:启动器的所有路径都相对自身所在目录,setup 出来的目录
   # 本身就是便携版(详见 package job 的注释)。
   #
-  # 这里钉死到具体 tag 而不是 /latest/:改名后发布页上的资产叫 NoNo-*,而唯一的
-  # ok-ww-win32.zip 只存在于 v3.7.17 那次发布里,用 latest 会 404。改名的代价就是
-  # 这个 4.7 MB 的启动器从此不会随构建更新(启动器本身不含应用逻辑,冻结无害)。
-  # 注意:那份资产不能删,删了构建立刻断。
-  BASE_EXE_URL: 'https://github.com/Canda15/ok-wuthering-waves/releases/download/v3.7.17/ok-ww-win32.zip'
+  # 启动器由 .github/workflows/build-launcher.yml 自己编译,挂在 launcher-1 这个
+  # 固定 tag 的 release 上:上游那份 exe 的 PE 版本信息里写着 ok-ww,只有自己编
+  # 才能把名字写进去。这里钉死到那个 tag 而不是 /latest/,否则哪天应用发版了,
+  # latest 会解析到应用发布页上(那里没有启动器)。
+  # 重建启动器时如果换了 tag(launcher-2),这里要同步改。
+  BASE_EXE_URL: 'https://github.com/Canda15/ok-wuthering-waves/releases/download/launcher-1/NoNo-win32.zip'
 
 jobs:
   validate:
@@ -219,9 +220,18 @@ jobs:
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'base-launcher.zip'
           Invoke-WebRequest -Uri $env:BASE_EXE_URL -OutFile $archive
-          # zip 里只有一个 ok-ww/ok-ww.exe(上游包装时的目录名,与本仓库无关)
-          Expand-Archive -LiteralPath $archive -DestinationPath 'pyappify_dist' -Force
-          Get-ChildItem 'pyappify_dist' -Recurse | Select-Object FullName, Length
+          # zip 结构是 NoNo/NoNo.exe(build-launcher.yml 打的),解到独立目录,
+          # 与后面要产出的便携目录 pyappify_dist\NoNo 区分开。
+          Expand-Archive -LiteralPath $archive -DestinationPath 'pyappify_dist\launcher' -Force
+          $exe = 'pyappify_dist\launcher\NoNo\NoNo.exe'
+          if (-not (Test-Path $exe)) { throw "启动器包里没有 $exe" }
+          # 防回归:BASE_EXE_URL 一旦指回上游那份 exe,这里立刻红,而不是等到
+          # 用户在文件属性里看到 ok-ww。
+          $info = (Get-Item $exe).VersionInfo
+          "启动器: ProductName=$($info.ProductName) FileVersion=$($info.FileVersion)"
+          if ($info.ProductName -match 'ok-ww|ok-script') {
+            throw "启动器的 PE 元数据仍是上游名字: $($info.ProductName)"
+          }
 
       - name: Build portable bundle
         shell: pwsh
@@ -231,9 +241,8 @@ jobs:
           $bundle = 'pyappify_dist\NoNo'
           New-Item -ItemType Directory -Force $bundle | Out-Null
           # 启动器不自我重命名(pyappify 的 Rust 侧只用 current_exe 重启自己),
-          # 所以这里把 exe 改成与 pyappify.yml 的 name 一致的文件名;
-          # data/apps/<name> 那个目录名由 pyappify.yml 决定,不依赖文件名。
-          Copy-Item 'pyappify_dist\ok-ww\ok-ww.exe' (Join-Path $bundle 'NoNo.exe')
+          # 文件名来自 pyappify.yml 的 name;data/apps/<name> 那个目录名也由它决定。
+          Copy-Item 'pyappify_dist\launcher\NoNo\NoNo.exe' (Join-Path $bundle 'NoNo.exe')
 
           # 启动器在 cwd 读 pyappify.yml(app.rs:198 read_embedded_app),读不到就
           # 退回 pyappify 自带的默认配置——那样既没有我们的 profile 也没有镜像仓库
@@ -290,7 +299,7 @@ jobs:
           # 只留发布要用的两样:便携包与校验文件(启动器不再随发布分发,
           # 它的来源是 env.BASE_EXE_URL 钉住的那份固定资产)。
           Remove-Item 'pyappify_dist\NoNo' -Recurse -Force
-          Remove-Item 'pyappify_dist\ok-ww' -Recurse -Force
+          Remove-Item 'pyappify_dist\launcher' -Recurse -Force
 
           $file = 'NoNo-win32-portable.zip'
           $hash = (Get-FileHash "pyappify_dist\$file" -Algorithm SHA256).Hash.ToLowerInvariant()

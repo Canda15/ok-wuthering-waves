@@ -173,17 +173,21 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 | --- | --- |
 | `NoNo-win32-portable.zip` | 便携版，解压即用，整个目录可以直接搬走 |
 | `NoNo-win32-sha256.txt` | 便携包的 SHA-256 |
-| `ok-ww-win32.zip` | **不再是产物**：只留在 v3.7.17 那次 release 里，被 `env.BASE_EXE_URL` 钉住当启动器来源 |
+
+启动器（`NoNo.exe`）不再是应用发布页上的资产，而是单独编译一次、挂在 `launcher-1` 这个固定
+tag 的 release 上（`.github/workflows/build-launcher.yml`，手动触发）。原因只有一个：上游那份
+exe 的 PE 版本信息里写着 `ok-ww`，而这是 config 改不到的地方，只能用本仓库的 `pyappify.yml`
+自己编一次。工作流里有一条硬检查：编出来的 exe 只要 `ProductName`/`FileDescription`/
+`CompanyName` 还匹配 `ok-ww|ok-script` 就直接失败。
 
 便携版由 `package` job 自己拼，不再经过 `ok-oldking/pyappify-action`：
-下载启动器（改名为 `NoNo.exe`）→ 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
+下载启动器 → 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
 `NoNo.exe -c setup -p China --setup-version <tag>` → 删掉 `cache/` 与 `data/logs/` → 打包成 zip。
-启动器不自我重命名（Rust 侧只用 `current_exe()` 重启自己），所以改文件名是安全的；
-而 `data/apps/<name>` 那个目录名来自 `pyappify.yml`，与文件名无关。
+`data/apps/<name>` 那个目录名来自 `pyappify.yml`，与 exe 文件名无关。
 
-`BASE_EXE_URL` 钉死在 `v3.7.17` 而不是 `latest`：改名后发布页上的资产都叫 `NoNo-*`，唯一的
-`ok-ww-win32.zip` 只存在于那次 release，用 `latest` 会 404。代价是这个 4.7 MB 启动器从此不随
-构建更新（它不含应用逻辑，版本号由 setup 按 tag 生成），**但那份资产绝对不能删**。
+`BASE_EXE_URL` 钉死在 `launcher-1`（并且校验启动器的 `ProductName`）：用 `latest` 会解析到
+应用发布页，那里没有启动器。重建启动器、换 tag 时要同步改这一行；**`launcher-1` 这个 release
+不能删**，删了发版会在下载启动器这一步 404。
 
 之所以成立：启动器的路径全部相对自身所在目录（`utils/path.rs` 用 `current_dir`，
 `lib.rs` 启动时强制 `set_current_dir(exe_dir)`），既不写注册表也不写 `%APPDATA%`，
@@ -209,9 +213,10 @@ NSIS 安装包只是把这个目录复制到 Program Files——那我们直接�
 更早还有一版 29.3 分钟，那时 `package` 里含一次 9m17s 的 Tauri 冷编译，启动器复用之后
 这段也不再出现。
 
-启动器二进制仍然是冻结的（一直是首次发布的那份）：它与版本号无关（版本由 setup 按 tag
-生成），但要重建就得本地跑一次 `pnpm tauri build`，或者临时把 `BASE_EXE_URL` 换成上游
-release 里的 `ok-ww-win32.zip`。
+启动器二进制现在是自建的（`launcher-1`），需要重建时手动跑一次
+`.github/workflows/build-launcher.yml`：约 10 分钟，全部时间花在 Tauri 的 Rust 冷编译上
+（`pyappify-action` 自己装 rustup，没有 cargo 缓存）。它与应用版本号无关——版本号由 setup
+按 tag 生成，所以除非要改启动器本身（名字、图标、UAC），不需要重建。
 
 能缓存的只有 pip 依赖：三个 job 的 `actions/setup-python` 都带 `cache: pip`。
 便携目录每次内容都变（版本号、源码），压缩产物没有缓存价值。
@@ -234,8 +239,9 @@ release 里的 `ok-ww-win32.zip`。
 
 改不了或刻意不改的：
 
-- **exe 内嵌的 PE 版本信息**（文件属性/任务管理器里的"ok-ww"）由 Rust 启动器编译时写入，
-  要改必须重建启动器，收益远小于代价。
+- **exe 内嵌的 PE 版本信息**（文件属性/任务管理器里的产品名）由启动器编译时写入，已由
+  `.github/workflows/build-launcher.yml` 自建启动器解决：用本仓库的 `pyappify.yml` 编一次，
+  tauri 会把 `productName` 等字符串全部换成 `NoNo`，工作流里还会复核。
 - **通知 app_id 前缀** `ok-script.`、通知/叠层窗口的 Win32 类名、`%TEMP%` 下的
   `ok-script-*.pid`、计划任务 XML 的作者、邮件通知的默认主题：这些都在 `ok/` 框架里硬编码，
   已由 `selfhost/framework_patches.py` 改成中性名或 `NoNo`（见上文"落地改动"第 11 条）。
