@@ -21,6 +21,9 @@ on:
 
 permissions:
   contents: write
+  # 派发 build.yml 走的是 Workflow dispatch API,只给 contents: write 会 403
+  # ("Resource not accessible by integration")——推送成功了但没开始构建。
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -159,5 +162,9 @@ jobs:
           git push --force origin $tag
           # 用 GITHUB_TOKEN 推的 tag 不会触发 build.yml(GitHub 禁止 token 递归
           # 触发 push 类事件),所以必须显式派发一次,否则源码合了、包没编译。
-          gh workflow run build.yml --ref $tag
+          # --repo 不能省:本仓库是 fork,gh 会把"仓库"解析成基仓库(上游),
+          # 于是拿着只能访问自己仓库的 token 去派发上游的 build.yml → 403
+          # "Resource not accessible by integration",而源码和标签已经推上去了。
+          gh workflow run build.yml --ref $tag --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw "派发 build.yml 失败(退出码 $LASTEXITCODE)" }
           Write-Host "已把 $tag 指到本次合并提交并派发 build.yml"

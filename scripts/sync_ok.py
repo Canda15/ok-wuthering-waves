@@ -16,9 +16,9 @@
 补丁丢失会被 --check 立刻发现。
 
 用法:
-    python scripts/sync_ok.py              # 按 selfhost/ok_pin.json 同步
+    python scripts/sync_ok.py              # 版本取"上游 pyproject 的声明",没有声明才用 pin
     python scripts/sync_ok.py --dry-run    # 只报告差异,不落盘
-    python scripts/sync_ok.py --version 3.0.2
+    python scripts/sync_ok.py --version 3.0.2   # 明确指定版本(覆盖上面的推断)
     python scripts/sync_ok.py --check      # 离线校验 ./ok 与 pin 是否一致
 """
 
@@ -30,6 +30,7 @@ import json
 import re
 import shutil
 import sys
+import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -220,6 +221,21 @@ def render_block(entries: list[str], package: str, version: str) -> list[str]:
     return body
 
 
+def ensure_trailing_comma(lines: list[str], closing_index: int) -> None:
+    """保证生成块之前那一项以逗号结尾(就地修改 lines)。
+
+    上游的 dependencies 数组最后一项通常不写尾逗号(TOML 允许)。生成块要插在
+    这一项和右括号之间,少了逗号整个 pyproject 就变成 "Unclosed array",
+    而 pip 只在安装依赖时才报错——一次合并可以因此"测试全绿、包打不出来"。
+    """
+    index = closing_index - 1
+    while index >= 0 and (not lines[index].strip() or lines[index].lstrip().startswith("#")):
+        index -= 1
+    if index < 0 or lines[index].rstrip().endswith(","):
+        return
+    lines[index] = lines[index].rstrip("\r\n") + ",\n"
+
+
 def rewrite_pyproject(base_requires: list[str], package: str, version: str) -> tuple[bool, list[str]]:
     text = read_text(PYPROJECT_FILE)
     outside, _current = dependency_lines(text)
@@ -229,8 +245,15 @@ def rewrite_pyproject(base_requires: list[str], package: str, version: str) -> t
     lines = text.splitlines(keepends=True)
     begin = next(i for i, line in enumerate(lines) if line.strip().startswith(BEGIN_MARK))
     end = next(i for i, line in enumerate(lines) if line.strip().startswith(END_MARK))
+    ensure_trailing_comma(lines, begin)
     new_lines = lines[: begin + 1] + render_block(entries, package, version) + lines[end + 1 :]
     new_text = "".join(new_lines)
+    # 写盘前先解析一遍:pyproject 坏掉的表现是"装依赖失败",离这里很远,
+    # 让它在产生的那一刻就炸,比事后从 CI 日志里倒推便宜得多。
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"改写后的 pyproject.toml 不是合法 TOML: {exc}") from exc
     if new_text == text:
         return False, entries
     write_text(PYPROJECT_FILE, new_text)
@@ -273,8 +296,11 @@ def reapply_upstream_overwrites() -> list[str]:
         )
         if end is None:
             raise SystemExit("pyproject.toml 的 dependencies 数组没有闭合括号")
+        ensure_trailing_comma(lines, end)
         lines[end:end] = [f"    {BEGIN_MARK}\n", f"    {END_MARK}\n"]
         pyproject_text = "".join(lines)
+    pyproject_text, extra_dropped = drop_web_test_extra(pyproject_text)
+    dropped.extend(extra_dropped)
     write_text(PYPROJECT_FILE, pyproject_text)
 
     requirements_text = read_text(REQUIREMENTS_FILE)
@@ -295,6 +321,45 @@ def reapply_upstream_overwrites() -> list[str]:
         index += 1
     write_text(REQUIREMENTS_FILE, "".join(kept_lines))
     return dropped
+
+
+def drop_web_test_extra(text: str) -> tuple[str, list[str]]:
+    """删掉上游的 web-test extra(pyproject 里一个数组块)。
+
+    上游这个 extra 只有一条 `ok-script[web]==x`。web 子系统在框架 3.0 里已经
+    整个删除,extra 本身装不上东西;更糟的是它一旦被 cue 到,pip 会把 ok-script
+    从 PyPI 装进 site-packages,与内联的 ./ok 并存——运行时用哪份取决于
+    sys.path 顺序,是那种只在个别机器上复现的问题。删行之后这个 extra 会剩一个
+    空数组,所以整块一起删。
+    """
+    lines = text.splitlines(keepends=True)
+    dropped: list[str] = []
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"(web-test)\s*=\s*\[", lines[index])
+        if not match:
+            kept.append(lines[index])
+            index += 1
+            continue
+        dropped.append(f"pyproject: {match.group(1)} extra")
+        index += 1
+        while index < len(lines) and not lines[index].strip().startswith("]"):
+            index += 1
+        index += 1  # 跳过右括号那一行
+    return "".join(kept), dropped
+
+
+def upstream_pinned_version() -> str | None:
+    """读出上游 pyproject.toml 声明的 ok-script 版本(合并后、改写前)。
+
+    这一行正是 reapply_upstream_overwrites() 要删掉的,所以必须抢在改写之前读。
+    不跟随它就意味着:上游把框架升到 3.0.3,我们继续内联 3.0.1,而 src/ 已经按
+    3.0.3 的 API 改了——冒烟测试只覆盖我们自己的页面,这类版本漂移只能靠
+    "版本以对方声明为准"来消除,不能指望有人记得手动 --version。
+    """
+    match = re.search(r'"ok-script[^"]*==\s*([0-9][^",\s]*)"', read_text(PYPROJECT_FILE))
+    return match.group(1) if match else None
 
 
 def check_requirements(base_requires: list[str]) -> list[str]:
@@ -345,11 +410,17 @@ def do_check() -> int:
     return 0
 
 
-def do_sync(version_override: str | None, dry_run: bool) -> int:
+def do_sync(
+    version_override: str | None, dry_run: bool, upstream_version: str | None = None
+) -> int:
     pin = load_pin()
     package = pin["package"]
-    version = version_override or pin["version"]
-    print(f"目标: {package} {version}")
+    # 优先级:--version(人手指定)> 上游 pyproject 的声明 > pin 文件。
+    version = version_override or upstream_version or pin["version"]
+    if version != pin["version"]:
+        print(f"目标: {package} {version}(pin 里是 {pin['version']},跟随上游声明)")
+    else:
+        print(f"目标: {package} {version}")
 
     url, pypi_sha256 = fetch_release(package, version)
     expected = pin.get("wheel_sha256", "") if version == pin["version"] else ""
@@ -434,6 +505,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return do_check()
+    # 顺序不能反:reapply 会把上游那行 pin 删掉,之后再读就没有版本依据了。
+    upstream_version = upstream_pinned_version()
     if args.reapply:
         dropped = reapply_upstream_overwrites()
         if dropped:
@@ -442,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {line}")
         else:
             print("没有需要移除的 pin")
-    return do_sync(args.version, args.dry_run)
+    return do_sync(args.version, args.dry_run, upstream_version=upstream_version)
 
 
 if __name__ == "__main__":
