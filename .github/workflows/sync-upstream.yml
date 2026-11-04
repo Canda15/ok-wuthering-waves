@@ -1,0 +1,163 @@
+name: Sync upstream release
+
+# 上游发版后把新版本合并进来、重新内联 ok-script、跑冒烟测试,全绿才推送并打 tag。
+# 设计取舍:自动化真正危险的不是"合并冲突"(那是可见的、会失败的),而是
+# "合并干净但启动 ImportError"——所以冒烟测试放在推送之前,红则什么都不推。
+on:
+  schedule:
+    # 每 12 小时查一次。fork 的 schedule 在仓库 60 天无活动后会被 GitHub 自动禁用,
+    # 手动跑一次 workflow_dispatch 即可重新启用。
+    - cron: '23 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 指定上游 tag(留空则取最新 release)
+        required: false
+      force:
+        # 演练用:上游没有新版本时也想完整跑一遍(合并→重建 ok/→冒烟→打 tag)。
+        description: 即使该 tag 已合并也继续执行
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ok-oldking/ok-wuthering-waves
+  PYTHON_VERSION: '3.12'
+  # runner 的控制台是 cp1252,不设这个变量时打印中文会 UnicodeEncodeError
+  PYTHONIOENCODING: 'UTF-8'
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve upstream tag
+        id: resolve
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ inputs.upstream_tag }}"
+          if (-not $tag) {
+            $tag = gh api "repos/$env:UPSTREAM_REPO/releases/latest" --jq .tag_name
+          }
+          if (-not $tag) { throw '未能取得上游 tag' }
+          Write-Host "upstream tag: $tag"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Skip when already merged
+        id: check
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          $force = "${{ inputs.force }}"
+          git remote add upstream "https://github.com/$env:UPSTREAM_REPO.git"
+          # 必须用 ${tag}:直接写 $tag:refs 会被 PowerShell 当成作用域变量
+          # ($tag 的 "refs" 作用域,解析为空),refspec 变成 refs/tags//tags/...
+          git fetch --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
+          git merge-base --is-ancestor $tag HEAD
+          $merged = $LASTEXITCODE -eq 0
+          if ($merged -and $force -ne 'true') {
+            Write-Host "$tag 已在 master 中,无需同步"
+            "needed=false" >> $env:GITHUB_OUTPUT
+          } else {
+            if ($merged) { Write-Host "$tag 已合并,按 force 要求继续执行" }
+            "needed=true" >> $env:GITHUB_OUTPUT
+          }
+          # merge-base 用 1 表示"不是祖先",这是正常分支,不能让步骤判失败
+          exit 0
+
+      - name: Merge upstream
+        if: steps.check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git merge --no-ff --no-edit $tag
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+
+          # 我们删掉过 pyproject.toml / requirements.txt 里的 ok-script pin,上游每次
+          # bump 版本都会改这两行,因此必然出现 "deleted by us"。这两处改动完全可
+          # 脚本复现,取上游版本后交给 --reapply 重新删,不必叫人。
+          $conflicts = git diff --name-only --diff-filter=U
+          $auto = @('pyproject.toml', 'requirements.txt')
+          $manual = $conflicts | Where-Object { $auto -notcontains $_ }
+          if ($manual) {
+            Write-Host "需要人工合并:$($manual -join ', ')"
+            exit 1
+          }
+          foreach ($file in $conflicts) { git checkout --theirs -- $file }
+          git add -- $conflicts
+          git commit --no-edit
+
+      - name: Install dependencies
+        if: steps.check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Re-vendor ok-script
+        if: steps.check.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          # --reapply 先把合并带回来的 pin 重新删掉,再从 wheel 重建 ./ok
+          # 并重写 pyproject 的依赖生成块。
+          python scripts/sync_ok.py --reapply
+          # 必须显式判负:脚本崩了但后面的 git 命令成功时,pwsh 步骤仍会判绿,
+          # 结果是"合并干净、ok/ 没更新、测试全绿"——最坏的一种假成功。
+          if ($LASTEXITCODE -ne 0) { throw 'sync_ok.py 执行失败' }
+          git add -A
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host '框架源码无变化'
+          } else {
+            $version = (Get-Content selfhost/ok_pin.json -Raw | ConvertFrom-Json).version
+            git commit -m "Vendor ok-script $version from the PyPI wheel"
+          }
+
+      - name: Smoke test
+        if: steps.check.outputs.needed == 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        shell: pwsh
+        run: python -u run_test.py tests/TestSelfhostSmoke.py
+
+      - name: Push and tag
+        if: steps.check.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          # 标签沿用上游版本号本身,而不是加后缀。原因不是审美:
+          # 1) 打包器只认 ^v?\d+\.\d+\.\d+(-alpha|beta|rc\.\d+)?$,
+          #    带 +xmod 的标签会让 `ok-ww.exe -c setup --setup-version` 直接报
+          #    "Invalid setup version tag",构建在打包 China profile 时崩掉;
+          # 2) 客户端拉版本列表也走同一个正则,带后缀的标签根本进不了列表,
+          #    等于自更新永远看不到新版本。
+          # 同名标签在我们的 fork 里改指自己的合并提交,语义是"同一版本号 + 我们的补丁"。
+          git push origin HEAD:master
+          git tag -f $tag
+          git push --force origin $tag
+          # 用 GITHUB_TOKEN 推的 tag 不会触发 build.yml(GitHub 禁止 token 递归
+          # 触发 push 类事件),所以必须显式派发一次,否则源码合了、包没编译。
+          gh workflow run build.yml --ref $tag
+          Write-Host "已把 $tag 指到本次合并提交并派发 build.yml"

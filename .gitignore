@@ -4,7 +4,9 @@ ok_tasks/
 ok_import/
 updates/
 working/
-update/
+# 只忽略仓库根目录的 update/ 运行时目录。写成 update/ 会连 ok/update/
+# (框架的 inline_ok_requirements 等发布脚本)一起忽略,内联后会丢代码。
+/update/
 tesseract
 cache/
 models
@@ -27,8 +29,8 @@ thread_dumps.txt
 .claude/
 CLAUDE.md
 # C extensions
-ok
-ok/
+# ok/ 现在是本仓库内联的框架源码(见 SELFHOST.md),必须纳入版本控制;
+# 只有打包时才由 ok.update.inline_ok_requirements 从 site-packages 复制。
 pyappify
 *.cpp
 *.pyx
@@ -76,4 +78,6 @@ working_images/
 repo/
 
 assets/result.json
-src/gui/CharacterCodeTab.py
+
+# scripts/sync_ok.py 的临时暂存目录
+/.sync-ok-stage/

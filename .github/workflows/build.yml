@@ -5,6 +5,10 @@ on:
   push:
     tags:
       - 'v*'
+  # 自维护分支用:GITHUB_TOKEN 推的 tag 不会触发 build(push 事件禁止 token 递归
+  # 触发),sync-upstream 工作流因此在推完 tag 后显式派发一次,并且必须带 tag 作为
+  # ref——ref_name 就是发布版本号,派到分支上会打出错误版本。
+  workflow_dispatch:
 
 concurrency:
   group: windows-release-${{ github.ref }}
@@ -18,9 +22,17 @@ env:
   PYTHON_VERSION: '3.12'
   PYTHONIOENCODING: 'UTF-8'
   PYTHONLEGACYWINDOWSSTDIO: 'UTF-8'
-  SIGN_BUILD: 'true'
+  # 上游用 SignPath 的证书签安装包,那份证书绑定 ok-oldking 的组织,自维护
+  # 分支没有也不需要。SIGN_BUILD 同时决定"只构建 exe"与是否进入签名步骤,
+  # 保持 false 就既不签名也能构建完整安装包。
+  SIGN_BUILD: 'false'
   BUILD_EXE: 'true'
-#  USE_RELEASE: 'https://api.github.com/repos/ok-oldking/ok-wuthering-waves/releases/tags/v3.5.15'
+  # 复用上一次发布里的启动器 ok-ww-win32.zip,跳过用 cargo 重新编译 Tauri/Rust
+  # 启动器(实测 9分17秒,占打包 step 的一半)。启动器本身与版本无关:版本号
+  # 由 pyappify 在 setup 时按仓库 tag 生成,所以复用旧 exe 不会让包"变旧"。
+  # 代价:launcher 从此冻结在首次发布的那份二进制上,要重建就临时把这行注释掉
+  # 跑一次 build,再恢复。
+  USE_RELEASE: 'https://api.github.com/repos/Canda15/ok-wuthering-waves/releases/latest'
 
 jobs:
   validate:
@@ -35,7 +47,7 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
           git config --global user.email "ok-oldking@users.noreply.github.com"
-          git config --global user.name "ok-oldking"
+          git config --global user.name "Canda15"
 
       - name: Check out source
         uses: actions/checkout@v4
@@ -117,7 +129,7 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
           git config --global user.email "ok-oldking@users.noreply.github.com"
-          git config --global user.name "ok-oldking"
+          git config --global user.name "Canda15"
 
       - name: Check out source
         uses: actions/checkout@v4
@@ -154,14 +166,18 @@ jobs:
           "is_release=$($isRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Release version: $isRelease"
 
-      - name: Synchronize update repositories
+      # 把部署树(deploy.txt 白名单)推到更新仓库 ok-ww-update,并同步 tag。
+      # 更新源必须是一个只含部署树的仓库:pyappify 会把被克隆的整棵树塞进
+      # NSIS 离线安装包,直接克隆源码仓库(ok_templates 839 MB)会让
+      # makensis 报 "Internal compiler error #12345: error mmapping datablock"。
+      # 认证走 secrets.UPDATE_TOKEN(带 repo 权限的 PAT),action 本身不接受
+      # token 输入,只能把凭据嵌进 repos 的 URL 里。
+      - name: Synchronize the update repository
         id: sync
         uses: ok-oldking/partial-sync-repo@master
         with:
           repos: |
-            https://cnb:${{ secrets.CNB_TOKEN }}@cnb.cool/ok-oldking/ok-wuthering-waves.git
-            https://cnb:${{ secrets.CNB_TOKEN }}@cnb.cool/ok-oldking/ok-ww-update2.git
-            https://ok-oldking:${{ secrets.OK_GH }}@github.com/ok-oldking/ok-ww-update
+            https://x-access-token:${{ secrets.UPDATE_TOKEN }}@github.com/Canda15/ok-ww-update.git
           sync_list: 'deploy.txt'
           tag: ${{ github.ref_name }}
           gitignore_file: '.update_repo_gitignore'
@@ -172,7 +188,8 @@ jobs:
     needs: synchronize
     runs-on: windows-latest
     env:
-      SIGN_BUILD: ${{ needs.synchronize.outputs.is_release }}
+      # 上游这里按 is_release 打开 SignPath 签名;我们恒为 false(见文件头注释)。
+      SIGN_BUILD: 'false'
 
     steps:
       - name: Configure runner
@@ -182,7 +199,7 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
           git config --global user.email "ok-oldking@users.noreply.github.com"
-          git config --global user.name "ok-oldking"
+          git config --global user.name "Canda15"
 
       - name: Check out source
         uses: actions/checkout@v4
@@ -207,6 +224,17 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python -m ok.update.inline_ok_requirements --tag "$env:RELEASE_TAG"
+
+      # 打包器靠 libgit2 把本仓库克隆到 pyappify_dist/ok-ww/data/apps/ok-ww/repo,
+      # 而 libgit2 默认不启用长路径支持;ok_templates/ 里有 180+ 字符的文件名,
+      # 叠上这条深目录就超过 260 的 MAX_PATH,克隆失败在
+      # "path too long: .../ok_templates/WindowsGraphicsCaptureMethod_..._original_png.rf.*.jpg"。
+      # core.longpaths 写进全局 gitconfig 后 libgit2 改用 \\?\ 前缀,克隆才能完成。
+      - name: Allow long paths when the packager clones the repo
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          Write-Host "core.longpaths = $(git config --global --get core.longpaths)"
 
       - name: Reuse base executable
         id: reuse_executable
@@ -413,16 +441,7 @@ jobs:
             ### 更新日志 ${{ needs.synchronize.outputs.start_tag }} -> ${{ needs.synchronize.outputs.end_tag }}:
               ${{ needs.synchronize.outputs.changes }}
             ### Install from source
-              See the [source installation guide](https://github.com/ok-oldking/ok-wuthering-waves/blob/master/docs/development/contributing.md).
+              See the [source installation guide](https://github.com/Canda15/ok-wuthering-waves/blob/master/docs/development/contributing.md).
           draft: false
           prerelease: ${{ needs.synchronize.outputs.is_release != 'true' }}
           files: pyappify_dist/*
-
-      - name: Trigger distribution workflows
-        if: needs.synchronize.outputs.is_release == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run --repo "$GITHUB_REPOSITORY" mirrorchyan_uploading
-          gh workflow run --repo "$GITHUB_REPOSITORY" mirrorchyan_release_note

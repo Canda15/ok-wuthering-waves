@@ -7,13 +7,28 @@ name = "ok-ww"
 version = "0.0.1"
 requires-python = ">=3.11"
 dependencies = [
+    # 应用自身声明的依赖,与框架版本无关,由人维护。
+    # ok-pyside-minimal 与 onnxocr-ppocrv5 原先来自 ok-script[qt] / [ocr]。
     "mcp==2.3.0",
-    "ok-script[ocr,qt]==3.0.1",
     "ok-pyside-minimal==6.12.0.post2",
     "onnxocr-ppocrv5>=0.0.20",
     "openvino",
     "opencv-python",
-    "pyappify>=1.0.13"
+    "pyappify>=1.0.13",
+    # ok-script 已以源码形式内联在 ./ok(见 SELFHOST.md),不再是 pip 的解析来源,
+    # 因此它 wheel 里声明的运行时依赖必须显式列在这里,否则 pip-compile 会悄悄
+    # 把它们丢掉。以下生成块由 python scripts/sync_ok.py 整体重写,不要手改。
+    # >>> generated: vendored ok-script dependencies (scripts/sync_ok.py)
+    # 来源: ok-script 3.0.1 的 wheel 元数据,由 scripts/sync_ok.py 生成。
+    "pywin32!=312,>=306",
+    "typing-extensions>=4.11.0",
+    "requests>=2.32.3",
+    "psutil>=6.0.0",
+    "pydirectinput==1.0.4",
+    "pycaw==20240210",
+    "mouse==0.7.1",
+    "pynput>=1.8.1",
+    # <<< generated: vendored ok-script dependencies
 ]
 
 [project.optional-dependencies]
@@ -23,7 +38,4 @@ dev = [
 ]
 docs = [
     "mkdocs-material>=9.5,<10",
-]
-web-test = [
-    "ok-script[web]==3.0.1",
 ]

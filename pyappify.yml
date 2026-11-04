@@ -4,8 +4,13 @@ icon: "icons/icon.png"
 website: "http://ok-script.com/ok-ww"
 
 profiles:
+  # 自维护分支:两个 profile 都指向自己的更新仓库 ok-ww-update,不再从上游
+  # 更新通道拉取。该仓库只有部署树(deploy.txt 白名单,发版时由 build.yml 的
+  # partial-sync-repo 步骤推送),不含 ok_templates/tests 等开发素材。
+  # 不能直接指向源码仓库:打包器会把被克隆的整棵树塞进 NSIS 离线安装包
+  # (ok_templates 单个目录就 839 MB),makensis 会因体积超限失败。
   - name: "China"
-    git_url: "https://cnb.cool/ok-oldking/ok-ww-update2.git"
+    git_url: "https://github.com/Canda15/ok-ww-update.git"
     admin: true
     main_script: "main.py"
     requires_python: "3.12"
@@ -16,7 +21,7 @@ profiles:
     # PYTHONPATH: "your/default/path" # Optional, will be "" if missing
 
   - name: "Global"
-    git_url: "https://github.com/ok-oldking/ok-ww-update.git"
+    git_url: "https://github.com/Canda15/ok-ww-update.git"
     main_script: "main.py"
     requirements: "requirements.txt"
 
