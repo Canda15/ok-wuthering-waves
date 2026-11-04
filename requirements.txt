@@ -62,10 +62,9 @@ ok-pyside-minimal==6.12.0.post2
     # via
     #   ok-script
     #   ok-ww (pyproject.toml)
-# ok-script 不在这里安装:它的源码已内联在 ./ok(见 SELFHOST.md)。
-# 若恢复这一行,site-packages 会多出一份 ok 与本仓库的 ok/ 并存,
-# 运行时用哪份取决于 sys.path 顺序。
-onnxocr-ppocrv5==0.0.22
+ok-script[ocr,qt]==3.0.3
+    # via ok-ww (pyproject.toml)
+onnxocr-ppocrv5==0.0.23
     # via
     #   ok-script
     #   ok-ww (pyproject.toml)
