@@ -3,7 +3,7 @@
 上游的测试覆盖的是"没有我们补丁"的树,测不到四件事:随 pin 重新内联的 ok/
 是否还认这些 API、被我们重新注册的两个页面是否还能实例化、改名相关的 override
 是否还压得住上游的默认值、以及施加在 ok/ 源码里的品牌补丁是否还在。
-五条断言、几十秒,由 .github/workflows/sync-upstream.yml 在每次自动合并后执行
+六条断言、几十秒,由 .github/workflows/sync-upstream.yml 在每次自动合并后执行
 ——它是整套自动同步唯一的闸门,红了就不许推送。
 """
 
@@ -93,6 +93,59 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(framework_patches.missing(repo_root / 'ok'), [],
                          'ok/ 里的品牌补丁没生效,跑一次 python scripts/sync_ok.py')
 
+    def test_sync_script_keeps_pyproject_parseable(self):
+        """上游的 dependencies 数组结尾不带逗号,把生成块插进去会让 pyproject 变成非法 TOML。
+
+        这个坑踩过一次:构建跑到"装依赖"才炸,而测试全绿——因为它们只需要 requirements.txt。
+        所以这里按上游的真实形状造一份文件,要求改写之后仍然可解析,且该删的都删了。
+        """
+        import tomllib
+        from importlib import util as importlib_util
+
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'sync_ok.py'
+        spec = importlib_util.spec_from_file_location('selfhost_sync_ok', script)
+        sync_ok = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(sync_ok)
+
+        upstream_shape = (
+            '[project]\n'
+            'dependencies = [\n'
+            '    "mcp==2.3.0",\n'
+            '    "ok-script[ocr,qt]==9.9.9",\n'
+            '    "pyappify>=1.0.13"\n'   # 上游最后一项没有尾逗号
+            ']\n'
+            '\n'
+            '[project.optional-dependencies]\n'
+            'dev = [\n'
+            '    "pytest",\n'
+            ']\n'
+            'web-test = [\n'
+            '    "ok-script[web]==9.9.9",\n'
+            ']\n'
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            pyproject = Path(folder) / 'pyproject.toml'
+            requirements = Path(folder) / 'requirements.txt'
+            pyproject.write_text(upstream_shape, encoding='utf-8')
+            requirements.write_text('mcp==2.3.0\nok-script[ocr,qt]==9.9.9\n    # via ok-ww\n',
+                                    encoding='utf-8')
+            with patch.object(sync_ok, 'PYPROJECT_FILE', pyproject), \
+                    patch.object(sync_ok, 'REQUIREMENTS_FILE', requirements):
+                # 版本必须在 reapply 删掉那行之前读出来,否则永远停在旧 pin 上。
+                self.assertEqual(sync_ok.upstream_pinned_version(), '9.9.9')
+                self.assertTrue(sync_ok.reapply_upstream_overwrites())
+                rewritten, _entries = sync_ok.rewrite_pyproject(['pywin32!=312,>=306'],
+                                                                'ok-script', '9.9.9')
+                text = pyproject.read_text(encoding='utf-8')
+                requirements_text = requirements.read_text(encoding='utf-8')
+
+            self.assertTrue(rewritten)
+            tomllib.loads(text)  # 解析失败就是这里要拦的那种回归
+            self.assertNotIn('"ok-script', text, '上游的 pin 行必须被删掉')
+            self.assertNotIn('web-test', text, '空掉的 web-test extra 不能留在 pyproject 里')
+            self.assertIn('"pywin32!=312,>=306"', text, '生成块应该写进依赖数组')
+            self.assertNotIn('ok-script', requirements_text)
+
     def test_registered_tabs_instantiate_against_current_framework(self):
         """页面能实例化,才说明框架契约(name/icon/add_after_default_tabs)没变。"""
         for module_name, class_name in apply({}):
@@ -104,3 +157,4 @@ class TestSelfhostSmoke(unittest.TestCase):
             finally:
                 tab.close()
                 tab.deleteLater()
+

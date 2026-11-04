@@ -91,16 +91,28 @@ dict，`MainWindow` 读的是同一个对象。
 版本 pin 记在 `selfhost/ok_pin.json`（版本、wheel SHA-256、整树 SHA-256）。日常只需要：
 
 ```powershell
-python scripts/sync_ok.py            # 按 pin 重新下载 wheel → 校哈希 → 整体替换 ok/ → 重写依赖块
-python scripts/sync_ok.py --version 3.0.2
+python scripts/sync_ok.py            # 版本取"上游 pyproject 的声明"，没有声明才用 pin；重下 wheel → 校哈希 → 整体替换 ok/ → 重写依赖块
+python scripts/sync_ok.py --version 3.0.2   # 明确指定版本（覆盖上面的推断）
 python scripts/sync_ok.py --dry-run  # 只看差异
 python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 ```
+
+**版本以对方声明为准，不是以 pin 为准。** 上游每次发版都会在 `pyproject.toml` 里写
+`ok-script[ocr,qt]==x.y.z`，那一行就是"这次的应用代码是按哪个框架写的"。合并之后如果继续按 pin
+内联旧框架，就会出现 src/ 比 ok/ 新：冒烟测试只覆盖我们自己的页面，这种漂移它测不出来，只会在
+某个功能被调用时炸。所以 `sync_ok.py` 先读出那一行再动手删它（顺序很重要：`--reapply` 一执行，
+版本依据就没了），`--version` 只在需要固定到某个版本时用。
 
 `sync_ok.py` 做六件事，替代了原先的手工步骤：按 pin 从 PyPI 取 wheel、核对 SHA-256 与 pin 一致
 （不一致直接中止，这是供应链断点）、把 wheel 内的 `ok/` **整树替换**（不是逐文件覆盖，否则上游删掉的
 模块会以旧文件形式残留）、按 `selfhost/framework_patches.py` 重新施加品牌补丁、按 wheel METADATA
 重写 `pyproject.toml` 的依赖生成块、更新 pin。
+
+改 `pyproject.toml` 时有两处坑是踩过的，脚本里已经处理，改动那段逻辑时别丢：上游的 `dependencies`
+数组最后一项**不带尾逗号**，生成块插在它后面会让整个文件变成非法 TOML（`Unclosed array`），而
+pip 只在装依赖时才报错——测试全绿、包打不出来，所以写盘前会用 `tomllib` 解析一遍；上游的
+`web-test` extra 只剩一条 `ok-script[web]==x`，这个 extra 在框架 3.0 里已经没有内容，留着只会在
+被 cue 到时把 ok-script 从 PyPI 装进 site-packages、和内联的 `./ok` 并存，所以整块删掉。
 
 补丁清单里的原文在新版本里找不到（或出现多次）时，同步会直接失败并要求人工核对：
 宁可停下来，也不要静默地少打一个补丁——那种情况没有任何报错，只是名字又回来了。
@@ -121,7 +133,13 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 4. `python scripts/sync_ok.py --reapply`：重建 `ok/`、重写依赖块；
 5. `python -u run_test.py tests/TestSelfhostSmoke.py`（`QT_QPA_PLATFORM=offscreen`）；
 6. 全绿才 `git push origin HEAD:master`，再把上游 tag 改指到本次合并提交并强推，然后
-   `gh workflow run build.yml --ref <tag>` 显式派发打包。
+   `gh workflow run build.yml --ref <tag> --repo <本仓库>` 显式派发打包。
+
+第 6 步的 `--repo` 不是可省的啰嗦：本仓库是 fork，`gh` 在 checkout 里会把"这个仓库"解析成**基仓库**
+（上游），于是拿着只能访问自己仓库的 token 去派发上游的 `build.yml`，报
+`HTTP 403: Resource not accessible by integration`。第一次无人值守同步就撞上了这个：master 和 tag
+都推上去了，只有构建没开始，而这一步之前每一步都是绿的。同理 `permissions` 必须带 `actions: write`
+——派发是 Workflow dispatch API，`contents: write` 不够。
 
 第 5 步是这套自动化的关键：上游的 CI 测的是**没有我们补丁**的树，`custom_tabs` 被塞回去后两个页面
 能不能在新框架下站起来、`kit.*` 的 API 有没有漂移，上游全绿也覆盖不到。红了就不推，等于把
