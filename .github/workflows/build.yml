@@ -360,7 +360,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           body: |
-            ### 更新日志 ${{ needs.synchronize.outputs.start_tag }} -> ${{ needs.synchronize.outputs.end_tag }}:
+            ### 更新日志 -> ${{ needs.synchronize.outputs.end_tag }}
+              自上次同步以来部署树的改动(mirror 仓库视角,不含上游提交正文):
               ${{ needs.synchronize.outputs.changes }}
             ### 便携版
               下载 `NoNo-win32-portable.zip`,解压到任意目录后双击 `NoNo\NoNo.exe`。
