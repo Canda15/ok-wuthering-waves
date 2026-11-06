@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import urlparse
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -41,7 +42,7 @@ from src.char.YangYangSp import YangYangSp
 from src.gui.CharacterCodeTab import (
     STATE_DOT_SIZE, CharacterCodeTab, ExportTeamDialog, ImportTeamDialog, TeamInfoDialog,
     TeamSelectionDialog, WorkshopDialog, fetch_all_workshop_teams, fetch_workshop_codes,
-    team_state_color, workshop_team_url,
+    WORKSHOP_ARCHIVE_HOSTS, WORKSHOP_TEAM_URL, WORKSHOP_TEAMS_ALL_URL, team_state_color, workshop_team_url,
 )
 
 
@@ -214,14 +215,20 @@ class TestCharacterCodeTab(unittest.TestCase):
     def test_workshop_url_uses_sorted_team_slug(self):
         self.assertEqual(
             workshop_team_url((Baizhi, Augusta, Aemeath)),
-            "https://cfokwwchar.ok-script.com/teams/Aemeath_Augusta_Baizhi.json",
+            "https://okwwcharcode.ok-script.com/teams/Aemeath_Augusta_Baizhi.json",
         )
 
     def test_workshop_url_sanitizes_character_name_punctuation(self):
         self.assertEqual(
             workshop_team_url((YangYangSp, Chisa, Suisui)),
-            "https://cfokwwchar.ok-script.com/teams/Chisa_Suisui_Yangyang_Xuanling.json",
+            "https://okwwcharcode.ok-script.com/teams/Chisa_Suisui_Yangyang_Xuanling.json",
         )
+
+    def test_workshop_urls_stay_inside_the_archive_whitelist(self):
+        # 索引与按队查询都必须落在导入白名单里,否则能列出队伍却导入不了任何代码
+        index_host = urlparse(WORKSHOP_TEAMS_ALL_URL).hostname
+        self.assertIn(index_host, WORKSHOP_ARCHIVE_HOSTS)
+        self.assertEqual(urlparse(WORKSHOP_TEAM_URL).hostname, index_host)
 
     def test_workshop_codes_are_sorted_by_timestamp_descending(self):
         payload = {
@@ -250,8 +257,7 @@ class TestCharacterCodeTab(unittest.TestCase):
         self.assertEqual(request.get_header("User-agent"), "ok-wuthering-waves")
         self.assertEqual(open_url.call_args.kwargs, {"timeout": 15})
         log_info.assert_called_once_with(
-            "char code workshop request: "
-            "https://cfokwwchar.ok-script.com/teams/Aemeath_Augusta_Baizhi.json"
+            "char code workshop request: " + workshop_team_url((Aemeath, Augusta, Baizhi))
         )
 
     def test_workshop_404_is_an_empty_list(self):
@@ -269,7 +275,7 @@ class TestCharacterCodeTab(unittest.TestCase):
         self.assertEqual(codes[0]["name"], "Test code")
         self.assertEqual(codes[0]["team"], "Test team")
         request = open_url.call_args.args[0]
-        self.assertEqual(request.full_url, "https://cfokwwchar.ok-script.com/teams.json")
+        self.assertEqual(request.full_url, WORKSHOP_TEAMS_ALL_URL)
         self.assertEqual(request.get_header("User-agent"), "ok-wuthering-waves")
         self.assertEqual(open_url.call_args.kwargs, {"timeout": 15})
 
@@ -281,8 +287,9 @@ class TestCharacterCodeTab(unittest.TestCase):
                  "https://cfokwwchar.ok-script.com/team.zip"),
                 ("rawUrl", "https://raw.githubusercontent.com/example/team.zip",
                  "https://raw.githubusercontent.com/example/team.zip"),
+                # 旧域名自动改写的目标就是当前主域名,因此现在是恒等映射
                 ("downloadUrl", "https://okwwcharcode.ok-script.com/codes/team%20name.zip",
-                 "https://cfokwwchar.ok-script.com/codes/team%20name.zip"),
+                 "https://okwwcharcode.ok-script.com/codes/team%20name.zip"),
             ):
                 with (
                     self.subTest(url=url),

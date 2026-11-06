@@ -79,6 +79,12 @@ dict，`MainWindow` 读的是同一个对象。
 `MainWindow` 消费、两个页面能在 offscreen 下实例化、品牌 override 生效、源码补丁已施加）。
 上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
 
+上游跟踪文件里目前只有一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-49` 的工坊 URL 指回
+`okwwcharcode.ok-script.com`（GitHub Pages）——上游自建的新工坊服务器 `cfokwwchar.ok-script.com`
+整个域名已消失（2026-11-07 实测 DNS NXDOMAIN），而旧 Pages 仍随上游的 ok-ww-char-code 仓库
+自动更新。哪天上游自己修这几个 URL 时会产生冲突：先看上游改成了什么，指向一个活着的源就取上游，
+否则保留我们的。
+
 ## 不许做的事
 
 - 不要 `pip install ok-script`：site-packages 会多出一份 `ok`，和仓库里的 `ok/` 抢 `sys.path`，

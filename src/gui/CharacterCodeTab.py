@@ -41,9 +41,13 @@ from src.char.CustomCharLoader import (
 
 BASE_CHAR_URL = "https://raw.githubusercontent.com/ok-oldking/ok-wuthering-waves/refs/heads/master/src/char/BaseChar.py"
 UPLOAD_TEAM_URL = "https://github.com/ok-oldking/ok-ww-char-code"
-WORKSHOP_TEAMS_ALL_URL = "https://cfokwwchar.ok-script.com/teams.json"
-WORKSHOP_TEAM_URL = "https://cfokwwchar.ok-script.com/teams/{slug}.json"
-WORKSHOP_ARCHIVE_HOSTS = {"cfokwwchar.ok-script.com", "raw.githubusercontent.com"}
+# 工坊服务器:上游把服务从 GitHub Pages(okwwcharcode)迁到自建(cfokwwchar)后,新服务器
+# 整个域名已消失(DNS NXDOMAIN,上游 master 仍指向它),而旧 Pages 一直在线并随
+# ok-oldking/ok-ww-char-code 的 deploy.yml 自动更新,因此指回旧域名;cfokwwchar 留在
+# 白名单里,上游恢复后只需把下面两个 URL 改回去。
+WORKSHOP_TEAMS_ALL_URL = "https://okwwcharcode.ok-script.com/teams.json"
+WORKSHOP_TEAM_URL = "https://okwwcharcode.ok-script.com/teams/{slug}.json"
+WORKSHOP_ARCHIVE_HOSTS = {"cfokwwchar.ok-script.com", "okwwcharcode.ok-script.com", "raw.githubusercontent.com"}
 WORKSHOP_USER_AGENT = "ok-wuthering-waves"
 logger = Logger.get_logger(__name__)
 
