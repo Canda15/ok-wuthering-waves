@@ -26,7 +26,9 @@ profiles:
   - name: "China"
     git_url: "https://github.com/Canda15/nono-update.git"
     admin: true
-    main_script: "main.py"
+    # 原生宿主在自身进程执行 main.py，任务管理器显示 NoNo.exe；
+    # 在发布时编译并随 selfhost/ 推入部署树，依赖更新仍由启动器负责。
+    main_script: "selfhost/NoNo.exe"
     requires_python: "3.12"
     requirements: "requirements.txt"
     use_pythonw: true

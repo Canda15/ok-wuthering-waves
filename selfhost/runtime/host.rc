@@ -1,0 +1,28 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "runtime_resources.h"
+
+1 ICON APP_ICON
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription", "NoNo\0"
+            VALUE "FileVersion", "1.0.0.0\0"
+            VALUE "InternalName", "NoNo\0"
+            VALUE "OriginalFilename", "NoNo.exe\0"
+            VALUE "ProductName", "NoNo\0"
+            VALUE "ProductVersion", "1.0.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

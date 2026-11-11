@@ -81,3 +81,6 @@ assets/result.json
 
 # scripts/sync_ok.py 的临时暂存目录
 /.sync-ok-stage/
+
+# 原生业务宿主由发布流程编译，只随部署树分发，不提交构建产物。
+/selfhost/NoNo.exe

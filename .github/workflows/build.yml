@@ -189,6 +189,11 @@ jobs:
       # token 输入,只能把凭据嵌进 repos 的 URL 里。
       # 注意:上一步的 inline_ok_requirements 已经把 config.py 的 version 改成本次
       # tag、并从 requirements.txt 摘掉 ok-script,所以镜像仓库里就是可发布的树。
+      # 业务宿主也必须在同步之前编译，selfhost/ 白名单会把 EXE 一起推入部署树。
+      - name: 编译并验证业务 EXE
+        shell: pwsh
+        run: .\scripts\build_runtime.ps1
+
       - name: Synchronize the update repository
         id: sync
         uses: ok-oldking/partial-sync-repo@master
@@ -290,6 +295,28 @@ jobs:
           # <name> 来自 pyappify.yml,改名后要与它保持一致。
           $repo = Join-Path $bundle 'data\apps\NoNo\repo'
           if (-not (Test-Path (Join-Path $repo 'main.py'))) { throw "setup 结束但 $repo\main.py 不存在" }
+          if (-not (Test-Path (Join-Path $repo 'selfhost\NoNo.exe'))) {
+            throw "部署树缺少业务宿主 $repo\selfhost\NoNo.exe，不能回退到 Python 进程运行"
+          }
+
+          # 使用 setup 装好的真实运行时验证进程身份，不能只证明 CI 的 Python 能启动宿主。
+          $working = Join-Path $bundle 'data\apps\NoNo\working'
+          $nativeExe = (Get-Item -LiteralPath (Join-Path $working 'selfhost\NoNo.exe')).FullName
+          $probeCode = "import json, os, sys; print(json.dumps({'pid': os.getpid(), 'executable': sys.executable}))"
+          $probeStdout = Join-Path $env:RUNNER_TEMP 'native.stdout.log'
+          $probeStderr = Join-Path $env:RUNNER_TEMP 'native.stderr.log'
+          $nativeProcess = Start-Process -FilePath $nativeExe -ArgumentList '-c', "`"$probeCode`"" `
+            -WorkingDirectory $working -WindowStyle Hidden -Wait -PassThru `
+            -RedirectStandardOutput $probeStdout -RedirectStandardError $probeStderr
+          if ($nativeProcess.ExitCode -ne 0) {
+            Get-Content -LiteralPath $probeStderr -ErrorAction SilentlyContinue
+            throw "便携包业务宿主启动失败，退出码 $($nativeProcess.ExitCode)"
+          }
+          $identity = Get-Content -LiteralPath $probeStdout -Raw | ConvertFrom-Json
+          if ($identity.pid -ne $nativeProcess.Id -or $identity.executable -ne $nativeExe) {
+            throw '便携包业务没有在 NoNo.exe 自身进程中运行'
+          }
+          Write-Host "业务宿主验证成功：$($identity.executable)"
 
           # pip 缓存和运行日志是运行期产物:pip 缓存动辄上百 MB,不随包分发。
           foreach ($dir in @('cache', 'data\logs')) {

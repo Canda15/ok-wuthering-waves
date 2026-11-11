@@ -63,13 +63,14 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 `git merge upstream/<tag>` 不会在这里产生任何冲突；反之，往 `config.py` 里插三行，
 上游每改一次该文件我们就要手工解一次冲突。
 
-`selfhost/` 现在是三件东西：
+`selfhost/` 的自有配置与源码如下：
 
 | 文件 | 作用 | 何时生效 |
 | --- | --- | --- |
 | `overrides.py` | 运行时改 config dict：把上游取消注册的两个页面加回 `custom_tabs`，并改品牌项 | `main.py` 里 `OK(config)` 之前 |
 | `framework_patches.py` | vendored `ok/` 源码的文字补丁清单（品牌标识） | `scripts/sync_ok.py` 每次内联时 |
 | `ok_pin.json` | 框架版本与两个哈希的权威来源 | 同步 / 校验时 |
+| `runtime/host.c`、`runtime/host.rc` | 原生业务宿主及图标、产品名等 EXE 资源 | `scripts/build_runtime.ps1` 编译时 |
 
 当前 `selfhost/overrides.py` 负责把上游取消注册的两个页面（角色代码、多账号配置）加回
 `config['custom_tabs']`。时序上必须在 `OK(config)` 之前——`OK.__init__` 按引用保存这个
@@ -78,6 +79,37 @@ dict，`MainWindow` 读的是同一个对象。
 `tests/TestSelfhostSmoke.py` 是为这个补丁面准备的五条冒烟断言（框架 import 链、注册键仍被
 `MainWindow` 消费、两个页面能在 offscreen 下实例化、品牌 override 生效、源码补丁已施加）。
 上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
+
+## 业务进程为什么显示 NoNo.exe
+
+根目录的 `NoNo.exe` 是 pyappify 启动器。原先配置 `main_script: "main.py"` 时，它实际启动
+`pythonw.exe main.py`，所以任务管理器里仍显示 Python。修改启动器的产品名只影响启动器自身。
+
+现在发布流程先编译 `selfhost/NoNo.exe`，再随 `selfhost/` 推入更新仓库。`pyappify.yml` 的
+`main_script` 改为 `selfhost/NoNo.exe`，启动器直接执行这个业务宿主。宿主加载同一便携目录中的
+`python3.dll`，通过 `Py_Main` 在自身进程执行 `main.py`，因此业务进程的映像名和产品名都为
+NoNo。图标复用 `icons/icon.ico`。这是 [CPython 官方说明的自定义宿主方式](https://docs.python.org/3.12/using/windows.html#the-embeddable-package)，
+[pyappify 官方也支持把 EXE 配为入口](https://github.com/ok-oldking/pyappify/tree/v1.2.4)。
+
+选择此方案是为了继续使用现有的源码更新、依赖管理和动态角色加载。PyInstaller 也能生成业务
+EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍然分发整个便携目录，不能只复制
+`selfhost/NoNo.exe`；它没有把 Python、Qt 和 OCR 模型压进单个文件。
+
+宿主按自身位置定位源码和运行时，并统一业务工作目录。正常启动自动加入 `main.py`；计划任务
+和提权重启的 `NoNo.exe main.py ...`、模块子进程的 `NoNo.exe -m ...` 也继续兼容。
+`tests/TestSelfhostSmoke.py` 中的原生宿主用例验证实际进程身份、中文路径、资源加载、启动参数
+和退出码。便携包生成后还会使用 setup 安装的真实运行时再次检查进程身份。
+
+本地编译需安装 Visual Studio C++ 生成工具和 Windows SDK，在仓库根目录运行：
+
+```powershell
+.\scripts\build_runtime.ps1
+```
+
+构建产物 `selfhost/NoNo.exe` 不提交到源码仓库，只由发布流程推入部署树。新下载的便携包直接
+使用原生宿主；当前 v1.2.4 启动器也会读取部署目录中的 `pyappify.yml`，旧安装升级后从根目录
+的启动器启动一次即可使用新入口并刷新快捷方式。已有计划任务的 XML 仍指向旧解释器，需在
+界面里重新创建。开发调试仍使用原来的 Python 入口。
 
 上游跟踪文件里目前只有一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-63` 的工坊数据源。
 三个历史入口全断了——上游自建的 `cfokwwchar.ok-script.com`（DNS NXDOMAIN）、旧 Pages 的
