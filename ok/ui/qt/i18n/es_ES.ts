@@ -1976,6 +1976,50 @@
             <source>Paused because browser exited</source>
             <translation>En pausa porque se cerró el navegador</translation>
         </message>
+        <message>
+            <source>Create Start Menu Shortcut</source>
+            <translation>Crear acceso directo en el menú Inicio</translation>
+        </message>
+        <message>
+            <source>Create Desktop Shortcut</source>
+            <translation>Crear acceso directo en el escritorio</translation>
+        </message>
+        <message>
+            <source>Create or update the Start Menu shortcut when the app starts</source>
+            <translation>Crear o actualizar el acceso directo del menú Inicio al iniciar la aplicación</translation>
+        </message>
+        <message>
+            <source>Create or update the Desktop shortcut when the app starts</source>
+            <translation>Crear o actualizar el acceso directo del escritorio al iniciar la aplicación</translation>
+        </message>
+        <message>
+            <source>Game</source>
+            <translation>Juego</translation>
+        </message>
+        <message>
+            <source>Tasks</source>
+            <translation>Tareas</translation>
+        </message>
+        <message>
+            <source>Application</source>
+            <translation>Aplicación</translation>
+        </message>
+        <message>
+            <source>Shortcuts</source>
+            <translation>Accesos directos</translation>
+        </message>
+        <message>
+            <source>Developer</source>
+            <translation>Desarrollador</translation>
+        </message>
+        <message>
+            <source>Other</source>
+            <translation>Otros</translation>
+        </message>
+        <message>
+            <source>Created or updated shortcuts: {paths}</source>
+            <translation>Accesos directos creados o actualizados: {paths}</translation>
+        </message>
     </context>
     <context>
         <name>ScheduleTaskTable</name>
@@ -3497,6 +3541,46 @@
         <message>
             <source>Download</source>
             <translation>Descargar</translation>
+        </message>
+        <message>
+            <source>Switch</source>
+            <translation>Cambiar</translation>
+        </message>
+        <message>
+            <source>Pip source</source>
+            <translation>Fuente de pip</translation>
+        </message>
+        <message>
+            <source>System default</source>
+            <translation>Predeterminado del sistema</translation>
+        </message>
+        <message>
+            <source>PyPI</source>
+            <translation>PyPI</translation>
+        </message>
+        <message>
+            <source>Tsinghua</source>
+            <translation>Tsinghua</translation>
+        </message>
+        <message>
+            <source>Aliyun</source>
+            <translation>Aliyun</translation>
+        </message>
+        <message>
+            <source>USTC</source>
+            <translation>USTC</translation>
+        </message>
+        <message>
+            <source>Huawei Cloud</source>
+            <translation>Huawei Cloud</translation>
+        </message>
+        <message>
+            <source>Tencent Cloud</source>
+            <translation>Tencent Cloud</translation>
+        </message>
+        <message>
+            <source>Failed to change pip source: {error}</source>
+            <translation>No se pudo cambiar la fuente de pip: {error}</translation>
         </message>
     </context>
     <context>

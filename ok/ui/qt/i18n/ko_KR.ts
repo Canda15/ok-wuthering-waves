@@ -1977,6 +1977,50 @@
             <source>Paused because browser exited</source>
             <translation>브라우저가 종료되어 일시 중지되었습니다</translation>
         </message>
+        <message>
+            <source>Create Start Menu Shortcut</source>
+            <translation>시작 메뉴 바로 가기 만들기</translation>
+        </message>
+        <message>
+            <source>Create Desktop Shortcut</source>
+            <translation>바탕 화면 바로 가기 만들기</translation>
+        </message>
+        <message>
+            <source>Create or update the Start Menu shortcut when the app starts</source>
+            <translation>앱 시작 시 시작 메뉴 바로 가기를 만들거나 업데이트합니다</translation>
+        </message>
+        <message>
+            <source>Create or update the Desktop shortcut when the app starts</source>
+            <translation>앱 시작 시 바탕 화면 바로 가기를 만들거나 업데이트합니다</translation>
+        </message>
+        <message>
+            <source>Game</source>
+            <translation>게임</translation>
+        </message>
+        <message>
+            <source>Tasks</source>
+            <translation>작업</translation>
+        </message>
+        <message>
+            <source>Application</source>
+            <translation>앱</translation>
+        </message>
+        <message>
+            <source>Shortcuts</source>
+            <translation>바로 가기</translation>
+        </message>
+        <message>
+            <source>Developer</source>
+            <translation>개발자</translation>
+        </message>
+        <message>
+            <source>Other</source>
+            <translation>기타</translation>
+        </message>
+        <message>
+            <source>Created or updated shortcuts: {paths}</source>
+            <translation>바로 가기를 만들거나 업데이트했습니다: {paths}</translation>
+        </message>
     </context>
     <context>
         <name>ScheduleTaskTable</name>
@@ -3498,6 +3542,46 @@
         <message>
             <source>Download</source>
             <translation>다운로드</translation>
+        </message>
+        <message>
+            <source>Switch</source>
+            <translation>전환</translation>
+        </message>
+        <message>
+            <source>Pip source</source>
+            <translation>Pip 소스</translation>
+        </message>
+        <message>
+            <source>System default</source>
+            <translation>시스템 기본값</translation>
+        </message>
+        <message>
+            <source>PyPI</source>
+            <translation>PyPI</translation>
+        </message>
+        <message>
+            <source>Tsinghua</source>
+            <translation>칭화대학교</translation>
+        </message>
+        <message>
+            <source>Aliyun</source>
+            <translation>알리윈</translation>
+        </message>
+        <message>
+            <source>USTC</source>
+            <translation>중국과학기술대학교</translation>
+        </message>
+        <message>
+            <source>Huawei Cloud</source>
+            <translation>Huawei Cloud</translation>
+        </message>
+        <message>
+            <source>Tencent Cloud</source>
+            <translation>Tencent Cloud</translation>
+        </message>
+        <message>
+            <source>Failed to change pip source: {error}</source>
+            <translation>pip 소스 변경 실패: {error}</translation>
         </message>
     </context>
     <context>

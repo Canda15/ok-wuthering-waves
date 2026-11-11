@@ -4,7 +4,9 @@ name: "NoNo"
 uac: true
 icon: "icons/icon.png"
 # website 原本是 http://ok-script.com/ok-ww(上游站点),自维护分支不再对外宣传,
-# 该字段会出现在程序属性/关于信息里,故整行删除。
+# 该字段会出现在程序属性/关于信息里,故整行删除。上游 v3.7.20 新增的 keep_releases
+# 予以保留:它控制发布页保留多少个历史 release。
+keep_releases: 30
 
 profiles:
   # 自维护分支:只保留一个 profile,指向自己的更新仓库 nono-update,不再从上游
