@@ -42,7 +42,8 @@ from src.char.YangYangSp import YangYangSp
 from src.gui.CharacterCodeTab import (
     STATE_DOT_SIZE, CharacterCodeTab, ExportTeamDialog, ImportTeamDialog, TeamInfoDialog,
     TeamSelectionDialog, WorkshopDialog, fetch_all_workshop_teams, fetch_workshop_codes,
-    WORKSHOP_ARCHIVE_HOSTS, WORKSHOP_TEAM_URL, WORKSHOP_TEAMS_ALL_URL, team_state_color, workshop_team_url,
+    WORKSHOP_ARCHIVE_HOSTS, WORKSHOP_RAW_BASE, WORKSHOP_TEAM_URL, WORKSHOP_TEAMS_ALL_URL,
+    team_state_color, workshop_archive_url, workshop_team_url,
 )
 
 
@@ -215,13 +216,32 @@ class TestCharacterCodeTab(unittest.TestCase):
     def test_workshop_url_uses_sorted_team_slug(self):
         self.assertEqual(
             workshop_team_url((Baizhi, Augusta, Aemeath)),
-            "https://okwwcharcode.ok-script.com/teams/Aemeath_Augusta_Baizhi.json",
+            WORKSHOP_RAW_BASE + "/teams/Aemeath_Augusta_Baizhi.json",
         )
 
     def test_workshop_url_sanitizes_character_name_punctuation(self):
         self.assertEqual(
             workshop_team_url((YangYangSp, Chisa, Suisui)),
-            "https://okwwcharcode.ok-script.com/teams/Chisa_Suisui_Yangyang_Xuanling.json",
+            WORKSHOP_RAW_BASE + "/teams/Chisa_Suisui_Yangyang_Xuanling.json",
+        )
+
+    def test_workshop_archive_url_normalizes_to_our_mirror(self):
+        # 父仓库(含旧分支)与已下线站点都必须落到同一个 raw 基线,否则工坊会依赖别人的仓库
+        for url in (
+            "https://raw.githubusercontent.com/yamadafz/ok-ww-char-code/master/codes/a.zip",
+            "https://cfokwwchar.ok-script.com/codes/a.zip",
+            "https://okwwcharcode.ok-script.com/codes/a.zip",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(workshop_archive_url(url), WORKSHOP_RAW_BASE + "/codes/a.zip")
+        # 无关仓库与非 https 地址不改写(前者合法、后者交由白名单校验拒绝)
+        self.assertEqual(
+            workshop_archive_url("https://raw.githubusercontent.com/example/other.zip"),
+            "https://raw.githubusercontent.com/example/other.zip",
+        )
+        self.assertEqual(
+            workshop_archive_url("http://okwwcharcode.ok-script.com/a.zip"),
+            "http://okwwcharcode.ok-script.com/a.zip",
         )
 
     def test_workshop_urls_stay_inside_the_archive_whitelist(self):
@@ -283,13 +303,16 @@ class TestCharacterCodeTab(unittest.TestCase):
         tab = CharacterCodeTab()
         try:
             for field, url, expected_url in (
-                ("downloadUrl", "https://cfokwwchar.ok-script.com/team.zip",
-                 "https://cfokwwchar.ok-script.com/team.zip"),
+                # 父仓库生成的 raw 地址 -> 我方 fork
+                ("downloadUrl",
+                 "https://raw.githubusercontent.com/yamadafz/ok-ww-char-code/main/codes/team%20name.zip",
+                 WORKSHOP_RAW_BASE + "/codes/team%20name.zip"),
+                # 无关仓库的 raw 地址原样保留(白名单允许任意 raw 仓库)
                 ("rawUrl", "https://raw.githubusercontent.com/example/team.zip",
                  "https://raw.githubusercontent.com/example/team.zip"),
-                # 旧域名自动改写的目标就是当前主域名,因此现在是恒等映射
+                # 已下线的旧站点 -> 接在 raw 基线后面
                 ("downloadUrl", "https://okwwcharcode.ok-script.com/codes/team%20name.zip",
-                 "https://okwwcharcode.ok-script.com/codes/team%20name.zip"),
+                 WORKSHOP_RAW_BASE + "/codes/team%20name.zip"),
             ):
                 with (
                     self.subTest(url=url),

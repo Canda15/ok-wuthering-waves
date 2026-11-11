@@ -79,10 +79,19 @@ dict，`MainWindow` 读的是同一个对象。
 `MainWindow` 消费、两个页面能在 offscreen 下实例化、品牌 override 生效、源码补丁已施加）。
 上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
 
-上游跟踪文件里目前只有一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-49` 的工坊 URL 指回
-`okwwcharcode.ok-script.com`（GitHub Pages）——上游自建的新工坊服务器 `cfokwwchar.ok-script.com`
-整个域名已消失（2026-11-07 实测 DNS NXDOMAIN），而旧 Pages 仍随上游的 ok-ww-char-code 仓库
-自动更新。哪天上游自己修这几个 URL 时会产生冲突：先看上游改成了什么，指向一个活着的源就取上游，
+上游跟踪文件里目前只有一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-63` 的工坊数据源。
+三个历史入口全断了——上游自建的 `cfokwwchar.ok-script.com`（DNS NXDOMAIN）、旧 Pages 的
+`okwwcharcode.ok-script.com`（证书失效）、原仓库 `ok-oldking/ok-ww-char-code`（已删除，API 404）。
+社区把工坊改成 raw.githubusercontent.com 托管（见该仓库 `scripts/generate.js` 的 `BASE_DOMAIN`），
+因此我们把 `WORKSHOP_REPO` 指向自己的 fork `Canda15/ok-ww-char-code`：索引、按队详情、代码包
+都来自这一个仓库。
+
+`workshop_archive_url()` 负责把索引里的下载地址归一到这个仓库——因为索引不由我们生成：
+我们 fork 的 `package.json` 里 `repository` 仍写父仓库 `yamadafz/ok-ww-char-code`，将来重跑
+`generate.js` 会再次生成父仓库 URL；旧索引还可能带已下线的站点域名。归一只改 owner 与分支，
+`codes/` 下的文件名保持原样（实测索引里 72 个文件名与我们是同一份）。
+
+哪天上游自己修这几个常量会产生冲突：先看上游改成了什么，指向一个活着的源就取上游，
 否则保留我们的。
 
 ## 不许做的事

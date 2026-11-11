@@ -40,14 +40,19 @@ from src.char.CustomCharLoader import (
 )
 
 BASE_CHAR_URL = "https://raw.githubusercontent.com/ok-oldking/ok-wuthering-waves/refs/heads/master/src/char/BaseChar.py"
-UPLOAD_TEAM_URL = "https://github.com/ok-oldking/ok-ww-char-code"
-# 工坊服务器:上游把服务从 GitHub Pages(okwwcharcode)迁到自建(cfokwwchar)后,新服务器
-# 整个域名已消失(DNS NXDOMAIN,上游 master 仍指向它),而旧 Pages 一直在线并随
-# ok-oldking/ok-ww-char-code 的 deploy.yml 自动更新,因此指回旧域名;cfokwwchar 留在
-# 白名单里,上游恢复后只需把下面两个 URL 改回去。
-WORKSHOP_TEAMS_ALL_URL = "https://okwwcharcode.ok-script.com/teams.json"
-WORKSHOP_TEAM_URL = "https://okwwcharcode.ok-script.com/teams/{slug}.json"
-WORKSHOP_ARCHIVE_HOSTS = {"cfokwwchar.ok-script.com", "okwwcharcode.ok-script.com", "raw.githubusercontent.com"}
+UPLOAD_TEAM_URL = "https://github.com/Canda15/ok-ww-char-code"
+# 工坊数据源:上游自建的 cfokwwchar.ok-script.com 域名早已消失(2026-11 实测 NXDOMAIN),
+# 原仓库 ok-oldking/ok-ww-char-code 已删除,旧 GitHub Pages 的自定义域名
+# okwwcharcode.ok-script.com 证书也已失效——三个历史入口全断。社区现在把工坊直接托管在
+# raw.githubusercontent.com(见该仓库 scripts/generate.js 的 BASE_DOMAIN),因此以我们自己的
+# fork 为唯一来源:索引、按队详情、代码包都来自同一个仓库,不再依赖任何第三方域名。
+WORKSHOP_REPO = "Canda15/ok-ww-char-code"
+WORKSHOP_BRANCH = "main"
+WORKSHOP_RAW_BASE = f"https://raw.githubusercontent.com/{WORKSHOP_REPO}/{WORKSHOP_BRANCH}"
+WORKSHOP_TEAMS_ALL_URL = f"{WORKSHOP_RAW_BASE}/teams.json"
+WORKSHOP_TEAM_URL = f"{WORKSHOP_RAW_BASE}/teams/{{slug}}.json"
+# 归一到我方镜像后只剩这一个下载宿主;收紧白名单即最小权限
+WORKSHOP_ARCHIVE_HOSTS = {"raw.githubusercontent.com"}
 WORKSHOP_USER_AGENT = "ok-wuthering-waves"
 logger = Logger.get_logger(__name__)
 
@@ -465,6 +470,30 @@ def workshop_team_slug(team):
 
 def workshop_team_url(team):
     return WORKSHOP_TEAM_URL.format(slug=quote(workshop_team_slug(team), safe="_-"))
+
+
+# 索引里的下载地址不由我们生成,可能是三种历史写法:已下线的自建域名、旧 Pages 自定义域名,
+# 以及生成时写死的其他仓库(我们 fork 的 package.json 里 repository 仍指向父仓库,重跑
+# generate.js 会再次生成父仓库地址)。统一归一到 WORKSHOP_RAW_BASE,工坊才只依赖一个仓库。
+_RETIRED_WORKSHOP_HOSTS = {"cfokwwchar.ok-script.com", "okwwcharcode.ok-script.com"}
+_WORKSHOP_OWNER, _, _WORKSHOP_REPO_NAME = WORKSHOP_REPO.partition("/")
+
+
+def workshop_archive_url(url):
+    """把索引里的代码包地址归一到我方镜像仓库,返回改写后的 URL 字符串。"""
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https":
+        return str(url or "")
+    if parsed.hostname in _RETIRED_WORKSHOP_HOSTS:
+        # 旧站点把仓库内容挂在站点根下(/codes/x.zip),直接接到 raw 基线后面即可
+        return f"{WORKSHOP_RAW_BASE}{parsed.path}"
+    # raw.githubusercontent.com/<owner>/ok-ww-char-code/<branch>/... -> 换成我方 owner 与分支
+    segments = parsed.path.split("/")
+    if parsed.hostname == "raw.githubusercontent.com" and len(segments) > 4 and segments[2] == _WORKSHOP_REPO_NAME:
+        segments[1] = WORKSHOP_REPO.partition("/")[0]
+        segments[3] = WORKSHOP_BRANCH
+        return parsed._replace(path="/".join(segments)).geturl()
+    return parsed.geturl()
 
 
 def fetch_all_workshop_teams():
@@ -1562,12 +1591,8 @@ class CharacterCodeTab(CustomTab):
         dialog.exec()
 
     def _import_workshop_code(self, code, parent):
-        url = code.get("downloadUrl") or code.get("rawUrl")
-        parsed = urlparse(str(url or ""))
-        # Published workshop indexes can still contain the previous server's URLs.
-        if parsed.hostname == "okwwcharcode.ok-script.com":
-            parsed = parsed._replace(netloc=urlparse(WORKSHOP_TEAMS_ALL_URL).netloc)
-            url = parsed.geturl()
+        url = workshop_archive_url(code.get("downloadUrl") or code.get("rawUrl"))
+        parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.hostname not in WORKSHOP_ARCHIVE_HOSTS:
             show_info_bar(parent, self.tr("Workshop download URL is invalid."), title=self.tr("Error"), error=True)
             return
