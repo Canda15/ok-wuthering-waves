@@ -97,7 +97,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/foreground_input.py.patch",
       "before_sha256": null,
-      "after_sha256": "453487b06c5feb1dd10e57b539c4e5acc9c49ebc7bdd95456f170e7716e8ffbb"
+      "after_sha256": "d6429d5dc4a94dc5b2bdc5ee767698d44beb1787a1c49771b98b833c1567a817"
     },
     {
       "path": "device/interaction_methods/foreground_post_message.py",
@@ -177,7 +177,7 @@
       "format": "unified_diff",
       "payload": "patches/notification/windows_messenger.py.patch",
       "before_sha256": "d8be6e682006450ec482ec2cc3e16bc20f90f692f8ed66c12558315fc72cc981",
-      "after_sha256": "31966ae1be9e849b54971040067890c8a7396a7481d676403e61e1033fa38409"
+      "after_sha256": "f944fb25b69511abf98028283bbb5ccfbc333b6fca91d409e7f5cd90d57c49b9"
     },
     {
       "path": "task/TaskExecutor.py",
@@ -185,7 +185,7 @@
       "format": "unified_diff",
       "payload": "patches/task/TaskExecutor.py.patch",
       "before_sha256": "85862d681d2faaf40a9df4c419c765a6a8cdcc70b8e76efb53989ead8ab88814",
-      "after_sha256": "d8386f4340fd3fce0edc3ced502028c3dd146077971e00743e689291760efed5"
+      "after_sha256": "b9c62831f44979b98a8815d58da637794b40aa48c7fb69a20c7b9038cc13a0ee"
     },
     {
       "path": "task/task.py",

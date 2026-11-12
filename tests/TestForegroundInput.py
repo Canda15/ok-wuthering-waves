@@ -1,6 +1,7 @@
 """前台输入状态机与跨层生命周期；全部原生输入及用户配置均使用替身。"""
 
 import ctypes
+import tempfile
 import threading
 import unittest
 from collections import deque
@@ -23,10 +24,11 @@ from ok.device.interaction_methods.foreground_input import (
     InputEvent, Win32InputBackend, _INPUT,
 )
 from ok.device.interaction_methods.pynput import PynputInteraction
+from ok.feature.Box import Box
 from ok.task.TaskExecutor import ExecutorJob, TaskExecutor
 from ok.core.start_controller import StartController
 from ok.core.mcp_server import LocalMcpServer
-from ok.task.exceptions import TaskDisabledException
+from ok.task.exceptions import TaskDisabledException, WaitFailedException
 from ok.task.task import BaseTask
 from ok.util import window as window_module
 
@@ -628,12 +630,166 @@ class TestForegroundLifecycle(InputFixture):
         self.assertLess(self.executor.business_time() - start, 0.1)
         self.assertEqual(condition.call_count, 2)
 
+    def test_条件持续成立的稳定期不执行补救动作(self):
+        recognized = object()
+        condition = Mock(return_value=recognized)
+        post_action = Mock()
+        self.executor.wait_until_settle_time = 0.05
+        start = self.executor.business_time()
+
+        result = self.task.wait_until(condition, time_out=0.2, post_action=post_action)
+
+        self.assertIs(result, recognized)
+        self.assertGreaterEqual(self.executor.business_time() - start, 0.05)
+        self.assertGreater(condition.call_count, 1)
+        post_action.assert_not_called()
+
+    def test_稳定条件丢失后只在丢失时补救并重新计时(self):
+        observations = []
+        post_action = Mock()
+
+        def condition():
+            observations.append(self.executor.business_time())
+            # 第三帧条件丢失，第四帧必须开始新的稳定期。
+            return len(observations) != 3
+
+        self.assertTrue(self.executor.wait_condition(
+            condition, time_out=0.3, settle_time=0.05, post_action=post_action))
+
+        post_action.assert_called_once()
+        self.assertGreaterEqual(self.executor.business_time() - observations[3], 0.05)
+
+    def test_稳定期未满仍保留业务超时和失败异常(self):
+        for raise_if_not_found in (False, True):
+            with self.subTest(raise_if_not_found=raise_if_not_found):
+                condition = Mock(return_value=True)
+                post_action = Mock()
+                start = self.executor.business_time()
+                kwargs = dict(time_out=0.1, settle_time=1, post_action=post_action,
+                              raise_if_not_found=raise_if_not_found)
+                if raise_if_not_found:
+                    with self.assertRaises(WaitFailedException):
+                        self.executor.wait_condition(condition, **kwargs)
+                else:
+                    self.assertIsNone(self.executor.wait_condition(condition, **kwargs))
+
+                self.assertAlmostEqual(self.executor.business_time() - start, 0.1, places=5)
+                self.assertGreater(condition.call_count, 1)
+                post_action.assert_not_called()
+
+    def test_稳定期取消不因跳过补救而被吞掉(self):
+        condition = Mock(return_value=True)
+        post_action = Mock()
+        self.clock.after_wait = lambda: setattr(self.task, '_enabled', False) if self.capture.count == 2 else None
+
+        with self.assertRaises(TaskDisabledException):
+            self.task.wait_until(condition, time_out=1, settle_time=0.5, post_action=post_action)
+
+        self.assertEqual(condition.call_count, 1)
+        self.assertLess(self.clock(), 1000.1)
+        post_action.assert_not_called()
+
+    def test_稳定等待中的输入错误继续向上传播(self):
+        error = ForegroundInputError('受控替身模拟识别过程中输入失败')
+        condition = Mock(side_effect=[True, error])
+        post_action = Mock()
+
+        with self.assertRaises(ForegroundInputError) as failure:
+            self.task.wait_until(condition, time_out=1, settle_time=0.5, post_action=post_action)
+
+        self.assertIs(failure.exception, error)
+        post_action.assert_not_called()
+
+    def test_抓帧内失焦恢复后稳定期重新计时(self):
+        # 先完成首次绑定回调，下面只统计实际失焦恢复。
+        self.executor.next_frame()
+        self.task.on_foreground_resume.reset_mock()
+        observations = []
+        post_action = Mock()
+        lost_focus = False
+
+        def change_focus():
+            nonlocal lost_focus
+            if not lost_focus:
+                self.native.foreground = 20
+                lost_focus = True
+            elif self.clock() >= 1000.14:
+                self.native.foreground = 10
+                self.clock.after_wait = None
+
+        def condition():
+            observations.append(self.executor.business_time())
+            if len(observations) == 1:
+                # 在下一次抓帧内部失焦并恢复，外层循环看不到持续失焦的状态。
+                self.clock.after_wait = change_focus
+            return True
+
+        self.assertTrue(self.executor.wait_condition(
+            condition, time_out=0.3, settle_time=0.08, post_action=post_action))
+
+        self.assertGreater(self.executor.focus_wait_seconds, 0)
+        self.assertGreaterEqual(self.executor.business_time() - observations[1], 0.08)
+        self.task.on_foreground_resume.assert_called_once()
+        post_action.assert_not_called()
+        self.window.bring_to_front.assert_not_called()
+
+    def test_海之女确认框稳定后只点击一次且不被Esc关闭(self):
+        config_directory = self.enterContext(tempfile.TemporaryDirectory(prefix='稳定等待配置-'))
+        self.enterContext(patch('ok.util.config.Config.config_folder', config_directory))
+        from src.task.FarmEchoTask import FarmEchoTask
+
+        # 仅初始化公共任务状态，隔离真实配置；保留海之女到通用等待的生产调用链。
+        task = FarmEchoTask.__new__(FarmEchoTask)
+        BaseTask.__init__(task, self.executor, self.task._app)
+        task._enabled = task.running = True
+        task.config = {'Boss': 'Lady of the Sea'}
+        task.boss_list = ['Lady of the Sea']
+        task.in_combat = Mock(return_value=False)
+        task.in_world = Mock(return_value=False)
+        task.wait_in_team_and_world = Mock()
+        task.on_foreground_resume = Mock()
+        task.sleep = self.executor.sleep
+        self.executor.current_task = task
+        self.executor.onetime_tasks = [task]
+        self.executor.wait_scene_timeout = 3
+        confirm = Box(15, 10, 5, 5, name='确认框')
+        dialog_visible = False
+        send_key = task.send_key
+
+        def send_escape(key, **kwargs):
+            nonlocal dialog_visible
+            self.assertEqual(key, 'esc')
+            dialog_visible = not dialog_visible
+            return send_key(key, **kwargs)
+
+        task.send_key = Mock(side_effect=send_escape)
+        task.find_one = Mock(side_effect=lambda *args, **kwargs: confirm if dialog_visible else None)
+        task.click_box = Mock(wraps=task.click_box)
+
+        task.manage_boss_interactions()
+
+        task.send_key.assert_called_once_with('esc', after_sleep=0.5)
+        task.click_box.assert_called_once_with(confirm, -1, 0.5, after_sleep=0)
+        task.wait_in_team_and_world.assert_called_once_with(time_out=120)
+        self.assertFalse(self.core._held)
+
     def test_识别等待的外部绝对期限仍然有效(self):
         self.native.foreground = 20
         condition = Mock()
         self.assertIsNone(self.executor.wait_condition(condition, time_out=10, deadline=1000.2))
         self.assertAlmostEqual(self.clock(), 1000.2, places=5)
         condition.assert_not_called()
+
+    def test_稳定期的外部绝对期限仍然有效(self):
+        condition = Mock(return_value=True)
+        post_action = Mock()
+
+        self.assertIsNone(self.executor.wait_condition(
+            condition, time_out=10, settle_time=1, post_action=post_action, deadline=1000.1))
+
+        self.assertAlmostEqual(self.clock(), 1000.1, places=5)
+        self.assertGreater(condition.call_count, 1)
+        post_action.assert_not_called()
 
     def test_普通sleep恢复前取得新帧且不偷占前台(self):
         self.native.foreground = 20

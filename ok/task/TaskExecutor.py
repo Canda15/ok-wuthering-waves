@@ -823,6 +823,7 @@ class TaskExecutor:
         time_out = self.wait_scene_timeout if time_out == 0 else time_out
         start = self.business_time()
         settled = None
+        focus_wait = self.focus_wait_seconds
         while not self.exit_event.is_set():
             self.check_enabled(check_pause=False)
             if deadline is not None and time.monotonic() >= deadline:
@@ -839,6 +840,11 @@ class TaskExecutor:
             if self.next_frame(time_out=min(0.25, remaining), deadline=deadline) is None:
                 continue
             result = condition()
+            current_focus_wait = self.focus_wait_seconds
+            if current_focus_wait != focus_wait:
+                # 抓帧或条件内部可能已经失焦并恢复，连续稳定期不能跨过这次中断。
+                settled = None
+                focus_wait = current_focus_wait
             if result:
                 settle = self.wait_until_settle_time if settle_time == -1 else settle_time
                 now = self.business_time()
@@ -846,6 +852,8 @@ class TaskExecutor:
                     return result
                 if settled is None:
                     settled = now
+                # 条件已出现时只等待稳定，补救动作可能反而关闭确认框。
+                continue
             else:
                 settled = None
             if post_action is not None:

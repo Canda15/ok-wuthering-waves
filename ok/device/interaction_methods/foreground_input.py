@@ -175,6 +175,37 @@ class Win32InputBackend:
         return int(self.user32.VkKeyScanExW(char, self._layout()))
 
 
+def window_belongs_to(native, anchor, candidate):
+    """只读判断窗口归属，不创建输入核心或会话，也不改变焦点和持有状态。"""
+    if not anchor or not candidate:
+        return False
+    try:
+        if not native.is_window(anchor) or not native.is_window(candidate):
+            return False
+        if candidate == anchor:
+            return True
+        if native.process_id(candidate) != native.process_id(anchor):
+            return False
+        root, anchor_root = native.root_window(candidate), native.root_window(anchor)
+        if (native.is_child(anchor, candidate) or native.is_child(candidate, anchor)
+                or root and root == anchor_root):
+            return True
+        # 共同启动器的拥有根不能授予权限，必须沿即时拥有链到达具体输入锚点。
+        current, seen = root, set()
+        while current and current not in seen and native.is_window(current):
+            if current == anchor:
+                return True
+            seen.add(current)
+            owner = native.owner_window(current)
+            if owner == anchor:
+                return True
+            current = native.root_window(owner) if owner and native.is_window(owner) else 0
+        return False
+    except Exception:
+        # 窗口可能在查询中销毁或失效；无法证明归属时不允许输入或通知交接。
+        return False
+
+
 KEY_ALIASES = {
     'lshift': 'shift_l', 'rshift': 'shift_r', 'lctrl': 'ctrl_l', 'rctrl': 'ctrl_r',
     'lalt': 'alt_l', 'ralt': 'alt_r', 'lcontrol': 'ctrl_l', 'rcontrol': 'ctrl_r',
@@ -405,35 +436,9 @@ class ForegroundInput:
         return (target.hwnd > 0 and self.native.is_window(target.hwnd)
                 and (target.process_id is None or self.native.process_id(target.hwnd) == target.process_id))
 
-    def _owned_by(self, hwnd, anchor):
-        # 共同启动器的拥有根不能授予权限，必须沿即时拥有链真正到达具体输入锚点。
-        current, seen = self.native.root_window(hwnd), set()
-        while current and current not in seen and self.native.is_window(current):
-            if current == anchor:
-                return True
-            seen.add(current)
-            owner = self.native.owner_window(current)
-            if owner == anchor:
-                return True
-            current = self.native.root_window(owner) if owner and self.native.is_window(owner) else 0
-        return False
-
     def _allowed(self, target, hwnd):
-        if not hwnd or not self.native.is_window(hwnd):
-            return False
-        for anchor in (target.hwnd, *target.allowed_hwnds):
-            if not anchor or not self.native.is_window(anchor):
-                continue
-            if hwnd == anchor:
-                return True
-            # 同进程、同根或拥有关系才允许；同进程的其它无关窗口不自动放行。
-            if self.native.process_id(hwnd) != self.native.process_id(anchor):
-                continue
-            root, anchor_root = self.native.root_window(hwnd), self.native.root_window(anchor)
-            if (self.native.is_child(anchor, hwnd) or self.native.is_child(hwnd, anchor)
-                    or root and root == anchor_root or self._owned_by(hwnd, anchor)):
-                return True
-        return False
+        return any(window_belongs_to(self.native, anchor, hwnd)
+                   for anchor in (target.hwnd, *target.allowed_hwnds))
 
     def _activate(self, session):
         # 上一会话释放失败时 active 可能已回到游戏；外来持有仍必须先清空。

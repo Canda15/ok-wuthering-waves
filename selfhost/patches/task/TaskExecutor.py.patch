@@ -448,7 +448,7 @@
          return None
  
      def _run_job(self, job):
-@@ -622,57 +791,67 @@
+@@ -622,57 +791,75 @@
          logger.info(f'start {job}')
          self.current_job = job
          start = time.time()
@@ -497,6 +497,7 @@
 +        time_out = self.wait_scene_timeout if time_out == 0 else time_out
 +        start = self.business_time()
 +        settled = None
++        focus_wait = self.focus_wait_seconds
          while not self.exit_event.is_set():
 +            self.check_enabled(check_pause=False)
 +            if deadline is not None and time.monotonic() >= deadline:
@@ -514,6 +515,11 @@
 +            if self.next_frame(time_out=min(0.25, remaining), deadline=deadline) is None:
 +                continue
              result = condition()
++            current_focus_wait = self.focus_wait_seconds
++            if current_focus_wait != focus_wait:
++                # 抓帧或条件内部可能已经失焦并恢复，连续稳定期不能跨过这次中断。
++                settled = None
++                focus_wait = current_focus_wait
              if result:
 -                result_str = list_or_obj_to_str(result)
 -                if settle_time == -1:
@@ -535,6 +541,8 @@
                      return result
 +                if settled is None:
 +                    settled = now
++                # 条件已出现时只等待稳定，补救动作可能反而关闭确认框。
++                continue
              else:
 -                settled = 0
 +                settled = None
@@ -548,7 +556,7 @@
          if raise_if_not_found:
              raise WaitFailedException()
          return None
-@@ -724,7 +903,7 @@
+@@ -724,7 +911,7 @@
  
      def next_task(self) -> tuple:
          if self.exit_event.is_set():
@@ -557,7 +565,7 @@
              return None, False, False
          with self.lock:
              while self.onetime_task_queue:
-@@ -764,20 +943,22 @@
+@@ -764,20 +951,22 @@
          ]
          return min(delays, default=default)
  
@@ -592,7 +600,7 @@
          while not self.exit_event.is_set():
              wake_version = self._get_wake_version()
              job = self._pop_job()
-@@ -804,10 +985,12 @@
+@@ -804,10 +993,12 @@
                      communicate.task.emit(task)
                  self._prepare_task_for_run(is_trigger_task)
                  if cycled or self._frame is None:
@@ -609,7 +617,7 @@
                  if is_trigger_task:
                      if task.run():
                          self.trigger_task_index = -1
-@@ -817,10 +1000,16 @@
+@@ -817,10 +1008,16 @@
                      prevent_sleeping(True)
                      try:
                          logger.debug(f'start running onetime_task {task.name}')
@@ -627,7 +635,7 @@
                      task.disable()
                      communicate.task_done.emit(task)
                      if task.exit_after_task or task.config.get('Exit After Task'):
-@@ -830,13 +1019,20 @@
+@@ -830,13 +1027,20 @@
                          self.device_manager.stop_hwnd()
                          time.sleep(5)
                          communicate.quit.emit()
@@ -649,7 +657,7 @@
                  break
              except Exception as e:
                  if isinstance(e, CaptureException):
-@@ -862,6 +1058,7 @@
+@@ -862,6 +1066,7 @@
          self.destroy()
  
      def _finish_task(self, task, is_trigger_task):
@@ -657,7 +665,7 @@
          if self.current_task is None and not task.running:
              return
          task.running = False
-@@ -871,6 +1068,7 @@
+@@ -871,6 +1076,7 @@
  
      def stop(self):
          logger.info('stop')
@@ -665,7 +673,7 @@
          self.exit_event.set()
          self._wake_executor()
  
-@@ -882,7 +1080,8 @@
+@@ -882,7 +1088,8 @@
              if getattr(self, '_destroyed', False):
                  return
              self._destroyed = True

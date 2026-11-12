@@ -1237,13 +1237,30 @@ class BaseWWTask(BaseTask):
         return 'unknown_lang'
 
     def open_esc_menu(self):
-        try:
-            self.send_key_down('alt')
-            self.sleep(.05)
-            self.click_relative(.95, .04)
-        finally:
-            self.send_key_up('alt')
-        self.sleep(0.5)
+        recovering = False
+        while True:
+            try:
+                if recovering:
+                    # 点击可能已经打开菜单，恢复后先判断页面，避免重复点击关闭它。
+                    if self.find_one('esc_setting'):
+                        return
+                    self.ensure_main()
+                epoch = getattr(self, '_foreground_epoch', 0)
+                try:
+                    self.send_key_down('alt')
+                    self.sleep(.05)
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('菜单手势已中断，需要重新按住 Alt')
+                    self.click_relative(.95, .04)
+                finally:
+                    self.send_key_up('alt')
+                self.sleep(0.5)
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('菜单画面已刷新，需要重新判断当前页面')
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def open_boss_book(self, name, after_sleep=2):
         self.log_info(self.tr('open_boss_book {name}').format(name=name))
@@ -1290,20 +1307,32 @@ class BaseWWTask(BaseTask):
                         self.send_key(book_key, after_sleep=4)
                         self.log_info(self.tr('send {book_key} key to open').format(book_key=book_key))
                     if self.in_team_and_world():
+                        epoch = getattr(self, '_foreground_epoch', 0)
                         try:
                             self.send_key_down('alt')
                             self.sleep(0.05)
+                            if epoch != getattr(self, '_foreground_epoch', 0):
+                                raise ForegroundInputInterrupted('图鉴手势已中断，需要重新判断当前页面')
                             self.click_relative(0.77, 0.05)
                             self.sleep(0.02)
                         finally:
                             self.send_key_up('alt')
                         self.sleep(4)
+                epoch = getattr(self, '_foreground_epoch', 0)
                 gray_book_boss = self.wait_book(feature)
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('图鉴识别期间画面已刷新，需要重新判断识别结果')
                 if not gray_book_boss:
                     self.log_error(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"), notify=True)
                     raise Exception(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"))
                 self.sleep(2)
+                # sleep 会静默等待前台并刷新画面，旧识别框不能用于恢复后的点击。
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('图鉴画面已刷新，需要重新识别页签')
                 self.click_box(gray_book_boss, after_sleep=1.5)
+                # 页签选择是幂等动作；点击后恢复也须重读页面，不能把旧框交给后续步骤。
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('图鉴页签点击后画面已刷新，需要重新识别当前页面')
                 return gray_book_boss
             except ForegroundInputInterrupted:
                 self._recover_foreground_input()

@@ -36,7 +36,7 @@ class DomainTask(WWOneTimeTask, BaseCombatTask):
             try:
                 confirm = self.find_one('gray_confirm_exit_button', threshold=.7)
                 if confirm:
-                    self.click(confirm, relative_x=-1, after_sleep=1)
+                    self.click_box(confirm, relative_x=-1, after_sleep=1)
                     self.wait_in_team_and_world(time_out=self.teleport_timeout)
                 elif self.in_realm():
                     self.send_key('esc', after_sleep=1)

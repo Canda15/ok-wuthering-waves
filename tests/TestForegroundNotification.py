@@ -11,6 +11,7 @@ import win32con
 
 from ok.device.interaction_methods.foreground_input import (
     ForegroundInput, ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget,
+    get_shared_foreground_input,
 )
 from ok.notification.manager import NotificationManager
 from ok.notification.messenger_images import _paste_from_context_menu, _wait_popup_text
@@ -37,6 +38,8 @@ class NotificationNative:
             300: (1, 300, 300, (0, 0)),
             900: (3, 900, 900, (1000, 500)),
         }
+        # 直接拥有者与 GA_ROOTOWNER 分开建模，才能区分多级拥有链和共同启动器。
+        self.owners = {220: 200}
         self.points = {}
         self.log = []
         self.on_send = None
@@ -55,8 +58,7 @@ class NotificationNative:
         return self.windows[hwnd][2 if owned else 1]
 
     def owner_window(self, hwnd):
-        root, owner = self.windows[hwnd][1:3]
-        return owner if owner != root else 0
+        return self.owners.get(hwnd, 0)
 
     def is_child(self, hwnd, child):
         return child != hwnd and self.root_window(child) == hwnd
@@ -183,6 +185,7 @@ class ForegroundNotificationCase(unittest.TestCase):
         self.gui.IsChild.side_effect = self.native.is_child
         self.gui.GetAncestor.side_effect = lambda hwnd, flag: self.native.root_window(
             hwnd, owned=flag == win32con.GA_ROOTOWNER)
+        self.gui.GetWindow.side_effect = lambda hwnd, _: self.native.owner_window(hwnd)
         self.gui.GetForegroundWindow.side_effect = self.native.foreground_window
         self.gui.SetForegroundWindow.side_effect = self.native.switch
         self.gui.IsIconic.return_value = False
@@ -223,6 +226,17 @@ class ForegroundNotificationCase(unittest.TestCase):
         manager.desktop_pipeline.interval = 0
         self.addCleanup(manager.stop)
         return manager, executor
+
+    def add_shared_owner_windows(self):
+        self.native.windows.update({
+            1: (1, 1, 1, (0, 0)),
+            100: (1, 100, 1, (0, 0)),
+            110: (1, 100, 1, (10, 10)),
+            120: (1, 120, 1, (20, 20)),
+            130: (1, 130, 1, (30, 30)),
+            300: (1, 300, 1, (300, 300)),
+        })
+        self.native.owners.update({100: 1, 120: 100, 130: 120, 300: 1})
 
     @staticmethod
     def desktop_enqueue_event(manager, message):
@@ -375,6 +389,91 @@ class TestMessengerForeground(ForegroundNotificationCase):
         with self.assertRaises(ForegroundInputInterrupted):
             automation.send('受控联系人', '', '测试', [])
         self.assertFalse(any(item[0] in ('move', 'input') for item in self.native.log))
+
+    def test_window_query_matches_core_without_changing_input_ownership(self):
+        self.add_shared_owner_windows()
+        game = self.core.session('game', ForegroundTarget(100, process_id=1))
+        game.key_down('ctrl')
+        held, events = dict(self.core._held), list(self.native.log)
+        candidates = ((100, True), (110, True), (120, True), (130, True),
+                      (300, False), (1, False), (900, False), (999, False), (0, False))
+        with patch('ok.notification.windows_messenger.get_shared_foreground_input') as factory:
+            for candidate, expected in candidates:
+                with self.subTest(candidate=candidate):
+                    self.assertEqual(MessengerAutomation.window_belongs_to(100, candidate), expected)
+                    self.assertEqual(self.core._allowed(game.target(), candidate), expected)
+            factory.assert_not_called()
+        self.assertIs(self.core._active, game)
+        self.assertEqual(self.core._held, held)
+        self.assertEqual(self.native.log, events)
+        self.gui.SetForegroundWindow.assert_not_called()
+
+    def test_window_query_rejects_destroyed_owner_and_cyclic_chain(self):
+        self.add_shared_owner_windows()
+        self.native.windows[130] = (1, 130, 100, (30, 30))
+        del self.native.windows[120]
+        self.assertFalse(MessengerAutomation.window_belongs_to(100, 130))
+        self.native.windows[120] = (1, 120, 100, (20, 20))
+        self.native.owners[120] = 130
+        self.assertFalse(MessengerAutomation.window_belongs_to(100, 130))
+
+    def test_window_query_rejects_failed_native_queries(self):
+        queries = ('win32gui.IsWindow', 'win32process.GetWindowThreadProcessId',
+                   'win32gui.GetAncestor', 'win32gui.IsChild', 'win32gui.GetWindow')
+        for query in queries:
+            with self.subTest(query=query), patch(
+                    f'ok.notification.windows_messenger.{query}',
+                    side_effect=OSError('受控窗口查询失败')):
+                self.assertFalse(MessengerAutomation.window_belongs_to(200, 220))
+
+    def test_read_only_query_does_not_restart_stopped_core(self):
+        self.core.stop()
+        self.exit_event.set()
+        automation = self.make_automation()
+        automation._send = Mock()
+        with patch('ok.device.interaction_methods.foreground_input._shared_input', self.core), \
+                patch('ok.device.interaction_methods.foreground_input.ForegroundInput') as constructor, \
+                patch('ok.notification.windows_messenger.get_shared_foreground_input',
+                      wraps=get_shared_foreground_input) as factory:
+            self.assertTrue(MessengerAutomation.window_belongs_to(200, 220))
+            self.assertFalse(automation.send('受控联系人', '', '测试', []))
+            factory.assert_not_called()
+            constructor.assert_not_called()
+        self.assertTrue(self.core._closed.is_set())
+        self.assertEqual(self.native.log, [])
+        automation._send.assert_not_called()
+        self.gui.SetForegroundWindow.assert_not_called()
+
+    def test_read_only_query_preserves_failed_release_before_handoff(self):
+        game = self.core.session('game', ForegroundTarget(100, process_id=1))
+        game.key_down('ctrl')
+        self.native.reject_release = True
+        automation = self.make_automation()
+        automation._send = Mock()
+        try:
+            with self.assertRaises(ForegroundInputError):
+                self.core.stop()
+            held, pending = dict(self.core._held), set(self.core._pending_release)
+            events = list(self.native.log)
+            with patch('ok.device.interaction_methods.foreground_input._shared_input', self.core), \
+                    patch('ok.device.interaction_methods.foreground_input.ForegroundInput') as constructor, \
+                    patch('ok.notification.windows_messenger.get_shared_foreground_input',
+                          wraps=get_shared_foreground_input) as factory:
+                self.assertTrue(MessengerAutomation.window_belongs_to(200, 220))
+                factory.assert_not_called()
+                self.assertEqual(self.core._held, held)
+                self.assertEqual(self.core._pending_release, pending)
+                self.assertEqual(self.native.log, events)
+                with self.assertRaises(ForegroundInputError):
+                    automation.send('受控联系人', '', '测试', [])
+                factory.assert_called_once()
+                constructor.assert_not_called()
+            self.assertEqual(self.core._held, held)
+            automation._send.assert_not_called()
+            self.gui.SetForegroundWindow.assert_not_called()
+        finally:
+            self.native.reject_release = False
+            self.core.release_all()
 
     def test_image_menu_uses_owned_popup_coordinates_and_shared_right_click(self):
         automation = self.make_automation()
@@ -816,6 +915,63 @@ class TestDesktopExecutorLifecycle(ForegroundNotificationCase):
             self.assertFalse(manager._send_desktop('受控消息', []))
         send.assert_not_called()
         self.gui.SetForegroundWindow.assert_not_called()
+
+    def test_common_owner_switch_after_dequeue_never_takes_foreground(self):
+        self.add_shared_owner_windows()
+        manager, executor = self.make_manager()
+        with patch.object(MessengerAutomation, '_find_hwnd', return_value=200), \
+                patch.object(MessengerAutomation, '_send', return_value=True) as send, \
+                patch.object(MessengerAutomation, '_save_error_screenshot'):
+            self.assertTrue(manager.submit('', '受控消息'))
+            self.assertTrue(executor.submitted.wait(1))
+            job = executor.jobs[0]
+            send_desktop = job.fn
+
+            def switch_after_dequeue():
+                # run_next 已取出作业；共同拥有者下的独立窗口不能接续游戏授权。
+                self.native.foreground = 300
+                return send_desktop()
+
+            job.fn = switch_after_dequeue
+            executor.run_next()
+            self.gui.SetForegroundWindow.assert_not_called()
+            self.assertFalse(job.future.result(timeout=1))
+            send.assert_not_called()
+        executor.prepare_foreground.assert_not_called()
+        executor.next_frame.assert_not_called()
+        self.assertEqual(self.native.log, [])
+        self.assertEqual(self.native.foreground, 300)
+
+    def test_common_owner_switch_during_handoff_never_takes_foreground(self):
+        self.add_shared_owner_windows()
+        manager, executor = self.make_manager()
+
+        def find_messenger(_):
+            self.native.foreground = 300
+            return 200
+
+        with patch.object(MessengerAutomation, '_find_hwnd', new=find_messenger), \
+                patch.object(MessengerAutomation, '_send', return_value=True) as send, \
+                patch.object(MessengerAutomation, '_save_error_screenshot'):
+            job = manager._submit_desktop('受控消息', [])
+            executor.run_next()
+            self.gui.SetForegroundWindow.assert_not_called()
+            self.assertFalse(job.future.result(timeout=1))
+            send.assert_not_called()
+        executor.prepare_foreground.assert_not_called()
+        executor.next_frame.assert_not_called()
+        self.assertEqual(self.native.log, [])
+        self.assertEqual(self.native.foreground, 300)
+
+    def test_owned_game_chain_still_sends_and_restores(self):
+        self.add_shared_owner_windows()
+        self.native.foreground = 130
+        result, executor = self.run_desktop_lifecycle('成功')
+        self.assertTrue(result)
+        self.gui.SetForegroundWindow.assert_called_once_with(200)
+        executor.prepare_foreground.assert_called_once()
+        executor.next_frame.assert_called_once_with(time_out=5)
+        self.assertEqual(self.native.foreground, 100)
 
 
 if __name__ == '__main__':

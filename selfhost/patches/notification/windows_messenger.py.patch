@@ -1,6 +1,6 @@
 --- a/notification/windows_messenger.py
 +++ b/notification/windows_messenger.py
-@@ -5,25 +5,29 @@
+@@ -5,25 +5,53 @@
  import cv2
  import numpy as np
  import psutil
@@ -16,13 +16,37 @@
 +
 +from ok.device.interaction_methods.foreground_input import (
 +    ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget,
-+    get_shared_foreground_input,
++    get_shared_foreground_input, window_belongs_to,
 +)
  from ok.util.logger import Logger
  
  logger = Logger.get_logger(__name__)
  
  
++class _Win32WindowQuery:
++    """通知仅适配只读窗口查询，避免许可检查触发输入核心的创建或清理。"""
++
++    @staticmethod
++    def is_window(hwnd):
++        return win32gui.IsWindow(hwnd)
++
++    @staticmethod
++    def process_id(hwnd):
++        return win32process.GetWindowThreadProcessId(hwnd)[1]
++
++    @staticmethod
++    def root_window(hwnd):
++        return win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
++
++    @staticmethod
++    def owner_window(hwnd):
++        return win32gui.GetWindow(hwnd, win32con.GW_OWNER)
++
++    @staticmethod
++    def is_child(hwnd, candidate):
++        return win32gui.IsChild(hwnd, candidate)
++
++
  class MessengerAutomation:
 -    """Short-lived BitBlt/OCR/PostMessage automation for a local messenger."""
 +    """在共享输入会话内识别并操作本地通知窗口。"""
@@ -34,7 +58,7 @@
                   image_method='clipboard_hotkey', paste_match_end=False,
                   dismiss_search_after_contact=False):
          self.process_names = {name.lower() for name in process_names}
-@@ -31,33 +35,58 @@
+@@ -31,33 +59,58 @@
          self.search_point_96dpi = search_point_96dpi
          self.left_panel_width_96dpi = left_panel_width_96dpi
          self.search_first_word = search_first_word
@@ -105,7 +129,7 @@
          search_region, contact_region, send_region = self._layout_regions(hwnd)
  
          # Fast path 1: the contact is already visible in the left chat list.
-@@ -83,33 +112,32 @@
+@@ -83,33 +136,32 @@
                  input_point = (
                      max(20, send_box[0] - 80), max(20, send_box[1] - 45))
                  input_target = self._click(hwnd, input_point)
@@ -146,7 +170,7 @@
                  try:
                      overlay_open = (
                          contact_hwnd != hwnd
-@@ -119,17 +147,16 @@
+@@ -119,17 +171,16 @@
                      overlay_open = False
                  if overlay_open:
                      self._send_key(hwnd, win32con.VK_ESCAPE)
@@ -168,7 +192,7 @@
  
      def _send_content(self, hwnd, send_box, input_point, title, message, images,
                        focus_input=True, input_target=None):
-@@ -139,16 +166,16 @@
+@@ -139,16 +190,16 @@
              input_target = self._click(hwnd, input_point)
          elif input_target is None:
              input_target, _ = self._target(hwnd, input_point)
@@ -189,7 +213,7 @@
  
          uses_clipboard = bool(images)
          clipboard_text = self._get_clipboard_text() if uses_clipboard else None
-@@ -158,14 +185,15 @@
+@@ -158,14 +209,15 @@
                      return False
                  from ok.notification.messenger_images import insert_messenger_image
                  input_target = self._click(hwnd, input_point)
@@ -207,7 +231,7 @@
  
      def _search_query(self, nickname):
          if self.search_first_word:
-@@ -177,8 +205,7 @@
+@@ -177,8 +229,7 @@
          deadline = time.monotonic() + timeout
          wanted = nickname.strip().casefold()
          while time.monotonic() < deadline:
@@ -217,7 +241,7 @@
              for candidate in self._contact_windows(hwnd):
                  frame = self._capture(candidate)
                  self._last_frame = frame
-@@ -188,7 +215,7 @@
+@@ -188,7 +239,7 @@
                      boxes, wanted, contacts_section=candidate != hwnd)
                  if point is not None:
                      return candidate, point
@@ -226,7 +250,7 @@
          return hwnd, None
  
      @staticmethod
-@@ -240,7 +267,8 @@
+@@ -240,7 +291,8 @@
                  return True
              _, pid = win32process.GetWindowThreadProcessId(candidate)
              class_name = win32gui.GetClassName(candidate)
@@ -236,7 +260,7 @@
                  left, top, right, bottom = win32gui.GetWindowRect(candidate)
                  area = max(0, right - left) * max(0, bottom - top)
                  if area:
-@@ -275,25 +303,119 @@
+@@ -275,25 +327,103 @@
          win32gui.EnumWindows(callback, None)
          return max(candidates, default=(0, 0, 0))[2]
  
@@ -244,24 +268,8 @@
 -        while win32gui.GetForegroundWindow() == hwnd:
 +    @staticmethod
 +    def window_belongs_to(hwnd, candidate):
-+        """同进程的根、子窗或拥有窗口才属于本次通知目标。"""
-+        if not hwnd or not candidate:
-+            return False
-+        try:
-+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindow(candidate):
-+                return False
-+            if hwnd == candidate:
-+                return True
-+            if (win32process.GetWindowThreadProcessId(hwnd)[1]
-+                    != win32process.GetWindowThreadProcessId(candidate)[1]):
-+                return False
-+            return (win32gui.IsChild(hwnd, candidate)
-+                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
-+                    == win32gui.GetAncestor(candidate, win32con.GA_ROOT)
-+                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOTOWNER)
-+                    == win32gui.GetAncestor(candidate, win32con.GA_ROOTOWNER))
-+        except Exception:
-+            return False
++        """通知交接和控件识别复用输入核心的同一窗口许可规则。"""
++        return window_belongs_to(_Win32WindowQuery, hwnd, candidate)
 +
 +    def owns_foreground(self):
 +        target = self._input_target
@@ -366,7 +374,7 @@
              frame = self._capture(hwnd)
              self._last_frame = frame
              boxes = self._ocr(frame, region=region)
-@@ -304,7 +426,7 @@
+@@ -304,7 +434,7 @@
                  center = (x + box_width // 2, y + box_height // 2)
                  if matched and self._in_region(center, width, height, region):
                      return center
@@ -375,7 +383,7 @@
          return None
  
      def _ocr(self, frame, region=None):
-@@ -318,7 +440,7 @@
+@@ -318,7 +448,7 @@
              to_y = max(y_offset, min(height, round(region[3])))
              ocr_frame = frame[y_offset:to_y, x_offset:to_x]
          if self.ocr_engine is None:
@@ -384,7 +392,7 @@
          boxes = self.ocr_engine.recognize(ocr_frame, threshold=.1)
          return [
              (text, x + x_offset, y + y_offset, width, height)
-@@ -335,7 +457,7 @@
+@@ -335,7 +465,7 @@
              communicate.screenshot.emit(
                  self._last_frame.copy(), f'notification/{suffix}', False, None)
          except Exception as e:
@@ -393,7 +401,7 @@
  
      def _search_field_point(self, hwnd):
          frame = self._capture(hwnd)
-@@ -389,7 +511,7 @@
+@@ -389,7 +519,7 @@
          left, top, right, bottom = win32gui.GetClientRect(hwnd)
          width, height = right - left, bottom - top
          if width <= 0 or height <= 0:
@@ -402,7 +410,7 @@
          window_dc = win32gui.GetDC(hwnd)
          source_dc = win32ui.CreateDCFromHandle(window_dc)
          memory_dc = source_dc.CreateCompatibleDC()
-@@ -397,13 +519,11 @@
+@@ -397,13 +527,11 @@
          try:
              bitmap.CreateCompatibleBitmap(source_dc, width, height)
              memory_dc.SelectObject(bitmap)
@@ -418,7 +426,7 @@
              return MessengerAutomation._bitmap_frame(bitmap, width, height)
          finally:
              memory_dc.DeleteDC()
-@@ -417,91 +537,42 @@
+@@ -417,91 +545,42 @@
          frame = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 4))
          return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
  

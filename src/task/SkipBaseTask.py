@@ -1,5 +1,6 @@
 
 from ok import Logger
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 
 from src.task.BaseWWTask import BaseWWTask, convert_dialog_icon
 
@@ -23,20 +24,26 @@ class SkipBaseTask(BaseWWTask):
         self.skip = None
 
     def skip_confirm(self):
-        if self.click_skip_dialog_confirm():
-            self.confirm_dialog_checked = True
-            return True
-        if skip_button := self.find_one('skip_quest_confirm', threshold=0.8):
-            # sleep 0.2 to stable click skip button
-            self.sleep(0.2)
-            self.click(skip_button)
-            return True
-        if skip_button := self.find_one('skip_quest_confirm_new', threshold=0.8):
-            self.sleep(0.2)
-            self.click(skip_button)
-            return True
-        if self.in_team_and_world():
-            return True
+        while True:
+            try:
+                epoch = getattr(self, '_foreground_epoch', 0)
+                if self.click_skip_dialog_confirm():
+                    self.confirm_dialog_checked = True
+                    return True
+                skip_button = (self.find_one('skip_quest_confirm', threshold=0.8)
+                               or self.find_one('skip_quest_confirm_new', threshold=0.8))
+                if skip_button:
+                    self.sleep(0.2)
+                    # 等待中恢复会废弃旧框；已发出的确认则由下一轮当前页面判断。
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('跳过确认画面已刷新，需要重新识别')
+                    self.click(skip_button)
+                    return True
+                if self.in_team_and_world():
+                    return True
+                return None
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def find_skip(self):
         return self.find_one('skip_dialog', horizontal_variance=0.02, threshold=0.85,

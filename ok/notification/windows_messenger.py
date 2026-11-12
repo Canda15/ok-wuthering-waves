@@ -15,11 +15,35 @@ from pynput.keyboard import KeyCode
 
 from ok.device.interaction_methods.foreground_input import (
     ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget,
-    get_shared_foreground_input,
+    get_shared_foreground_input, window_belongs_to,
 )
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
+
+
+class _Win32WindowQuery:
+    """通知仅适配只读窗口查询，避免许可检查触发输入核心的创建或清理。"""
+
+    @staticmethod
+    def is_window(hwnd):
+        return win32gui.IsWindow(hwnd)
+
+    @staticmethod
+    def process_id(hwnd):
+        return win32process.GetWindowThreadProcessId(hwnd)[1]
+
+    @staticmethod
+    def root_window(hwnd):
+        return win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+
+    @staticmethod
+    def owner_window(hwnd):
+        return win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+
+    @staticmethod
+    def is_child(hwnd, candidate):
+        return win32gui.IsChild(hwnd, candidate)
 
 
 class MessengerAutomation:
@@ -305,24 +329,8 @@ class MessengerAutomation:
 
     @staticmethod
     def window_belongs_to(hwnd, candidate):
-        """同进程的根、子窗或拥有窗口才属于本次通知目标。"""
-        if not hwnd or not candidate:
-            return False
-        try:
-            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindow(candidate):
-                return False
-            if hwnd == candidate:
-                return True
-            if (win32process.GetWindowThreadProcessId(hwnd)[1]
-                    != win32process.GetWindowThreadProcessId(candidate)[1]):
-                return False
-            return (win32gui.IsChild(hwnd, candidate)
-                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
-                    == win32gui.GetAncestor(candidate, win32con.GA_ROOT)
-                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOTOWNER)
-                    == win32gui.GetAncestor(candidate, win32con.GA_ROOTOWNER))
-        except Exception:
-            return False
+        """通知交接和控件识别复用输入核心的同一窗口许可规则。"""
+        return window_belongs_to(_Win32WindowQuery, hwnd, candidate)
 
     def owns_foreground(self):
         target = self._input_target

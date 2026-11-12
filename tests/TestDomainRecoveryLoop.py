@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from ok.feature.Box import Box
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+from ok.task.exceptions import TaskDisabledException
 from src.task.BaseWWTask import BaseWWTask
 from src.task.DomainTask import DomainTask
 from src.task.ForgeryTask import ForgeryTask
@@ -75,6 +77,61 @@ class TestDomainRecoveryLoop(unittest.TestCase):
         self.assertEqual([call.args for call in task.info_incr.call_args_list],
                          [('used stamina', 0), ('used stamina', 80), ('used stamina', 40)])
         task.wait_foreground_frame.assert_called_once()
+
+
+class TestDomainExitConfirmation(unittest.TestCase):
+    def make_task(self):
+        task = DomainTask.__new__(DomainTask)
+        task._executor = SimpleNamespace(interaction=Mock(), reset_scene=Mock())
+        task.logger = Mock()
+        task.teleport_timeout = 100
+        task.sleep = Mock()
+        task.find_one = Mock(return_value=Box(200, 100, 40, 20, name='退出确认'))
+        task.wait_in_team_and_world = Mock()
+        task.wait_foreground_frame = Mock()
+        task.in_realm = Mock(return_value=False)
+        task.ensure_main = Mock()
+        return task
+
+    def test_已打开的退出确认使用真实框点击接口和相对位置(self):
+        task = self.make_task()
+        # 保留 click_box → BaseWWTask.click → BaseTask.click 的真实签名及坐标换算。
+        with patch('ok.task.task.communicate'):
+            task.make_sure_in_world()
+
+        task.executor.interaction.click.assert_called_once_with(
+            160, 110, move_back=False, name='退出确认', move=True, down_time=.2, key='left')
+        task.sleep.assert_called_once_with(1)
+        task.wait_in_team_and_world.assert_called_once_with(time_out=100)
+        task.ensure_main.assert_not_called()
+
+    def test_退出确认已接受后失焦不会再次点击(self):
+        task = self.make_task()
+
+        def accepted_then_interrupted(*args, **kwargs):
+            task.find_one.return_value = None
+            raise ForegroundInputInterrupted('退出确认已发出后失焦')
+
+        task.executor.interaction.click.side_effect = accepted_then_interrupted
+        with patch('ok.task.task.communicate'):
+            task.make_sure_in_world()
+
+        task.executor.interaction.click.assert_called_once()
+        task.wait_foreground_frame.assert_called_once()
+        task.ensure_main.assert_called_once()
+
+    def test_退出确认取消或系统失败直接上抛(self):
+        for error in (ForegroundInputError, TaskDisabledException):
+            with self.subTest(error=error):
+                task = self.make_task()
+                task.executor.interaction.click.side_effect = error('退出已停止')
+
+                with patch('ok.task.task.communicate'), self.assertRaises(error):
+                    task.make_sure_in_world()
+
+                task.executor.interaction.click.assert_called_once()
+                task.wait_foreground_frame.assert_not_called()
+                task.wait_in_team_and_world.assert_not_called()
 
 
 class TestStaminaForegroundRecovery(unittest.TestCase):
