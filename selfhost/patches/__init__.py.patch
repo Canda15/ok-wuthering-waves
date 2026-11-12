@@ -1,0 +1,42 @@
+--- a/__init__.py
++++ b/__init__.py
+@@ -35,10 +35,7 @@
+         BaseInteraction,
+         BrowserInteraction,
+         DoNothingInteraction,
+-        ForegroundPostMessageInteraction,
+-        GenshinInteraction,
+-        PostMessageInteraction,
+-        PyDirectInteraction,
++        PynputInteraction as PynputInteraction,
+     )
+     from ok.feature.Box import (
+         Box,
+@@ -116,10 +113,11 @@
+     'DoNothingInteraction': ('ok.device.interaction', 'DoNothingInteraction'),
+     'BaseInteraction': ('ok.device.interaction', 'BaseInteraction'),
+     'BrowserInteraction': ('ok.device.interaction', 'BrowserInteraction'),
+-    'PostMessageInteraction': ('ok.device.interaction', 'PostMessageInteraction'),
+-    'GenshinInteraction': ('ok.device.interaction', 'GenshinInteraction'),
+-    'ForegroundPostMessageInteraction': ('ok.device.interaction', 'ForegroundPostMessageInteraction'),
+-    'PyDirectInteraction': ('ok.device.interaction', 'PyDirectInteraction'),
++    'PynputInteraction': ('ok.device.interaction', 'PynputInteraction'),
++    'ForegroundInputInterrupted': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputInterrupted'),
++    'ForegroundInputError': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputError'),
++    'ForegroundTarget': ('ok.device.interaction_methods.foreground_input', 'ForegroundTarget'),
++    'get_shared_foreground_input': ('ok.device.interaction_methods.foreground_input', 'get_shared_foreground_input'),
+     'ImageCaptureMethod': ('ok.device.capture', 'ImageCaptureMethod'),
+     'BaseCaptureMethod': ('ok.device.capture', 'BaseCaptureMethod'),
+     'BrowserCaptureMethod': ('ok.device.capture', 'BrowserCaptureMethod'),
+@@ -1203,6 +1201,11 @@
+ 
+     def quit(self):
+         logger.info('quit app')
++        from ok.device.interaction_methods.foreground_input import stop_shared_foreground_input
++        try:
++            stop_shared_foreground_input()
++        except Exception as error:
++            logger.error(f'关闭时输入清理失败：{error}')
+         if getattr(self, '_mcp_server', None) is not None:
+             self._mcp_server.stop()
+         self.exit_event.set()

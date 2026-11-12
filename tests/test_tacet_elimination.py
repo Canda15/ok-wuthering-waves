@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+
 from src.task.TacetEliminationTask import TacetEliminationTask, read_board, matches, choose_move
-from src.task.WWOneTimeTask import WWOneTimeTask
 
 
 class TestTacetElimination(unittest.TestCase):
@@ -99,29 +100,87 @@ class TestTacetElimination(unittest.TestCase):
         self.assertEqual(task.swap.call_count, 125)
         task.send_key.assert_not_called()
 
-    def test_mouse_reset_is_restored_on_failure(self):
-        reset = SimpleNamespace(enabled=True, _enabled=True, config={'_enabled': True}, post_mouse_reset=Mock())
-        task = SimpleNamespace(tr=str, prepare_event=Mock(), sleep=Mock(),
-                               get_task_by_class=Mock(return_value=reset),
-                               run_event=Mock(side_effect=RuntimeError('capture failed')))
-        with patch.object(WWOneTimeTask, 'run'), self.assertRaisesRegex(RuntimeError, 'capture failed'):
-            TacetEliminationTask.run(task)
-        self.assertTrue(reset._enabled)
-        reset.post_mouse_reset.assert_called_once_with(.01)
+    def board_task(self, iterations):
+        task = SimpleNamespace(tr=str, frame=None)
+        for name in ('next_frame', 'wait_foreground_frame', 'wait_board_settled', 'screenshot',
+                     'sleep', 'info_set', 'log_info', 'swap'):
+            setattr(task, name, Mock())
+        task.dismiss_event_help = Mock(return_value=False)
+        task.is_board = Mock(side_effect=[True] * iterations + [False])
+        return task
 
-    def test_mouse_reset_keeps_setting_changed_during_run(self):
-        reset = SimpleNamespace(enabled=True, _enabled=True, config={'_enabled': True}, post_mouse_reset=Mock())
+    def test_interrupted_drag_recomputes_move_from_new_board_without_old_exclusions(self):
+        task = self.board_task(2)
+        task.swap.side_effect = [ForegroundInputInterrupted(), None]
+        boards = [[list('RGB')], [list('BGR')]]
+        moves = [(10, (0, 0), (0, 1)), (20, (0, 1), (0, 2))]
+        observed = []
 
-        def change_setting():
-            reset.config['_enabled'] = False
-            reset._enabled = False
+        def choose(board, excluded):
+            observed.append((board, frozenset(excluded)))
+            return moves[len(observed) - 1]
 
-        task = SimpleNamespace(tr=str, prepare_event=Mock(), sleep=Mock(),
-                               get_task_by_class=Mock(return_value=reset), run_event=change_setting)
-        with patch.object(WWOneTimeTask, 'run'):
-            TacetEliminationTask.run(task)
-        self.assertFalse(reset._enabled)
-        reset.post_mouse_reset.assert_not_called()
+        with patch('src.task.TacetEliminationTask.read_board', side_effect=boards), \
+                patch('src.task.TacetEliminationTask.choose_move', side_effect=choose):
+            TacetEliminationTask.play_board(task)
+        self.assertEqual(observed, [(boards[0], frozenset()), (boards[1], frozenset())])
+        self.assertEqual([call.args for call in task.swap.call_args_list],
+                         [moves[0][1:], moves[1][1:]])
+        task.info_set.assert_called_once_with('Move', 1)
+        task.wait_foreground_frame.assert_called_once()
+
+    def test_repeated_focus_interruptions_do_not_consume_board_stall_budget(self):
+        task = self.board_task(10)
+        task.swap.side_effect = [ForegroundInputInterrupted()] * 9 + [None]
+        with patch('src.task.TacetEliminationTask.read_board', return_value=[list('RGB')]), \
+                patch('src.task.TacetEliminationTask.choose_move', return_value=(10, (0, 0), (0, 1))):
+            TacetEliminationTask.play_board(task)
+        self.assertEqual(task.swap.call_count, 10)
+        task.info_set.assert_called_once_with('Move', 1)
+        task.screenshot.assert_not_called()
+
+    def test_board_system_input_failure_is_not_retried(self):
+        task = self.board_task(1)
+        task.swap.side_effect = ForegroundInputError()
+        with patch('src.task.TacetEliminationTask.read_board', return_value=[list('RGB')]), \
+                patch('src.task.TacetEliminationTask.choose_move', return_value=(10, (0, 0), (0, 1))), \
+                self.assertRaises(ForegroundInputError):
+            TacetEliminationTask.play_board(task)
+        task.swap.assert_called_once()
+        task.wait_foreground_frame.assert_not_called()
+
+    def test_interrupted_result_exit_preserves_completion_and_never_replays_final(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                success = [SimpleNamespace(name='挑战成功'), SimpleNamespace(name='退出关卡')]
+                completed = [SimpleNamespace(name='已完成')]
+                state = SimpleNamespace(page=success, exits=0)
+                task = SimpleNamespace(tr=str, text=TacetEliminationTask.text,
+                    is_board=Mock(side_effect=[True, True] + [False] * 4),
+                    ocr=Mock(return_value=[SimpleNamespace(name='最高纪录：4960')]),
+                    event_text=lambda: state.page,
+                    wait_until=lambda condition, **kwargs: condition(),
+                    open_unfinished_stage=Mock(),
+                )
+                for name in ('info_set', 'next_frame', 'wait_foreground_frame', 'log_info', 'screenshot'):
+                    setattr(task, name, Mock())
+
+                def click_text(boxes, pattern):
+                    if any(re.search(pattern, box.name, re.I) for box in boxes):
+                        state.exits += 1
+                        if state.exits == 1:
+                            if accepted:
+                                state.page = completed
+                            raise ForegroundInputInterrupted()
+                        state.page = completed
+                        return True
+                    return False
+
+                task.click_text = click_text
+                TacetEliminationTask.run_event(task)
+                self.assertEqual(task.completed_stages, 1)
+                self.assertEqual(state.exits, 1 if accepted else 2)
+                task.open_unfinished_stage.assert_not_called()
 
     def test_success_page_exits_instead_of_replaying(self):
         success = [SimpleNamespace(name=name) for name in ('挑战成功', '退出关卡', '再次挑战')]
@@ -172,16 +231,13 @@ class TestTacetElimination(unittest.TestCase):
         self.assertEqual(clicked, ['退出关卡'])
         task.return_to_stage_list.assert_called_once()
 
-    def test_return_to_stage_list_retries_ineffective_posted_escape(self):
-        window = SimpleNamespace(bring_to_front=Mock(), is_foreground=Mock(return_value=True))
-        interaction = SimpleNamespace(hwnd_window=window, capture=Mock())
-        task = SimpleNamespace(tr=str, executor=SimpleNamespace(interaction=interaction),
-                               send_key=Mock(), reset_scene=Mock(),
+    def test_return_to_stage_list_retries_only_while_details_are_visible(self):
+        task = SimpleNamespace(tr=str, send_key=Mock(),
                                ocr=Mock(side_effect=[[SimpleNamespace(name='开始挑战')], []]),
                                wait_until=lambda predicate, **kwargs: predicate())
-        with patch('ok.device.interaction_methods.pynput.PynputInteraction') as backend:
-            TacetEliminationTask.return_to_stage_list(task)
-        backend.return_value.send_key.assert_called_once_with('esc', down_time=.1)
+        TacetEliminationTask.return_to_stage_list(task)
+        self.assertEqual(task.send_key.call_count, 2)
+        task.send_key.assert_called_with('esc', down_time=.1, after_sleep=.7)
 
     def test_resumed_final_board_can_finish_when_initial_record_ocr_is_empty(self):
         success = [SimpleNamespace(name=name) for name in ('挑战成功', '退出关卡', '再次挑战')]

@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "framework_version": "3.0.5b4",
+  "baseline_tree_sha256": "75a7131fb09552f834754dc5c415d22f55ac347e3a992cbab65c023541974e53",
+  "entries": [
+    {
+      "path": "__init__.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/__init__.py.patch",
+      "before_sha256": "96afa8cb7f3093f99faf889de974569a5f8822888a7998593278e35765a151ea",
+      "after_sha256": "85b8d722bf42c0fc0f99f36865041818619f6f882bd3140145149600d5952800"
+    },
+    {
+      "path": "agent_resources/.agents/skills/develop/SKILL.md",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/agent_resources/.agents/skills/develop/SKILL.md.patch",
+      "before_sha256": "0f5bff87bb967c4938d79fa217e62326044dbc4829855cd4b212257cf2839ac0",
+      "after_sha256": "37dfdd8ccc9858765648cdb43774ac3080690c74d4e3368b7c71cf9831f52dc2"
+    },
+    {
+      "path": "agent_resources/.agents/skills/develop/references/windows-input.md",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/agent_resources/.agents/skills/develop/references/windows-input.md.patch",
+      "before_sha256": "e722d31fb3047ad097523030a0880911f00ac005b12f718426a105fa4bd89844",
+      "after_sha256": "13a7a539a6a4572ab135f46e7ae318e29da1da95da7405973fdc87ad1d511f4f"
+    },
+    {
+      "path": "agent_resources/.agents/skills/setup-project/SKILL.md",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/agent_resources/.agents/skills/setup-project/SKILL.md.patch",
+      "before_sha256": "22b05a6564c8b9f7b1c24a7f85b9d7618c4ef4251992150931eb15399ce03261",
+      "after_sha256": "993ace6eb6439735cf23f681f28d845078ef751309d6364b533f53a2165a5438"
+    },
+    {
+      "path": "core/mcp_runner.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/core/mcp_runner.py.patch",
+      "before_sha256": "f14da51d66a244a522ca297b7a53777b3b7c5cb7be5010db973a120c9e042bb9",
+      "after_sha256": "2e061a701044eaf5f6cfaba6f61ac15343d36d12a57623d2dcc4fcea1cdb0e52"
+    },
+    {
+      "path": "core/mcp_server.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/core/mcp_server.py.patch",
+      "before_sha256": "71c4a27823cb9740fc500573e7d4559867d7dec0a892dff0900796c073341e50",
+      "after_sha256": "e07af44d300ef6eade5a693ea9fe9a40f88ae14459e52df19dbbd3cc9f5c6203"
+    },
+    {
+      "path": "core/start_controller.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/core/start_controller.py.patch",
+      "before_sha256": "3c4eb2176bdb1faf6ba91a1e82f36a2dcfe1540ce0d98768afde26b3606d6521",
+      "after_sha256": "a39b762affa7ba7f0f90cf2d7dc6d28cf5e8cf4fccb9e774d044fe1ca39177d6"
+    },
+    {
+      "path": "device/DeviceManager.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/DeviceManager.py.patch",
+      "before_sha256": "b3ca3599a9570ea1aef62db8b4d97f1d8d2e6e119a721b1a40545ee90f62e5f1",
+      "after_sha256": "d6dc75bc6437d9c0fd46b9b091470e24b67944cd4bc03efb96088f6095a74702"
+    },
+    {
+      "path": "device/capture_methods/hwnd_window.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/capture_methods/hwnd_window.py.patch",
+      "before_sha256": "70cffdfe5a07e3d99e565dda9044036763a2ae443ff4048aabc2b18329ee228e",
+      "after_sha256": "bd4a8d52e4f75c81252a432533260359c3b7a36c0ff9544f8c8d1f3c3dc90cc4"
+    },
+    {
+      "path": "device/interaction_methods/__init__.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/__init__.py.patch",
+      "before_sha256": "8ce4ee2e4fea09a3929c8fe728a67403154b9a1e90b5dd6e61321eb45c8347c1",
+      "after_sha256": "ab959df8fa2e81c15cbcb42ab9f0c584be9f94e9e00c16c4b84b89e9953606f4"
+    },
+    {
+      "path": "device/interaction_methods/base.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/base.py.patch",
+      "before_sha256": "f152455b78ab9a5d03f9d36705a134b5063a3a89f8d50dab2f7f73d9a2dbab49",
+      "after_sha256": "8d02256132bfb43bc922bad05df1c1d7bb6bfa6dc48a3bc36e9bcf412c60e5a7"
+    },
+    {
+      "path": "device/interaction_methods/foreground_input.py",
+      "operation": "add",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/foreground_input.py.patch",
+      "before_sha256": null,
+      "after_sha256": "453487b06c5feb1dd10e57b539c4e5acc9c49ebc7bdd95456f170e7716e8ffbb"
+    },
+    {
+      "path": "device/interaction_methods/foreground_post_message.py",
+      "operation": "delete",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/foreground_post_message.py.patch",
+      "before_sha256": "6656a2c6ce2e483e130173772c42be1c000a15c19e93f14e22ccfa2fb4007fbb",
+      "after_sha256": null
+    },
+    {
+      "path": "device/interaction_methods/genshin.py",
+      "operation": "delete",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/genshin.py.patch",
+      "before_sha256": "11541ec99b62e0fdc9aa10571c12e1d57879af9555f4eff7d186af2d010da946",
+      "after_sha256": null
+    },
+    {
+      "path": "device/interaction_methods/keys.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/keys.py.patch",
+      "before_sha256": "035361ae5562ed646176cc539a93016239370a8a343d327edde0da9eb40219b2",
+      "after_sha256": "a25ab101cf1eabb7415a4f8b4b751b4f3b6b3620d6c428a238080c4835550aa0"
+    },
+    {
+      "path": "device/interaction_methods/post_message.py",
+      "operation": "delete",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/post_message.py.patch",
+      "before_sha256": "642851ae1f484d476a8fa27166dba6d17f5f62a2d1a0bdc609e21f96b89891dc",
+      "after_sha256": null
+    },
+    {
+      "path": "device/interaction_methods/pydirect.py",
+      "operation": "delete",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/pydirect.py.patch",
+      "before_sha256": "c6551cdb1798bb90584e88290841f8776bd284973370dc76f0950f8da57375d2",
+      "after_sha256": null
+    },
+    {
+      "path": "device/interaction_methods/pynput.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/pynput.py.patch",
+      "before_sha256": "5565b441cc955617bded36ea46234801bbc3aab27498f89412e4d0b7105b4dae",
+      "after_sha256": "f2e8b083bca2c25168d53fa7b037840b3edf404cc7f51b8b21e141b7fcac4ccd"
+    },
+    {
+      "path": "notification/manager.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/notification/manager.py.patch",
+      "before_sha256": "7c89dad44603aa90a278f48c0029f452acd2177b41d39bd641f31c1aee4d8a66",
+      "after_sha256": "30ca08e85b92e57248ed2608fb79c81700f5b51dc47dd839175181ec31959203"
+    },
+    {
+      "path": "notification/messenger_images.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/notification/messenger_images.py.patch",
+      "before_sha256": "510afb795938c62360442070748679cc53213b3af8728b15f008af4a0629029e",
+      "after_sha256": "86d192f6ac73d11446c06423bb8c40933adf24998fa4e3b62d3d2b3d5d227f2a"
+    },
+    {
+      "path": "notification/pipeline.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/notification/pipeline.py.patch",
+      "before_sha256": "c24e6e4f4d0b66b908f12b985030893318f0b900dc24b2cb4ac2e7ae607b76db",
+      "after_sha256": "257158e29d49f32308102754c3d1511432e4ef31d8383a7ea2f7981a48b424b0"
+    },
+    {
+      "path": "notification/windows_messenger.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/notification/windows_messenger.py.patch",
+      "before_sha256": "d8be6e682006450ec482ec2cc3e16bc20f90f692f8ed66c12558315fc72cc981",
+      "after_sha256": "31966ae1be9e849b54971040067890c8a7396a7481d676403e61e1033fa38409"
+    },
+    {
+      "path": "task/TaskExecutor.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/task/TaskExecutor.py.patch",
+      "before_sha256": "85862d681d2faaf40a9df4c419c765a6a8cdcc70b8e76efb53989ead8ab88814",
+      "after_sha256": "d8386f4340fd3fce0edc3ced502028c3dd146077971e00743e689291760efed5"
+    },
+    {
+      "path": "task/task.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/task/task.py.patch",
+      "before_sha256": "0e1677611fb93a18ae98caa98ddfbbf62814fc8bd8e82c780c6817eb409ba1b0",
+      "after_sha256": "561d92665bd07e35252a737fe7395228711f829c8a61f73ce30242361bb10725"
+    },
+    {
+      "path": "ui/qt/i18n/en_US.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/en_US.qm.bin",
+      "before_sha256": "66a11f6d7bede5867c71d3bf3c29d4bc0919fb48f8a61246e062f867d8c2a851",
+      "after_sha256": "34d1ff6a14e3c2f676026c0a1a3201bd55313f652861744ebb5b882ac5daf413"
+    },
+    {
+      "path": "ui/qt/i18n/en_US.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/en_US.ts.patch",
+      "before_sha256": "f5cbfc80ad0dc351ed95611c2ec1056018d9b5ed2016253b8f8063e79af3cd5d",
+      "after_sha256": "43065943607b26fbb99a1fbb3f55514bcd10007cfa22b481ac91c02bc2ee6007"
+    },
+    {
+      "path": "ui/qt/i18n/es_ES.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/es_ES.qm.bin",
+      "before_sha256": "3776ca4391110af1bdf87ea68b8098de8829d1e5e5828cb1afcd6bb7aa905d39",
+      "after_sha256": "895fa9bfcd7edd7820ccf8e889953c74cc72c73dfa54b28b06fa1ae8c7ead4ae"
+    },
+    {
+      "path": "ui/qt/i18n/es_ES.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/es_ES.ts.patch",
+      "before_sha256": "2c3ddb8483675d04ed393496fc1a260e5f788b0c19334f0794e6ccb8c08a002e",
+      "after_sha256": "e6267d36796b3c1363da2c5fd6ae90769d68705e809d2e3811c1e5091148a57f"
+    },
+    {
+      "path": "ui/qt/i18n/ja_JP.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/ja_JP.qm.bin",
+      "before_sha256": "923e9ab5fa1da4f782f0a482d90229bd364f6e81a580e8a5c2d79f3b1ba8ee4d",
+      "after_sha256": "891e5cf3bc3e402a676bc227bacbd043492cdf92c4f289312341623ee8ceeef0"
+    },
+    {
+      "path": "ui/qt/i18n/ja_JP.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/ja_JP.ts.patch",
+      "before_sha256": "91d6c332f013e767327256f16f39c51858250cf5ae5e7cb1e8fe91e4ee7c9832",
+      "after_sha256": "5fbc32483b399e62a40b60f8dc5a8b335de676bd77d32b3f6668516b46346f63"
+    },
+    {
+      "path": "ui/qt/i18n/ko_KR.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/ko_KR.qm.bin",
+      "before_sha256": "9d712713141d9dbfef4651bafb6d96baf2e0a1ca83dfd0b2f28ac98a865e5abc",
+      "after_sha256": "900daf49322b37dfcd71c550d252f7b725df719306d78b5230368798bc1f01d7"
+    },
+    {
+      "path": "ui/qt/i18n/ko_KR.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/ko_KR.ts.patch",
+      "before_sha256": "005e0999f863c3e34416b13e2fb9b636ff8835ff03637541b00d0b3d0608573c",
+      "after_sha256": "7909015c8ea1b2d9e26ee1f849eaa0ace31e2b7ed6237dd1d2d931ecba768192"
+    },
+    {
+      "path": "ui/qt/i18n/zh_CN.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/zh_CN.qm.bin",
+      "before_sha256": "dd0d284cf49d9784375d30c0bb94bb4bedc346f10948b4c461098df119919830",
+      "after_sha256": "77f1e8a6a6e702a0eb46498c6788811f160bd169ca8a13322bf3321350124765"
+    },
+    {
+      "path": "ui/qt/i18n/zh_CN.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/zh_CN.ts.patch",
+      "before_sha256": "e777d8b8b55bb161acb2dec6fb7cdb4a5e1f8361becef120e0f9fa1daf7c2aca",
+      "after_sha256": "4794c53e6f4bdf433adda0152f2da19d3961c9406eb7706f5664564c2c5cf996"
+    },
+    {
+      "path": "ui/qt/i18n/zh_TW.qm",
+      "operation": "modify",
+      "format": "binary",
+      "payload": "patches/ui/qt/i18n/zh_TW.qm.bin",
+      "before_sha256": "97abf57079f3b5077e69575f3b8d5b9a66c1a5d3a59811d8d9334951094f8d0d",
+      "after_sha256": "e3194bb57c79ebedcf352f28dd38063f6c9090031e6039627eecc4f8696638c8"
+    },
+    {
+      "path": "ui/qt/i18n/zh_TW.ts",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/i18n/zh_TW.ts.patch",
+      "before_sha256": "91cfc7e0883d1224477976ae07dce5d31d69689a4d775803b255be7ff5f3d022",
+      "after_sha256": "0a7c7e710bb05eff74aa698a36edf398279b7d6b65f903c56c569189023ca1d0"
+    },
+    {
+      "path": "ui/qt/resources.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/resources.py.patch",
+      "before_sha256": "d29acce87803abb3d6c2f4b52aba8734105a570ebd4bb4235588fe604407c04a",
+      "after_sha256": "891bd28efadad64200c1c30fe37d657de627ea963c7295a351edea38b4f9456f"
+    },
+    {
+      "path": "ui/qt/shell/connection.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/shell/connection.py.patch",
+      "before_sha256": "47deae2fe5809cf96c5a134709176821ee30db98640dababa8a93144496d7708",
+      "after_sha256": "9c48fdfcfcfa2c5c7ea0d6ec1ac2241b4850d3c0b612d883fbae6a3edbb043c7"
+    },
+    {
+      "path": "util/GlobalConfig.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/util/GlobalConfig.py.patch",
+      "before_sha256": "fca4bff1c0cb9c7fe8c9c61fd4ffb54500e0371af9ced765638c8d85b4b5e529",
+      "after_sha256": "8bbc89dbb3ae05954dd8d4dc5f714dde80d0c26e4f441b55144a6135c9f20622"
+    },
+    {
+      "path": "util/window.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/util/window.py.patch",
+      "before_sha256": "8ba8b5e85e461a7f24794ae3140b1be254e2c85d523e115e97d06d2253fc9e8c",
+      "after_sha256": "02fbb15f42d5df940a6a54167d8d028174eab658e2ccc8d4baf06f996ac547ed"
+    }
+  ]
+}

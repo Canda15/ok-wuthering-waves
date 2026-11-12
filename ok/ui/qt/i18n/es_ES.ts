@@ -1257,6 +1257,14 @@
     <context>
         <name>app</name>
         <message>
+            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
+            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
             <source>Diagnosis</source>
             <translation>Diagnóstico</translation>
         </message>
@@ -1763,14 +1771,6 @@
         <message>
             <source>Requires the local QQ or WeChat client window to be open and running</source>
             <translation>Requiere que la ventana del cliente local de QQ o WeChat esté abierta y en ejecución</translation>
-        </message>
-        <message>
-            <source>Requires the local QQ client window to be open and running</source>
-            <translation>Requiere que la ventana del cliente local de QQ esté abierta y en ejecución</translation>
-        </message>
-        <message>
-            <source>Requires the local WeChat client window to be open and running</source>
-            <translation>Requiere que la ventana del cliente local de WeChat esté abierta y en ejecución</translation>
         </message>
         <message>
             <source>SMTP Notification</source>
@@ -3341,20 +3341,12 @@
     <context>
         <name>SelectInteractionListView</name>
         <message>
-            <source>Pynput</source>
-            <translation>Pynput - Primer plano, más compatible</translation>
+            <source>前台系统键鼠</source>
+            <translation>前台系统键鼠</translation>
         </message>
         <message>
-            <source>PostMessage</source>
-            <translation>PostMessage - Segundo plano, la mayoría de aplicaciones y algunos juegos</translation>
-        </message>
-        <message>
-            <source>PyDirect</source>
-            <translation>PyDirect - Primer plano, respaldo de Pynput</translation>
-        </message>
-        <message>
-            <source>Genshin</source>
-            <translation>Genshin - Segundo plano, soporte para algunos juegos de Unity</translation>
+            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
+            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
         </message>
         <message>
             <source>ADBInteraction</source>
@@ -3367,10 +3359,6 @@
         <message>
             <source>Default Interaction</source>
             <translation>Interacción predeterminada</translation>
-        </message>
-        <message>
-            <source>WindowsInteraction</source>
-            <translation>Interacción de Windows</translation>
         </message>
     </context>
     <context>

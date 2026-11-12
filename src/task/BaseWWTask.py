@@ -2,12 +2,12 @@ import math
 import re
 import time
 from datetime import datetime, timedelta
-from typing import List
 
 import numpy as np
 
-from ok import BaseTask, Logger, find_boxes_by_name, og, find_color_rectangles, mask_white, Box
+from ok import BaseTask, Logger, og, find_color_rectangles, Box
 from ok import CannotFindException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 import cv2
 
 from src.Labels import Labels
@@ -40,6 +40,44 @@ class BaseWWTask(BaseTask):
         self.key_config = self.get_global_config('Game Hotkey')  # 游戏热键配置
         self.next_monthly_card_start = 0
         self.scene: WWScene | None = None
+        self._foreground_epoch = 0
+
+    def business_time(self):
+        """业务等待预算排除失焦等待；游戏冷却和明确的外部期限仍使用原时钟。"""
+        return self.executor.business_time()
+
+    def on_foreground_resume(self):
+        super().on_foreground_resume()
+        self._foreground_epoch = getattr(self, '_foreground_epoch', 0) + 1
+        # 用户失焦期间可能改动地图，清掉准备标记，后续操作从新画面重新定位。
+        self.map_zoomed = False
+
+    def _recover_foreground_input(self):
+        if (getattr(self, '_active_char_rotation', None) is not None
+                and not getattr(self, '_foreground_revive_recovery', False)):
+            # 角色栈中的导航或等待不能吞掉恢复信号，必须先退出旧轮转再重读角色。
+            raise ForegroundInputInterrupted('旧角色轮转已中断，需要重新识别')
+        return self.wait_foreground_frame()
+
+    def search_monsters(self, text):
+        """重新定位图鉴搜索框，清空已有内容后输入；部分文本不能直接重放。"""
+        while True:
+            try:
+                self.ensure_main()
+                self.openF2Book('gray_book_all_monsters')
+                self.click(0.13, 0.14, after_sleep=.5)
+                self.click(0.20, 0.14, after_sleep=.3)
+                try:
+                    self.send_key_down('ctrl')
+                    self.send_key('a')
+                finally:
+                    self.send_key_up('ctrl')
+                self.send_key('backspace')
+                self.input_text(text)
+                self.send_key('enter', after_sleep=.5)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     @property
     def logged_in(self):
@@ -157,44 +195,48 @@ class BaseWWTask(BaseTask):
 
     def walk_to_yolo_echo(self, time_out=8, update_function=None, echo_threshold=0.5):
         last_direction = None
-        start = time.time()
+        start = self.business_time()
         no_echo_start = 0
-        while time.time() - start < time_out:
-            self.next_frame()
-            if self.pick_f():
-                self.log_debug('pick echo success')
-                self._stop_last_direction(last_direction)
-                return True
-            if self.in_combat():
-                self.log_debug('pick echo has_target return fail')
-                self._stop_last_direction(last_direction)
-                return False
-            echos = self.find_echos(threshold=echo_threshold)
-            if not echos:
-                if no_echo_start == 0:
-                    no_echo_start = time.time()
-                elif time.time() - no_echo_start > 3:
-                    self.log_debug(f'walk front to_echo, no echos found, break')
-                    break
-                next_direction = 'w'
-            else:
-                no_echo_start = 0
-                echo = echos[0]
-                center_distance = echo.center()[0] - self.width_of_screen(0.5)
-                threshold = 0.05 if not last_direction else 0.15
-                if abs(center_distance) < self.height_of_screen(threshold):
-                    if echo.y + echo.height > self.height_of_screen(0.65):
-                        next_direction = 's'
-                    else:
+        epoch = getattr(self, '_foreground_epoch', 0)
+        try:
+            while self.business_time() - start < time_out:
+                try:
+                    self.next_frame()
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        last_direction = None
+                        no_echo_start = 0
+                        epoch = getattr(self, '_foreground_epoch', 0)
+                    if self.pick_f():
+                        self.log_debug('pick echo success')
+                        return True
+                    if self.in_combat():
+                        return False
+                    echos = self.find_echos(threshold=echo_threshold)
+                    if not echos:
+                        if no_echo_start == 0:
+                            no_echo_start = self.business_time()
+                        elif self.business_time() - no_echo_start > 3:
+                            break
                         next_direction = 'w'
-                elif center_distance > 0:
-                    next_direction = 'd'
-                else:
-                    next_direction = 'a'
-            last_direction = self._walk_direction(last_direction, next_direction)
-            if update_function is not None:
-                update_function()
-        self._stop_last_direction(last_direction)
+                    else:
+                        no_echo_start = 0
+                        echo = echos[0]
+                        center_distance = echo.center()[0] - self.width_of_screen(.5)
+                        threshold = .05 if not last_direction else .15
+                        if abs(center_distance) < self.height_of_screen(threshold):
+                            next_direction = 's' if echo.y + echo.height > self.height_of_screen(.65) else 'w'
+                        else:
+                            next_direction = 'd' if center_distance > 0 else 'a'
+                    last_direction = self._walk_direction(last_direction, next_direction)
+                    if update_function is not None:
+                        update_function()
+                except ForegroundInputInterrupted:
+                    self._recover_foreground_input()
+                    last_direction = None
+                    no_echo_start = 0
+                    epoch = getattr(self, '_foreground_epoch', 0)
+        finally:
+            self._stop_last_direction(last_direction)
 
     def _walk_direction(self, last_direction, next_direction):
         if next_direction != last_direction:
@@ -211,12 +253,15 @@ class BaseWWTask(BaseTask):
 
     def walk_to_box(self, find_function, time_out=30, end_condition=None, y_offset=0.05, x_threshold=0.07,
                     use_hook=False):
-        start = time.time()
-        while time.time() - start < time_out:
-            if ended := self.do_walk_to_box(find_function, time_out=time_out - (time.time() - start),
-                                            end_condition=end_condition, y_offset=y_offset,
-                                            x_threshold=x_threshold, use_hook=use_hook):
-                return ended
+        start = self.business_time()
+        while self.business_time() - start < time_out:
+            try:
+                if ended := self.do_walk_to_box(find_function, time_out=time_out - (self.business_time() - start),
+                                                end_condition=end_condition, y_offset=y_offset,
+                                                x_threshold=x_threshold, use_hook=use_hook):
+                    return ended
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def do_walk_to_box(self, find_function, time_out=30, end_condition=None, y_offset=0.05, x_threshold=0.07,
                        use_hook=False):
@@ -224,78 +269,89 @@ class BaseWWTask(BaseTask):
             self.wait_until(lambda: (not end_condition or end_condition()) or find_function(), raise_if_not_found=True,
                             time_out=time_out)
         last_direction = None
-        start = time.time()
+        start = self.business_time()
         ended = False
         running = False
         last_target = None
         centered = False
-        while time.time() - start < time_out:
-            self.next_frame()
-            if end_condition:
-                ended = end_condition()
-                if ended:
-                    logger.info(f'do_walk_to_box ended {ended}')
-                    break
-            treasure_icon = find_function()
-            if isinstance(treasure_icon, list):
-                if len(treasure_icon) > 0:
-                    treasure_icon = treasure_icon[0]
+        epoch = getattr(self, '_foreground_epoch', 0)
+        try:
+            while self.business_time() - start < time_out:
+                self.next_frame()
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    # 系统已释放旧移动；必须重新定位目标并重新按下，不能把缓存方向当成仍在行走。
+                    last_direction = None
+                    last_target = None
+                    centered = False
+                    running = False
+                    epoch = getattr(self, '_foreground_epoch', 0)
+                if end_condition:
+                    ended = end_condition()
+                    if ended:
+                        logger.info(f'do_walk_to_box ended {ended}')
+                        break
+                treasure_icon = find_function()
+                if isinstance(treasure_icon, list):
+                    if len(treasure_icon) > 0:
+                        treasure_icon = treasure_icon[0]
+                    else:
+                        treasure_icon = None
+                if treasure_icon:
+                    last_target = treasure_icon
+                if last_target is None:
+                    next_direction = self.opposite_direction(last_direction)
+                    self.log_info(self.tr('find_function not found, change to opposite direction'))
                 else:
-                    treasure_icon = None
-            if treasure_icon:
-                last_target = treasure_icon
-            if last_target is None:
-                next_direction = self.opposite_direction(last_direction)
-                self.log_info(self.tr('find_function not found, change to opposite direction'))
-            else:
-                x, y = last_target.center()
-                y = max(0, y - self.height_of_screen(y_offset))
-                x_abs = abs(x - self.width_of_screen(0.5))
-                threshold = 0.04 if not last_direction else x_threshold
-                centered = centered or x_abs <= self.width_of_screen(threshold)
-                if not centered:
-                    if x > self.width_of_screen(0.5):
-                        next_direction = 'd'
+                    x, y = last_target.center()
+                    y = max(0, y - self.height_of_screen(y_offset))
+                    x_abs = abs(x - self.width_of_screen(0.5))
+                    threshold = 0.04 if not last_direction else x_threshold
+                    centered = centered or x_abs <= self.width_of_screen(threshold)
+                    if not centered:
+                        if x > self.width_of_screen(0.5):
+                            next_direction = 'd'
+                        else:
+                            next_direction = 'a'
                     else:
-                        next_direction = 'a'
+                        if last_direction == 's':
+                            center = 0.45
+                        elif last_direction == 'w':
+                            center = 0.6
+                        else:
+                            center = 0.5
+                        if y > self.height_of_screen(center):
+                            next_direction = 's'
+                        else:
+                            next_direction = 'w'
+                if next_direction != last_direction:
+                    if last_direction:
+                        self.send_key_up(last_direction)
+                        self.sleep(0.001)
+                    last_direction = next_direction
+                    if next_direction:
+                        self.send_key_down(next_direction)
+                if running:
+                    if not self.find_one('on_the_wall', threshold=0.7):
+                        self.log_info(self.tr('not on the wall, stop running'))
+                        self.mouse_up(key='right')
                 else:
-                    if last_direction == 's':
-                        center = 0.45
-                    elif last_direction == 'w':
-                        center = 0.6
-                    else:
-                        center = 0.5
-                    if y > self.height_of_screen(center):
-                        next_direction = 's'
-                    else:
-                        next_direction = 'w'
-            if next_direction != last_direction:
+                    if next_direction == 'w' and self.find_one('on_the_wall', threshold=0.7):
+                        self.log_info(self.tr('on the wall, start running'))
+                        running = True
+                        self.mouse_down(key='right')
+                        self.sleep(0.1)
+                if use_hook and next_direction == 'w':
+                    if self.find_one('tool_teleport', 0.75):
+                        self.send_key(self.key_config['Tool Key'])
+                        self.sleep(3)
+                        continue
+        finally:
+            try:
                 if last_direction:
                     self.send_key_up(last_direction)
-                    self.sleep(0.001)
-                last_direction = next_direction
-                if next_direction:
-                    self.send_key_down(next_direction)
-            if running:
-                if not self.find_one('on_the_wall', threshold=0.7):
-                    self.log_info(self.tr('not on the wall, stop running'))
+            finally:
+                if running:
                     self.mouse_up(key='right')
-            else:
-                if next_direction == 'w' and self.find_one('on_the_wall', threshold=0.7):
-                    self.log_info(self.tr('on the wall, start running'))
-                    running = True
-                    self.mouse_down(key='right')
-                    self.sleep(0.1)
-            if use_hook and next_direction == 'w':
-                if self.find_one('tool_teleport', 0.75):
-                    self.send_key(self.key_config['Tool Key'])
-                    self.sleep(3)
-                    continue
-        if last_direction:
-            self.send_key_up(last_direction)
-            self.sleep(0.001)
-        if running:
-            self.send_key_up(self.key_config.get('Dodge Key'))
         if not end_condition:
             return last_direction is not None
         else:
@@ -333,7 +389,6 @@ class BaseWWTask(BaseTask):
         delta_x = center_x - location_x
         delta_y = center_y - location_y
         # Determine dominant direction based on vector magnitude
-        direction = None
         if (abs(delta_x) > abs(delta_y) or (not current_direction and abs(delta_x) > 0.05 * screen_height)
                 or abs(delta_x) > 0.15 * screen_height):
             # More horizontal movement needed
@@ -362,12 +417,12 @@ class BaseWWTask(BaseTask):
     def check_for_monthly_card(self):
         if self.should_check_monthly_card():
             start = time.time()
-            logger.info(f'check_for_monthly_card start check')
+            logger.info('check_for_monthly_card start check')
             if self.in_combat():
-                logger.info(f'check_for_monthly_card in combat return')
+                logger.info('check_for_monthly_card in combat return')
                 return time.time() - start
             if self.in_team_and_world():
-                logger.info(f'check_for_monthly_card in team send sleep until monthly card popup')
+                logger.info('check_for_monthly_card in team send sleep until monthly card popup')
                 monthly_card = self.wait_until(self.handle_monthly_card, time_out=120, raise_if_not_found=False)
                 logger.info(f'wait monthly card end {monthly_card}')
                 cost = time.time() - start
@@ -429,6 +484,8 @@ class BaseWWTask(BaseTask):
     def use_stamina(self, once=60, must_use=0):
         self.sleep(1)
         current, back_up, total = self.get_stamina()
+        if current < 0 or back_up < 0 or total < once or not self.has_claim_stamina():
+            self._raise_stamina_result_unknown('无法确认领取界面或可用结晶波片')
         if current >= once * 2:
             used = once * 2
             use_double = True
@@ -440,17 +497,58 @@ class BaseWWTask(BaseTask):
         else:
             used = once
             use_double = False
-            logger.info(f"使用单倍体力")
-        if use_double:
-            btn = self.click_dialog_right_button()
-        else:
-            btn = self.click_dialog_left_button()
-        if self.wait_feature('gem_add_stamina', horizontal_variance=0.4, vertical_variance=0.05,
-                             time_out=2, settle_time=0.5):  # 看是否需要使用备用体力
-            self.click_relative(0.70, 0.71, hcenter=True, after_sleep=1)  # 点击确认
-            self.click_relative(0.70, 0.71, hcenter=True, after_sleep=1)
-            self.back(after_sleep=1)
-            self.click(btn, after_sleep=1)
+            logger.info("使用单倍体力")
+        start_with_backup = False
+        reserve_submitted = False
+        while True:
+            try:
+                if not start_with_backup:
+                    if use_double:
+                        self.click_dialog_right_button()
+                    else:
+                        self.click_dialog_left_button()
+                need_backup = start_with_backup or self.wait_feature(
+                    'gem_add_stamina', horizontal_variance=.4, vertical_variance=.05,
+                    time_out=2, settle_time=.5)
+                if need_backup:
+                    # 备用确认也是资源动作；失焦后不能凭旧按钮继续重复确认。
+                    reserve_submitted = True
+                    self.click_relative(.70, .71, hcenter=True, after_sleep=1)
+                    if self.find_one('gem_add_stamina') or self.find_one(
+                            ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
+                        self.click_relative(.70, .71, hcenter=True, after_sleep=1)
+                    if self.find_one('gem_add_stamina'):
+                        self.back(after_sleep=1)
+                    if self.has_claim_stamina():
+                        # 补充后重新识别领取按钮，不能复用补充前记录的按钮框。
+                        if use_double:
+                            self.click_dialog_right_button()
+                        else:
+                            self.click_dialog_left_button()
+                completed = self.wait_until(
+                    lambda: self._stamina_result_state() == 'completed', time_out=4, raise_if_not_found=False)
+                if completed:
+                    break
+                self._raise_stamina_result_unknown('领取后未确认奖励结果')
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                state = self.wait_until(self._stamina_result_state, time_out=4,
+                                        settle_time=1, raise_if_not_found=False)
+                if state == 'completed':
+                    break
+                if state == 'claim':
+                    _, _, observed_total = self.get_stamina()
+                    if observed_total >= total:
+                        # 新领取菜单和未扣减的总额共同确认尚未领取，才允许重新作出领取决定。
+                        start_with_backup = False
+                        reserve_submitted = False
+                        continue
+                    self._raise_stamina_result_unknown('波片已变化，但领取结果无法确认')
+                if state == 'backup' and not reserve_submitted:
+                    # 只在尚未提交备用确认且新框仍可识别时接入该确认阶段。
+                    start_with_backup = True
+                    continue
+                self._raise_stamina_result_unknown('资源输入中断后无法确认提交结果')
 
         current -= used
         must_use -= used
@@ -465,27 +563,73 @@ class BaseWWTask(BaseTask):
             can_continue = True
         return can_continue, used
 
+    def _stamina_result_state(self):
+        rewards = self.ocr(match=re.compile(
+            r'获得奖励|獲得獎勵|获得物品|獲得物品|领取成功|領取成功|Rewards? (?:Obtained|Claimed)', re.I))
+        if rewards:
+            return 'completed'
+        claiming = bool(self.has_claim_stamina())
+        if not claiming and self.ocr(.25, .7, .85, 1, match=re.compile(
+                r'再次挑战|再次挑戰|继续挑战|繼續挑戰|重新挑战|Rechallenge|Challenge Again|Repeat Challenge', re.I)):
+            return 'completed'
+        if self.find_one('gem_add_stamina'):
+            return 'backup'
+        if claiming:
+            return 'claim'
+        return None
+
+    def _raise_stamina_result_unknown(self, reason):
+        self.screenshot('stamina_result_unknown')
+        raise ForegroundInputError(f'{reason}，已停止操作，未计入消耗')
+
+    def finish_challenge_result(self, repeat, repeat_point=(.68, .84), exit_point=(.42, .84),
+                                team_timeout=120, hcenter=False):
+        """领取已确认后继续或离场；恢复仅操作新画面中的目标按钮，不重复领取。"""
+        point = repeat_point if repeat else exit_point
+        pattern = re.compile(r'再次|重新|继续|再次|繼續|Rechallenge|Again|Repeat|Continue' if repeat
+                             else r'退出|返回|離開|Exit|Leave|Return', re.I)
+        recovering = False
+        while True:
+            try:
+                if self.in_team_and_world() and (repeat or not self.in_realm()):
+                    return
+                if recovering:
+                    area = self.box_of_screen(max(0, point[0] - .2), max(0, point[1] - .15),
+                                              min(1, point[0] + .2), min(1, point[1] + .15), hcenter=hcenter)
+                    targets = self.wait_ocr(box=area, match=pattern, time_out=2, raise_if_not_found=False)
+                    if targets:
+                        expected = self.box_of_screen(*point, *point, hcenter=hcenter)
+                        target = min(targets, key=lambda box: (box.x + box.width / 2 - expected.x) ** 2
+                                     + (box.y + box.height / 2 - expected.y) ** 2)
+                        self.click(target, after_sleep=1)
+                    elif self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
+                        self.click_confirm()
+                    else:
+                        if self.wait_in_team_and_world(time_out=team_timeout, raise_if_not_found=False):
+                            return
+                        self.screenshot('challenge_result_unknown')
+                        raise ForegroundInputError('无法确认挑战结果页的继续或离场状态，已停止操作')
+                else:
+                    self.click_relative(*point, hcenter=hcenter, after_sleep=1)
+                self.wait_click_skip_dialog_confirm()
+                self.wait_in_team_and_world(time_out=team_timeout)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
+
     def send_key_and_wait_f(self, direction, raise_if_not_found, time_out, running=False, target_text=None,
                             check_combat=False):
         if time_out <= 0:
             return
-        self.send_key_down(direction)
-        if running:
-            self.sleep(0.1)
-            self.mouse_down(key='right')
-        f_found = self.wait_until(
+        f_found = self.run_until(
             lambda: self.find_f_with_text(target_text=target_text) or (check_combat and self.in_combat()),
-            time_out=time_out,
-            raise_if_not_found=False)
-        self.send_key_up(direction)
-        if running:
-            self.sleep(0.1)
-            self.mouse_up(key='right')
+            direction, time_out=time_out, running=running)
         if not f_found:
             if raise_if_not_found:
                 raise CannotFindException(self.tr('cant find the f to enter'))
             else:
-                logger.warning(f"can't find the f to enter")
+                logger.warning("can't find the f to enter")
                 return False
         return f_found
 
@@ -493,25 +637,41 @@ class BaseWWTask(BaseTask):
                   post_walk=0):
         if time_out <= 0:
             return
-        self.send_key_down(direction)
-        if running:
-            self.sleep(0.1)
-            logger.debug(f'run_until condiction {condiction} direction {direction}')
-            self.mouse_down(key='right')
-        start = time.time()
+        start = self.business_time()
         result = None
-        while time.time() - start < time_out:
-            if result := condiction():
+        while self.business_time() - start < time_out:
+            try:
+                if result := condiction():
+                    break
+                epoch = getattr(self, '_foreground_epoch', 0)
+                try:
+                    self.send_key_down(direction)
+                    if running:
+                        self.sleep(.1)
+                        self.mouse_down(key='right')
+                    while self.business_time() - start < time_out:
+                        result = condiction()
+                        if epoch != getattr(self, '_foreground_epoch', 0):
+                            raise ForegroundInputInterrupted('导航画面已刷新，需要重新判断移动')
+                        if result:
+                            break
+                        if target:
+                            self.middle_click(interval=.5)
+                        self.sleep(.02)
+                    if result and post_walk:
+                        self.sleep(post_walk)
+                        if epoch != getattr(self, '_foreground_epoch', 0):
+                            raise ForegroundInputInterrupted('后续移动已中断，需要重新定位')
+                finally:
+                    try:
+                        self.send_key_up(direction)
+                    finally:
+                        if running:
+                            self.mouse_up(key='right')
                 break
-            if target:
-                self.middle_click(interval=0.5)
-            self.sleep(0.02)
-        if result and post_walk:
-            self.sleep(post_walk)
-        self.send_key_up(direction)
-        if running:
-            self.sleep(0.1)
-            self.mouse_up(key='right')
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                result = None
 
         if raise_if_not_found and not result:
             raise Exception(self.tr('wait condition failed while walking'))
@@ -521,12 +681,18 @@ class BaseWWTask(BaseTask):
         return False
 
     def handle_claim_button(self):
-        while self.wait_until(self.has_claim, raise_if_not_found=False, time_out=1.5):
-            self.sleep(0.5)
-            self.send_key('esc')
-            self.sleep(0.5)
-            logger.info(f"handle_claim_button found a claim reward")
-            return True
+        found = False
+        while True:
+            try:
+                if not self.wait_until(self.has_claim, raise_if_not_found=False, time_out=1.5):
+                    return found
+                found = True
+                self.sleep(.5)
+                self.send_key('esc', after_sleep=.5)
+                logger.info('已关闭当前领奖弹窗')
+                return True
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def has_claim_stamina(self):
         return not self.in_team()[0] and self.find_one('claim_stamina_sign')
@@ -578,20 +744,36 @@ class BaseWWTask(BaseTask):
         return ret
 
     def pick_echo(self):
-        if self.find_f_with_text(target_text=self.absorb_echo_text()):
-            self.send_key('f')
-            if not self.handle_claim_button():
-                self.log_debug('found a echo picked')
-                return True
+        pending = False
+        while True:
+            try:
+                if not self.find_f_with_text(target_text=self.absorb_echo_text()):
+                    return pending and not self.handle_claim_button()
+                pending = True
+                self.send_key('f')
+                if not self.handle_claim_button():
+                    self.log_debug('found a echo picked')
+                    return True
+                return False
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def pick_f(self, handle_claim=True):
-        if self.find_one('pick_up_f_hcenter_vcenter', box=self.f_search_box, threshold=0.8):
-            self.send_key('f', after_sleep=1)
-            if not handle_claim:
-                return True
-            if not self.handle_claim_button():
-                self.log_debug('found a echo picked')
-                return True
+        pending = False
+        while True:
+            try:
+                if not self.find_one('pick_up_f_hcenter_vcenter', box=self.f_search_box, threshold=.8):
+                    return pending and (not handle_claim or not self.handle_claim_button())
+                pending = True
+                self.send_key('f', after_sleep=1)
+                if not handle_claim:
+                    return True
+                if not self.handle_claim_button():
+                    self.log_debug('found a echo picked')
+                    return True
+                return False
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def is_pick_f(self):
         f = self.find_one('pick_up_f_hcenter_vcenter', box=self.f_search_box,
@@ -607,6 +789,8 @@ class BaseWWTask(BaseTask):
 
     def walk_to_treasure(self, send_f=True, raise_if_not_found=True):
         self.log_info(self.tr('start walk_to_treasure'))
+        if self.has_claim_stamina() or self.has_claim():
+            return True
         if not self.walk_to_box(self.find_treasure_icon, end_condition=self.find_f_with_claim_text):
             if not self.walk_to_box(self.find_treasure_icon, end_condition=self.find_f_with_text):
                 raise Exception(self.tr('can not walk to treasure!'))
@@ -660,7 +844,7 @@ class BaseWWTask(BaseTask):
     def walk_find_echo(self, backward_time=1, time_out=3):
         if self.walk_until_f(time_out=time_out, backward_time=backward_time, target_text=self.absorb_echo_text(),
                              raise_if_not_found=False, check_combat=True):  # find and pick echo
-            logger.debug(f'farm echo found echo move forward walk_until_f to find echo')
+            logger.debug('farm echo found echo move forward walk_until_f to find echo')
             return self.pick_f()
 
     def incr_drop(self, dropped):
@@ -686,10 +870,20 @@ class BaseWWTask(BaseTask):
         return success
 
     def esc_world_confirm(self, send_esc=True):
-        if send_esc:
-            self.send_key('esc', after_sleep=1)
-        self.click_dialog_right_button()
-        self.wait_in_team_and_world(time_out=120)
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world() and not self.in_realm():
+                    return
+                if not self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
+                    if send_esc:
+                        self.send_key('esc', after_sleep=1)
+                self.click_dialog_right_button()
+                self.wait_in_team_and_world(time_out=120)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def click_dialog_right_button(self):
         confirm = self.find_one([
@@ -702,10 +896,20 @@ class BaseWWTask(BaseTask):
         return confirm
 
     def esc_cancel(self, send_esc=True):
-        if send_esc:
-            self.send_key('esc', after_sleep=1)
-        self.click_dialog_left_button()
-        self.wait_in_team_and_world(time_out=120)
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world():
+                    return
+                if not self.find_one(['cancel_button_hcenter_vcenter', 'cancel_button_highlight_hcenter_vcenter']):
+                    if send_esc:
+                        self.send_key('esc', after_sleep=1)
+                self.click_dialog_left_button()
+                self.wait_in_team_and_world(time_out=120)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def click_dialog_left_button(self) -> Box:
         cancel = self.find_one([
@@ -721,8 +925,16 @@ class BaseWWTask(BaseTask):
         self.info_set('current task', f'wait main esc={esc}')
         if not self.logged_in:
             time_out = 600
-        if not self.wait_until(lambda: self.is_main(esc=esc), time_out=time_out, raise_if_not_found=False):
-            raise Exception(self.tr('Please start in game world and in team!'))
+        start = self.business_time()
+        while True:
+            try:
+                remaining = max(0, time_out - (self.business_time() - start))
+                if remaining <= 0 or not self.wait_until(
+                        lambda: self.is_main(esc=esc), time_out=remaining, raise_if_not_found=False):
+                    raise Exception(self.tr('Please start in game world and in team!'))
+                break
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
         self.sleep(0.5)
         self.info_set('current task', f'in main esc={esc}')
 
@@ -740,6 +952,12 @@ class BaseWWTask(BaseTask):
             self.log_debug('main esc')
             self.back(after_sleep=2)
             return False
+
+    def _confirm_login_account(self, require_visible=True):
+        """多账号上下文在实际提交前回读；普通登录没有目标回调，保持原流程。"""
+        confirm = getattr(self, '_login_account_guard', None)
+        if confirm is not None:
+            confirm(require_visible=require_visible)
 
     def wait_login(self):
         if not self.logged_in:
@@ -766,12 +984,15 @@ class BaseWWTask(BaseTask):
                                             match=LOGIN_TEXTS)
                     if login and not self.find_boxes(texts, boundary=login_box,
                                                      match="+86"):
+                        # ensure_main 会自行恢复失焦，必须在最后点击边界重新确认当前账号。
+                        BaseWWTask._confirm_login_account(self)
                         self.click(login, after_sleep=1)
                         self.log_info(self.tr('Click the Login button!'))
                 return False
             if agree := self.find_boxes(texts, boundary=login_box, match="同意"):
                 self.log_debug(f'found agree {agree}')
                 if self.find_boxes(texts, boundary=login_box, match=re.compile("隐私")):
+                    BaseWWTask._confirm_login_account(self, require_visible=False)
                     self.click(agree, after_sleep=1)
                     self.log_info(self.tr('Click the Agree button!'))
                 return False
@@ -786,6 +1007,8 @@ class BaseWWTask(BaseTask):
 
             if start := self.find_boxes(texts, boundary='bottom_right', match=["开始游戏", re.compile("进入游戏")]):
                 if not self.find_boxes(texts, boundary='bottom_right', match=LOGIN_TEXTS):
+                    # 鉴权后的进入页可能不再显示账号；仍可回读时必须拒绝目标变化。
+                    BaseWWTask._confirm_login_account(self, require_visible=False)
                     self.click(start)
                     self.log_info(self.tr('Click Start Game! {start}').format(start=start))
                     return False
@@ -793,6 +1016,7 @@ class BaseWWTask(BaseTask):
                 if boxes := self.find_boxes(texts, boundary=self.box_of_screen(0.37, 0.63, 0.63, 0.99, hcenter=True,
                                                                                vcenter=True)):
                     self.log_info(self.tr('wait_login {switch_login} {boxes}').format(switch_login=switch_login, boxes=boxes))
+                    BaseWWTask._confirm_login_account(self, require_visible=False)
                     self.click_relative(0.503, 0.926, hcenter=True, vcenter=True, after_sleep=3)
                     return False
 
@@ -820,7 +1044,6 @@ class BaseWWTask(BaseTask):
         max_conf = 0
         max_angle = 0
         max_target = None
-        max_mat = None
         (h, w) = arrow_template.mat.shape[:2]
         # self.log_debug(f'turn_east h:{h} w:{w}')
         center = (w // 2, h // 2)
@@ -866,10 +1089,12 @@ class BaseWWTask(BaseTask):
         return to_turn
 
     def _stop_movement(self, current_direction):
-        """Releases keys and mouse to stop character movement."""
+        """异常和取消时仍释放实际移动持有，不受前台门禁限制。"""
         if current_direction is not None:
-            self.mouse_up(key='right')
-            self.send_key_up(current_direction)
+            try:
+                self.mouse_up(key='right')
+            finally:
+                self.send_key_up(current_direction)
 
     def _navigate_based_on_angle(self, angle, current_direction, current_adjust):
         """
@@ -881,6 +1106,7 @@ class BaseWWTask(BaseTask):
         - new_adjust: The updated adjustment state.
         - should_continue: A boolean indicating if the calling loop should `continue`.
         """
+        epoch = getattr(self, '_foreground_epoch', 0)
         # 1. Handle minor adjustments if already moving forward
         if current_direction == 'w':
             if 10 <= angle <= 80:
@@ -891,11 +1117,15 @@ class BaseWWTask(BaseTask):
                 minor_adjust = None
 
             if minor_adjust:
-                self.send_key_down(minor_adjust)
-                self.sleep(0.1)
-                self.middle_click(down_time=0.1)
-                self.send_key_up(minor_adjust)
+                try:
+                    self.send_key_down(minor_adjust)
+                    self.sleep(.1)
+                    self.middle_click(down_time=.1)
+                finally:
+                    self.send_key_up(minor_adjust)
                 self.sleep(0.01)
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('转向画面已刷新，需要重新计算角度')
                 # Tell the caller to continue to the next loop iteration
                 return current_direction, current_adjust, True
 
@@ -928,6 +1158,8 @@ class BaseWWTask(BaseTask):
             current_direction = 'w'  # After turning, we always move forward
             self.wait_until(self.in_combat, time_out=1)
 
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('移动画面已刷新，需要重新计算方向')
         return current_direction, current_adjust, False
 
     def in_team(self):
@@ -960,21 +1192,39 @@ class BaseWWTask(BaseTask):
 
     def handle_monthly_card(self):
         monthly_card = self.find_monthly_card()
-        # self.screenshot('monthly_card1')
-        if monthly_card is not None:
-            # self.screenshot('monthly_card1')
-            self.log_info(self.tr('monthly_card found click'))
-            self.click_relative(0.50, 0.89)
-            self.sleep(2)
-            # self.screenshot('monthly_card2')
-            self.click_relative(0.50, 0.89)
-            self.sleep(2)
-            self.wait_until(self.in_team_and_world, time_out=10,
-                            post_action=lambda: self.click_relative(0.50, 0.89, after_sleep=1))
-            # self.screenshot('monthly_card3')
-            self.set_check_monthly_card(next_day=True)
-        # logger.debug(f'check_monthly_card {monthly_card}')
-        return monthly_card is not None
+        if monthly_card is None:
+            return False
+        phase = 'card'
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world():
+                    break
+                if phase == 'card':
+                    if not recovering or self.find_monthly_card():
+                        self.click_relative(.50, .89)
+                    phase = 'reward'
+                    self.sleep(2)
+                if phase == 'reward':
+                    if not recovering or self._has_monthly_reward_ui():
+                        self.click_relative(.50, .89)
+                    phase = 'wait'
+                    self.sleep(2)
+                self.wait_until(self.in_team_and_world, time_out=10, post_action=self._dismiss_monthly_reward)
+                break
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
+        self.set_check_monthly_card(next_day=True)
+        return True
+
+    def _has_monthly_reward_ui(self):
+        return bool(self.find_monthly_card() or self.has_claim() or self.ocr(match=re.compile(
+            r'获得奖励|獲得獎勵|获得物品|獲得物品|Rewards? Obtained', re.I)))
+
+    def _dismiss_monthly_reward(self):
+        if self._has_monthly_reward_ui():
+            self.click_relative(.50, .89, after_sleep=1)
 
     @property
     def game_lang(self):
@@ -987,10 +1237,12 @@ class BaseWWTask(BaseTask):
         return 'unknown_lang'
 
     def open_esc_menu(self):
-        self.send_key_down('alt')
-        self.sleep(0.05)
-        self.click_relative(0.95, 0.04)
-        self.send_key_up('alt')
+        try:
+            self.send_key_down('alt')
+            self.sleep(.05)
+            self.click_relative(.95, .04)
+        finally:
+            self.send_key_up('alt')
         self.sleep(0.5)
 
     def open_boss_book(self, name, after_sleep=2):
@@ -1010,57 +1262,95 @@ class BaseWWTask(BaseTask):
         elif name == 'canxiang':
             y = 0.83
         elif name == 'mengyan':
-            self.click_relative(0.356, 0.882, after_sleep=after_sleep)
             y = 0.86
         else:
             raise Exception(self.tr('unknown_lang {name}').format(name=name))
-        self.click_relative(x, y, after_sleep=after_sleep, name=name)
+        self._book_category_name = name
+        while True:
+            try:
+                if name == 'mengyan':
+                    self.click_relative(0.356, 0.882, after_sleep=after_sleep)
+                self.click_relative(x, y, after_sleep=after_sleep, name=name)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                self.openF2Book('gray_book_boss')
 
     def openF2Book(self, feature="gray_book_all_monsters"):
         if hasattr(self, 'reset_to_false'):
             self.reset_to_false('opening book')
-        self.ensure_main()
         book_key = self.key_config.get('Guidebook Key', self.key_config.get('索拉指南', 'f2'))
         self.log_info(self.tr('click {book_key} to open the book').format(book_key=book_key))
-        if self.in_team_and_world():
-            self.send_key(book_key, after_sleep=4)
-            self.log_info(self.tr('send {book_key} key to open').format(book_key=book_key))
-        if self.in_team_and_world():
-            self.log_info(self.tr('send f2 key mouse key to open the book'))
-            self.send_key_down('alt')
-            self.sleep(0.05)
-            self.click_relative(0.77, 0.05)
-            self.sleep(0.02)
-            self.send_key_up('alt')
-            self.sleep(4)
-        gray_book_boss = self.wait_book(feature)
-        if not gray_book_boss:
-            self.log_error(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"), notify=True)
-            raise Exception(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"))
-        self.sleep(2)
-        self.click_box(gray_book_boss, after_sleep=1.5)
-        return gray_book_boss
+        while True:
+            try:
+                # 已打开图鉴时直接重新找目标页签，避免失焦后再按快捷键把图鉴关掉。
+                if not self.find_one(feature):
+                    self.ensure_main()
+                    if self.in_team_and_world():
+                        self.send_key(book_key, after_sleep=4)
+                        self.log_info(self.tr('send {book_key} key to open').format(book_key=book_key))
+                    if self.in_team_and_world():
+                        try:
+                            self.send_key_down('alt')
+                            self.sleep(0.05)
+                            self.click_relative(0.77, 0.05)
+                            self.sleep(0.02)
+                        finally:
+                            self.send_key_up('alt')
+                        self.sleep(4)
+                gray_book_boss = self.wait_book(feature)
+                if not gray_book_boss:
+                    self.log_error(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"), notify=True)
+                    raise Exception(self.tr("can't find gray_book_boss, make sure f2 is the hotkey for book"))
+                self.sleep(2)
+                self.click_box(gray_book_boss, after_sleep=1.5)
+                return gray_book_boss
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def click_traval_button(self):
-        for feature_name in ['fast_travel_custom', 'gray_teleport', 'remove_custom']:
-            if self.find_one(feature_name, threshold=0.7):
-                self.sleep(0.5)
-                feature = self.find_one(feature_name, threshold=0.7)
-                if not feature:
-                    continue
-                self.click(feature, after_sleep=1)
-                if feature.name == 'fast_travel_custom':
-                    if confirm := self.wait_feature(
-                            ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
-                            raise_if_not_found=False,
-                            threshold=0.6,
-                            time_out=2):
-                        self.click(0.49, 0.55, after_sleep=0.5)  # 点击不再提醒
-                        self.click(confirm, after_sleep=0.5)
+        requested = False
+        recovering = False
+        while True:
+            try:
+                if requested and self.in_team_and_world():
+                    return True
+                if recovering and requested:
+                    confirm = self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
+                                            threshold=.6)
+                    if confirm:
+                        # 只重查并确认仍在前台的弹窗；失焦前的勾选步骤不再盲目切换。
+                        self.click(confirm, after_sleep=.5)
                         self.click_confirm()
-                if feature.name != 'remove_custom':
-                    self.wait_click_skip_dialog_confirm()
-                return True
+                        self.wait_click_skip_dialog_confirm()
+                        return True
+                for feature_name in ['fast_travel_custom', 'gray_teleport', 'remove_custom']:
+                    if self.find_one(feature_name, threshold=0.7):
+                        self.sleep(0.5)
+                        feature = self.find_one(feature_name, threshold=0.7)
+                        if not feature:
+                            continue
+                        requested = feature.name != 'remove_custom'
+                        self.click(feature, after_sleep=1)
+                        if feature.name == 'fast_travel_custom':
+                            if confirm := self.wait_feature(
+                                    ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
+                                    raise_if_not_found=False, threshold=.6, time_out=2):
+                                self.click(.49, .55, after_sleep=.5)
+                                self.click(confirm, after_sleep=.5)
+                                self.click_confirm()
+                        if feature.name != 'remove_custom':
+                            self.wait_click_skip_dialog_confirm()
+                        return True
+                if requested:
+                    # 传送点击可能已进入加载，先确认新主界面；没有结果时不能再点旧地图坐标。
+                    if self.wait_in_team_and_world(time_out=120, raise_if_not_found=False):
+                        return True
+                    raise ForegroundInputError('无法确认传送结果，已停止操作')
+                return False
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def click_confirm(self, timeout=1):
         self.wait_click_feature(
@@ -1070,6 +1360,7 @@ class BaseWWTask(BaseTask):
             time_out=1)
 
     def click_skip_dialog_confirm(self):
+        epoch = getattr(self, '_foreground_epoch', 0)
         skip_dialog_confirm = self.find_one(
             ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
             horizontal_variance=0.1,
@@ -1101,23 +1392,68 @@ class BaseWWTask(BaseTask):
             return False
 
         logger.info('confirm dialog exists, click confirm')
-        self.sleep(0.5)
-        self.click(skip_dialog_check)
-        self.sleep(0.5)
-        self.click(skip_dialog_confirm)
-        self.sleep(0.2)
-        return True
+        try:
+            self.sleep(.5)
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('确认弹窗画面已刷新，需要重新识别')
+            self.click(skip_dialog_check)
+            self.sleep(.5)
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('勾选后画面已刷新，需要重新识别确认')
+            self.click(skip_dialog_confirm)
+            self.sleep(.2)
+            return True
+        except ForegroundInputInterrupted:
+            self._recover_foreground_input()
+            return self._confirm_resumed_skip_dialog()
+
+    def _confirm_resumed_skip_dialog(self):
+        while True:
+            try:
+                confirm = self.find_one(
+                    ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
+                    horizontal_variance=.1, vertical_variance=.1)
+                if not confirm:
+                    return False
+                # 不恢复旧勾选动作；新弹窗仍在时只点其确认，避免取消已经生效的勾选。
+                self.click(confirm, after_sleep=.2)
+                return True
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
 
     def wait_click_skip_dialog_confirm(self, time_out=3):
-        return self.wait_until(
-            self.click_skip_dialog_confirm,
-            time_out=time_out,
-            raise_if_not_found=False,
-        )
+        recovering = False
+        while True:
+            try:
+                if recovering:
+                    return self._confirm_resumed_skip_dialog()
+                return self.wait_until(self.click_skip_dialog_confirm, time_out=time_out,
+                                       raise_if_not_found=False)
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def click_team_challenge(self):
-        self.wait_click_feature('team_start_challenge', raise_if_not_found=True, click_after_delay=0.5, after_sleep=1)
-        self.wait_click_skip_dialog_confirm()
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world():
+                    return
+                if recovering and not self.find_one('team_start_challenge'):
+                    if self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
+                        self.click_confirm()
+                    elif self.wait_in_team_and_world(time_out=120, raise_if_not_found=False):
+                        return
+                    else:
+                        raise ForegroundInputError('无法确认编队开始后的状态，已停止操作')
+                else:
+                    self.wait_click_feature('team_start_challenge', raise_if_not_found=True,
+                                            click_after_delay=.5, after_sleep=1)
+                self.wait_click_skip_dialog_confirm()
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def wait_click_travel(self):
         self.wait_until(self.click_traval_button, raise_if_not_found=True, time_out=10)
@@ -1154,6 +1490,21 @@ class BaseWWTask(BaseTask):
         return bar.y / self.height
 
     def click_on_book_target(self, serial_number: int, total_number: int, structure: list[int] = None):
+        while True:
+            try:
+                return self._click_on_book_target_once(serial_number, total_number, structure)
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                feature = self.find_one(['fast_travel_custom', 'gray_teleport', 'remove_custom', *TEAM_SCREEN_FEATURES])
+                if feature:
+                    return feature.name in TEAM_SCREEN_FEATURES
+                # 列表或滚动条动作中断后恢复已记录的分类，再重读行和滚动条，不沿用旧框。
+                category = getattr(self, '_book_category_name', None)
+                if category:
+                    self.openF2Book('gray_book_boss')
+                    self.open_boss_book(category)
+
+    def _click_on_book_target_once(self, serial_number: int, total_number: int, structure: list[int] = None):
         def get_cross_count(structure, sn):
             current_sum = 0
             cross_count = 0

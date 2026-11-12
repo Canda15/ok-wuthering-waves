@@ -1,0 +1,10 @@
+--- a/device/interaction_methods/base.py
++++ b/device/interaction_methods/base.py
+@@ -51,3 +51,7 @@
+ 
+     def on_destroy(self):
+         pass
++
++    def release_all(self):
++        """停止与换目标的专用清理入口，不经过普通任务输入检查。"""
++        pass

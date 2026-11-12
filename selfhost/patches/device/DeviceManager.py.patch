@@ -1,0 +1,434 @@
+--- a/device/DeviceManager.py
++++ b/device/DeviceManager.py
+@@ -1,6 +1,7 @@
+ import os
+ import re
+ import threading
++import time
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ import cv2
+@@ -8,8 +9,8 @@
+ 
+ from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method, NemuIpcCaptureMethod, \
+     ADBCaptureMethod
+-from ok.device.interaction import PostMessageInteraction, GenshinInteraction, ForegroundPostMessageInteraction, \
+-    PynputInteraction, PyDirectInteraction, BrowserInteraction, ADBInteraction
++from ok.device.interaction import PynputInteraction, BrowserInteraction, ADBInteraction
++from ok.task.exceptions import TaskDisabledException
+ from ok.core.events import communicate
+ from ok.util.collection import parse_ratio
+ from ok.util.config import Config
+@@ -42,6 +43,25 @@
+     return method.__name__ if isinstance(method, type) else str(method)
+ 
+ 
++def normalize_pc_interaction(interaction):
++    """所有 PC 入口使用同一个迁移规则，旧标识永远不能恢复消息输入。"""
++    if isinstance(interaction, list):
++        for item in interaction:
++            normalize_pc_interaction(item)
++        return 'Pynput'
++    if interaction is None or interaction == '':
++        return 'Pynput'
++    if interaction is PynputInteraction:
++        return 'Pynput'
++    name = interaction.__name__ if isinstance(interaction, type) else interaction
++    accepted = {'pynput', 'pynputinteraction', 'postmessage', 'postmessageinteraction',
++                'genshin', 'genshininteraction', 'foregroundpostmessage',
++                'foregroundpostmessageinteraction', 'pydirect', 'pydirectinteraction'}
++    if isinstance(name, str) and name.strip().lower() in accepted:
++        return 'Pynput'
++    raise ValueError('不支持该 PC 输入方案，本应用仅使用前台系统键鼠')
++
++
+ class DeviceManager:
+ 
+     def __init__(self, app_config, exit_event=None, global_config=None):
+@@ -49,6 +69,11 @@
+         self._device = None
+         self._adb = None
+         self.executor = None
++        self._binding_lock = threading.RLock()
++        self._binding_condition = threading.Condition()
++        self._binding_requested = 0
++        self._binding_completed = 0
++        self._binding_error = None
+         self.capture_method = None
+         self.global_config = global_config
+         self._adb_lock = threading.Lock()
+@@ -74,6 +99,14 @@
+                               'selected_hwnd': 0, 'interaction': ''})
+         self.handler = Handler(exit_event, 'RefreshAdb')
+         if self.windows_capture_config is not None:
++            from ok.device.interaction_methods.foreground_input import get_shared_foreground_input
++            if hasattr(exit_event, 'bind_stop'):
++                exit_event.bind_stop(get_shared_foreground_input())
++            self.windows_capture_config['interaction'] = normalize_pc_interaction(
++                self.windows_capture_config.get('interaction'))
++            normalize_pc_interaction(self.config.get('interaction'))
++            self.win_interaction_class = PynputInteraction
++            self._save_pc_interaction()
+             if isinstance(self.windows_capture_config.get('exe'), str):
+                 self.windows_capture_config['exe'] = [self.windows_capture_config.get('exe')]
+ 
+@@ -82,46 +115,47 @@
+                                           hwnd_class=self.windows_capture_config.get('hwnd_class'),
+                                           global_config=self.global_config, device_manager=self,
+                                           top_hwnd_class=self.windows_capture_config.get('top_hwnd_class'))
+-            interaction = self.windows_capture_config.get('interaction')
+-            if isinstance(interaction, list):
+-                if interaction:
+-                    selected_interaction = interaction[0]
+-                else:
+-                    selected_interaction = 'Pynput'
+-            else:
+-                selected_interaction = interaction
+-
+-            saved_interaction = self.config.get('interaction')
+-            if saved_interaction:
+-                if isinstance(interaction, list):
+-                    for item in interaction:
+-                        item_name = item.__name__ if isinstance(item, type) else item
+-                        if saved_interaction == item_name:
+-                            selected_interaction = item
+-                            break
+-                else:
+-                    item_name = interaction.__name__ if isinstance(interaction, type) else interaction
+-                    if saved_interaction == item_name:
+-                        selected_interaction = interaction
+-
+-            if selected_interaction == 'PostMessage':
+-                self.win_interaction_class = PostMessageInteraction
+-            elif selected_interaction == 'Genshin':
+-                self.win_interaction_class = GenshinInteraction
+-            elif selected_interaction == 'ForegroundPostMessage':
+-                self.win_interaction_class = ForegroundPostMessageInteraction
+-            elif selected_interaction == 'Pynput':
+-                self.win_interaction_class = PynputInteraction
+-            elif selected_interaction == 'PyDirect':
+-                self.win_interaction_class = PyDirectInteraction
+-            elif selected_interaction:
+-                self.win_interaction_class = selected_interaction
+-            else:
+-                self.win_interaction_class = PynputInteraction
+         else:
+             self.hwnd_window = None
+ 
+         logger.info('__init__ end')
++
++    def _save_pc_interaction(self):
++        try:
++            self.config['interaction'] = 'Pynput'
++        except Exception as error:
++            # 保存失败也已经采用唯一前台类，不能降级到旧配置。
++            logger.warning(f'前台输入配置保存失败：{error}')
++
++    @property
++    def interaction(self):
++        return getattr(self, '_interaction', None)
++
++    @interaction.setter
++    def interaction(self, interaction):
++        previous = getattr(self, '_interaction', None)
++        if previous is not None and previous is not interaction:
++            self.release_input()
++        self._interaction = interaction
++
++    def release_input(self):
++        interaction = self.interaction
++        if interaction is not None:
++            try:
++                interaction.release_all()
++            except Exception as error:
++                logger.error(f'设备输入清理失败：{error}')
++
++    @property
++    def capture_method(self):
++        return getattr(self, '_capture_method', None)
++
++    @capture_method.setter
++    def capture_method(self, capture):
++        previous = getattr(self, '_capture_method', None)
++        if previous is not None and previous is not capture:
++            self.release_input()
++        self._capture_method = capture
+ 
+     def stop_hwnd(self):
+         if self.hwnd_window:
+@@ -131,6 +165,7 @@
+ 
+     def close(self):
+         """Stop capture resources before Qt/Python teardown begins."""
++        self.release_input()
+         hwnd_window = self.hwnd_window
+         if hwnd_window is not None:
+             hwnd_window.stop()
+@@ -144,6 +179,7 @@
+                 logger.error(f'capture method close failed: {e}')
+ 
+     def select_hwnd(self, exe, hwnd):
++        self.release_input()
+         self.config['selected_exe'] = exe
+         self.config['selected_hwnd'] = hwnd
+ 
+@@ -156,7 +192,7 @@
+         with self._adb_lock:
+             if self._adb is None:
+                 import adbutils
+-                logger.debug(f'init adb')
++                logger.debug('init adb')
+                 from adbutils._utils import _get_bin_dir
+                 bin_dir = _get_bin_dir()
+                 exe = os.path.join(bin_dir, "adb.exe" if os.name == 'nt' else 'adb')
+@@ -183,7 +219,7 @@
+                 try:
+                     proc.kill()
+                 except Exception as e:
+-                    logger.error(f'kill adb server failed', e)
++                    logger.error('kill adb server failed', e)
+         logger.info('try kill adb end')
+ 
+     def adb_connect(self, addr, try_connect=True):
+@@ -191,7 +227,7 @@
+         try:
+             for device in self.adb.list():
+                 if self.exit_event.is_set():
+-                    logger.error(f"adb_connect exit_event is set")
++                    logger.error("adb_connect exit_event is set")
+                     return None
+                 if device.serial == addr:
+                     if device.state == 'offline':
+@@ -364,7 +400,7 @@
+                 logger.debug(f'ThreadPoolExecutor failed during shutdown: {e}')
+             else:
+                 raise
+-        logger.debug(f'refresh_phones done')
++        logger.debug('refresh_phones done')
+ 
+     def refresh_emulators(self, current=False):
+         if self.adb_capture_config is None:
+@@ -431,7 +467,7 @@
+                 else:
+                     logger.warning(f'resolution error {device.serial} {self.supported_ratio} {width, height}')
+             else:
+-                logger.info(f'get_resolution capture frame is None')
++                logger.info('get_resolution capture frame is None')
+         return width, height
+ 
+     def set_preferred_device(self, imei=None, index=-1):
+@@ -451,9 +487,10 @@
+                 preferred = connected_device
+                 imei = preferred['imei']
+             else:
+-                logger.warning(f'no devices')
++                logger.warning('no devices')
+                 return
+         if self.config.get("preferred") != imei:
++            self.release_input()
+             logger.info(f'preferred device did change {imei}')
+             self.config["preferred"] = imei
+             if preferred.get('device') == 'windows' and preferred.get('real_hwnd'):
+@@ -497,7 +534,7 @@
+                 if image is not None:
+                     return image
+                 else:
+-                    logger.error(f"Screencap image decode error, probably disconnected")
++                    logger.error("Screencap image decode error, probably disconnected")
+         except Exception as e:
+             logger.error('screencap', e)
+ 
+@@ -568,9 +605,8 @@
+             return []
+         kind = device.get('device')
+         if kind == 'windows':
+-            configured = (self.windows_capture_config or {}).get('interaction', [])
+-            methods = configured if isinstance(configured, list) else [configured]
+-            return [method_name(item) for item in (methods or ['Pynput']) if item]
++            normalize_pc_interaction((self.windows_capture_config or {}).get('interaction'))
++            return ['Pynput']
+         if kind == 'browser':
+             return ['BrowserInteraction']
+         if kind == 'adb':
+@@ -587,36 +623,27 @@
+ 
+     def set_capture(self, capture):
+         if self.config.get("capture") != capture:
++            self.release_input()
+             self.config['capture'] = capture
+             self.start()
+ 
+     def set_interaction(self, interaction):
+-        interaction_name = interaction.__name__ if isinstance(interaction, type) else interaction
+-        
+-        config_interaction = self.windows_capture_config.get('interaction') if self.windows_capture_config else None
+-        if isinstance(interaction, str):
+-            if isinstance(config_interaction, list):
+-                for item in config_interaction:
+-                    if isinstance(item, type) and item.__name__ == interaction:
+-                        interaction = item
+-                        break
+-            elif isinstance(config_interaction, type) and config_interaction.__name__ == interaction:
+-                interaction = config_interaction
+-
+-        if self.config.get("interaction") != interaction_name:
+-            self.config['interaction'] = interaction_name
+-            if interaction == 'PostMessage':
+-                self.win_interaction_class = PostMessageInteraction
+-            elif interaction == 'Genshin':
+-                self.win_interaction_class = GenshinInteraction
+-            elif interaction == 'ForegroundPostMessage':
+-                self.win_interaction_class = ForegroundPostMessageInteraction
+-            elif interaction == 'Pynput':
+-                self.win_interaction_class = PynputInteraction
+-            elif interaction and interaction != 'PyDirect':
+-                self.win_interaction_class = interaction
+-            else:
+-                self.win_interaction_class = PyDirectInteraction
++        preferred = self.get_preferred_device()
++        kind = preferred.get('device') if preferred else 'windows'
++        if kind != 'windows':
++            expected = BrowserInteraction if kind == 'browser' else ADBInteraction
++            if interaction not in (expected, expected.__name__):
++                raise ValueError('该设备不支持请求的输入方案')
++            self.config['interaction'] = expected.__name__
++            return
++        interaction = normalize_pc_interaction(interaction)
++        changed = self.config.get('interaction') != interaction or self.win_interaction_class is not PynputInteraction
++        self.win_interaction_class = PynputInteraction
++        if self.windows_capture_config is not None:
++            self.windows_capture_config['interaction'] = interaction
++        self._save_pc_interaction()
++        if changed or not isinstance(self.interaction, PynputInteraction):
++            self.release_input()
+             self.start()
+ 
+     def get_hwnd_name(self):
+@@ -628,6 +655,9 @@
+             self.hwnd_window = HwndWindow(self.exit_event, title, exe, frame_width, frame_height, player_id,
+                                           hwnd_class, global_config=self.global_config, device_manager=self, top_hwnd_class=top_hwnd_class)
+         else:
++            if (self.hwnd_window.title != title or self.hwnd_window.exe_names != ([exe] if isinstance(exe, str) else exe)
++                    or self.hwnd_window.hwnd_class != hwnd_class or self.hwnd_window.top_hwnd_class != top_hwnd_class):
++                self.release_input()
+             self.hwnd_window.update_window(title, exe, frame_width, frame_height, player_id, hwnd_class, top_hwnd_class)
+ 
+     def use_windows_capture(self):
+@@ -639,17 +669,61 @@
+         self.capture_method = update_capture_method(self.windows_capture_config, self.capture_method, self.hwnd_window,
+                                                     exit_event=self.exit_event, selected_method=selected_method)
+         if self.capture_method is None:
+-            logger.error(f'cant find a usable windows capture')
++            logger.error('cant find a usable windows capture')
+         else:
+             logger.info(f'capture method {type(self.capture_method)}')
+             if self.interaction:
+                 self.interaction.capture = self.capture_method
+ 
+     def start(self):
+-        self.handler.post(self.do_start, remove_existing=True, skip_if_running=True)
++        with self._binding_condition:
++            self._binding_requested += 1
++            self._binding_error = None
++        self.handler.post(self._bind_pending, remove_existing=True)
++
++    def _bind_pending(self):
++        with self._binding_condition:
++            requested = self._binding_requested
++        error = None
++        try:
++            self.do_start()
++        except BaseException as caught:
++            error = caught
++            raise
++        finally:
++            with self._binding_condition:
++                self._binding_completed = requested
++                self._binding_error = error
++                self._binding_condition.notify_all()
++
++    def wait_for_binding(self, time_out=10, cancel_check=None):
++        """等待最近一次异步绑定，避免准备与首帧操作旧输入对象。"""
++        deadline = time.monotonic() + time_out
++        while True:
++            if self.exit_event.is_set():
++                raise TaskDisabledException()
++            if cancel_check is not None:
++                if cancel_check():
++                    raise TaskDisabledException()
++            with self._binding_condition:
++                if self._binding_completed >= self._binding_requested:
++                    if self._binding_error is not None:
++                        raise RuntimeError('设备绑定失败') from self._binding_error
++                    return self.interaction
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError('等待设备绑定完成超时')
++                self._binding_condition.wait(min(0.05, remaining))
+ 
+     def do_start(self, notify=True):
+-        logger.debug(f'do_start')
++        lock = getattr(self, '_binding_lock', None)
++        if lock is None:
++            lock = self._binding_lock = threading.RLock()
++        with lock:
++            return self._do_start(notify)
++
++    def _do_start(self, notify=True):
++        logger.debug('do_start')
+         preferred = self.get_preferred_device()
+         if preferred is None:
+             if self.device_dict:
+@@ -659,6 +733,9 @@
+             return
+ 
+         if preferred['device'] == 'windows':
++            normalize_pc_interaction(self.windows_capture_config.get('interaction'))
++            normalize_pc_interaction(self.config.get('interaction'))
++            self.win_interaction_class = PynputInteraction
+             title = self.windows_capture_config.get('title')
+             exe = self.windows_capture_config.get('exe')
+             if not exe and not title and preferred.get('real_hwnd'):
+@@ -701,7 +778,7 @@
+                     logger.info(f'use ipc capture {preferred}')
+                 else:
+                     if not isinstance(self.capture_method, ADBCaptureMethod):
+-                        logger.debug(f'use adb capture')
++                        logger.debug('use adb capture')
+                         if self.capture_method is not None:
+                             self.capture_method.close()
+                         self.capture_method = ADBCaptureMethod(self, self.exit_event, width=width,
+@@ -744,7 +821,7 @@
+                 logger.info(f'get device adb device addr changed {preferred}')
+                 self._device = self.adb_connect(preferred.get('address'))
+         else:
+-            logger.error(f'self.get_preferred_device returned None')
++            logger.error('self.get_preferred_device returned None')
+         return self._device
+ 
+     def adb_kill_server(self):
+@@ -768,6 +845,7 @@
+         pass
+ 
+     def clear_devices(self):
++        self.release_input()
+         logger.info('clear_devices')
+         self.device_dict.clear()
+         self.config['preferred'] = ''
+@@ -867,6 +945,7 @@
+         logger.info(f'update_capture {config}')
+         if 'windows' in config:
+             win_config = config['windows']
++            normalize_pc_interaction(win_config.get('interaction', self.windows_capture_config.get('interaction')))
+             reset_selected_hwnd = any(
+                 key in win_config for key in ('title', 'exe', 'hwnd_class', 'top_hwnd_class', 'selected_hwnd')
+             )
+@@ -987,6 +1066,8 @@
+     def ensure_capture(self, config: dict):
+         import time
+         logger.info(f'ensure_capture {config}')
++        if 'windows' in config:
++            normalize_pc_interaction(config['windows'].get('interaction', self.windows_capture_config.get('interaction')))
+         self.clear_devices()
+         if 'windows' in config:
+             win_config = config['windows']

@@ -1255,6 +1255,14 @@
     <context>
         <name>app</name>
         <message>
+            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
+            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
             <source>Diagnosis</source>
             <translation>诊断</translation>
         </message>
@@ -1761,14 +1769,6 @@
         <message>
             <source>Requires the local QQ or WeChat client window to be open and running</source>
             <translation>需要本地 QQ 或微信客户端窗口保持打开并运行</translation>
-        </message>
-        <message>
-            <source>Requires the local QQ client window to be open and running</source>
-            <translation>需要本地 QQ 客户端窗口保持打开并运行</translation>
-        </message>
-        <message>
-            <source>Requires the local WeChat client window to be open and running</source>
-            <translation>需要本地微信客户端窗口保持打开并运行</translation>
         </message>
         <message>
             <source>SMTP Notification</source>
@@ -3339,20 +3339,12 @@
     <context>
         <name>SelectInteractionListView</name>
         <message>
-            <source>Pynput</source>
-            <translation>Pynput - 前台，兼容性最好</translation>
+            <source>前台系统键鼠</source>
+            <translation>前台系统键鼠</translation>
         </message>
         <message>
-            <source>PostMessage</source>
-            <translation>PostMessage - 后台，兼容大多数应用和少数游戏</translation>
-        </message>
-        <message>
-            <source>PyDirect</source>
-            <translation>PyDirect - 前台，Pynput 备用</translation>
-        </message>
-        <message>
-            <source>Genshin</source>
-            <translation>Genshin - 后台，支持部分 Unity 游戏</translation>
+            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
+            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
         </message>
         <message>
             <source>ADBInteraction</source>
@@ -3365,10 +3357,6 @@
         <message>
             <source>Default Interaction</source>
             <translation>默认交互</translation>
-        </message>
-        <message>
-            <source>WindowsInteraction</source>
-            <translation>Windows 交互</translation>
         </message>
     </context>
     <context>

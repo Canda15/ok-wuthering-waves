@@ -1,6 +1,5 @@
 # window.py
 import ctypes
-import os
 import platform
 import re
 import sys
@@ -30,7 +29,6 @@ def windows_graphics_available():
         f"check available WINDOWS_BUILD_NUMBER:{WINDOWS_BUILD_NUMBER} >= {WGC_NO_BORDER_MIN_BUILD} {WINDOWS_BUILD_NUMBER >= WGC_NO_BORDER_MIN_BUILD}")
     if WINDOWS_BUILD_NUMBER >= WGC_NO_BORDER_MIN_BUILD:
         try:
-            from ok.rotypes import idldsl
             from ok.rotypes.roapi import GetActivationFactory
             from ok.rotypes.Windows.Graphics.Capture import IGraphicsCaptureItemInterop
             GetActivationFactory('Windows.Graphics.Capture.GraphicsCaptureItem').astype(
@@ -114,7 +112,7 @@ def get_window_bounds(hwnd):
         ctypes.windll.shcore.GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, ctypes.byref(dpiX), ctypes.byref(dpiY))
         return client_x, client_y, window_width, window_height, client_width, client_height, dpiX.value / 96
     except Exception as e:
-        logger.error(f'get_window_bounds exception', e)
+        logger.error('读取窗口边界失败', e)
         return 0, 0, 0, 0, 0, 0, 1
 
 
@@ -301,12 +299,73 @@ def _match_class_name(hwnd_class, patterns):
     return -1
 
 
+def get_hwnd_identity(hwnd):
+    """句柄可被系统重用，绑定时记录进程和窗口类，读取时必须重新核对。"""
+    try:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return None
+        _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+        return (process_id, win32gui.GetClassName(hwnd)) if process_id > 0 else None
+    except Exception:
+        return None
+
+
+def _has_window_ancestor(hwnd, main_hwnd):
+    # 只接受向上能到达所选主窗的关系；共同启动器根不能证明属于同一游戏实例。
+    pending, seen = [hwnd], set()
+    try:
+        while pending:
+            current = pending.pop()
+            if current == main_hwnd:
+                return True
+            if not current or current in seen or not win32gui.IsWindow(current):
+                continue
+            seen.add(current)
+            pending.extend((win32gui.GetParent(current),
+                            win32gui.GetWindow(current, win32con.GW_OWNER)))
+    except Exception:
+        return False
+    return False
+
+
+def filter_hwnd_group(main_hwnd, hwnds, top_hwnd_class=None, identities=None):
+    """发现、捕获和置前共享许可；缓存身份变化时剔除，客户区几何始终即时读取。"""
+    main_identity = get_hwnd_identity(main_hwnd)
+    if main_identity is None or identities is not None and identities.get(main_hwnd) != main_identity:
+        return []
+    filtered, seen = [], set()
+    for info in hwnds:
+        if len(info) < 9 or info[0] in seen:
+            continue
+        hwnd = info[0]
+        identity = get_hwnd_identity(hwnd)
+        if identity is None or identity[1] != info[7]:
+            continue
+        if identities is not None and identities.get(hwnd) != identity:
+            continue
+        try:
+            if hwnd != main_hwnd:
+                if not win32gui.IsWindowVisible(hwnd) or not win32gui.IsWindowEnabled(hwnd):
+                    continue
+                same_instance_login = (identity[0] == main_identity[0]
+                                       and _match_class_name(identity[1], top_hwnd_class) >= 0)
+                if not same_instance_login and not _has_window_ancestor(hwnd, main_hwnd):
+                    continue
+            x, y, _, _, width, height, scaling = get_window_bounds(hwnd)
+            if width <= 0 or height <= 0:
+                continue
+            filtered.append((hwnd, info[1], width, height, x, y, info[6], identity[1], scaling))
+            seen.add(hwnd)
+        except Exception:
+            continue
+    return filtered if main_hwnd in seen else []
+
+
 def enum_child_windows(biggest, frame_aspect_ratio, frame_width, frame_height):
     ratio_match = []
 
     def child_callback(hwnd, _):
         visible = win32gui.IsWindowVisible(hwnd)
-        parent = win32gui.GetParent(hwnd)
         rect = win32gui.GetWindowRect(hwnd)
         real_width = rect[2] - rect[0]
         real_height = rect[3] - rect[1]
@@ -407,28 +466,14 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
     results = [biggest]
 
     if top_hwnd_class is not None:
-        bg_exe_path, bg_dir = biggest[1], None
-        if bg_exe_path:
-            bg_dir = os.path.dirname(os.path.normpath(bg_exe_path)).lower()
-
-        filtered_top = []
-        for result in top_results:
-            top_exe_path = result[1]
-            if top_exe_path and bg_exe_path:
-                top_exe_path_norm = os.path.normpath(top_exe_path).lower()
-                bg_exe_path_norm = os.path.normpath(bg_exe_path).lower()
-                if top_exe_path_norm == bg_exe_path_norm or (bg_dir and top_exe_path_norm.startswith(bg_dir + os.sep)):
-                    filtered_top.append(result)
-
-        if filtered_top:
-            for top_item in reversed(filtered_top):
-                if top_item[0] != biggest[0] and not any(r[0] == top_item[0] for r in results):
-                    results.insert(0, top_item[:9] if len(top_item) > 9 else top_item)
-            sorted_results = sort_hwnds_top_to_bottom(results)
-            if [r[0] for r in sorted_results] != [r[0] for r in results]:
-                logger.debug(f'find_hwnd sorted hwnds by z-order {[r[0] for r in sorted_results]}')
-            results = sorted_results
-            results = expand_clickable_hwnds(results, biggest[0], top_hwnd_class)
+        candidates = [item[:9] for item in top_results] + results
+        results = filter_hwnd_group(biggest[0], candidates, top_hwnd_class)
+        results = sort_hwnds_top_to_bottom(results)
+        results = expand_clickable_hwnds(results, biggest[0], top_hwnd_class)
+    results = filter_hwnd_group(biggest[0], results, top_hwnd_class)
+    if not results:
+        return None, 0, None, 0, 0, 0, 0, []
+    biggest = next(info for info in results if info[0] == biggest[0])
 
     x_offset, y_offset, real_width, real_height = 0, 0, biggest[2], biggest[3]
     if class_name is None and frame_aspect_ratio != 0:

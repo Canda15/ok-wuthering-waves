@@ -1,3 +1,6 @@
+from ok import TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+
 import time
 from src.char.BaseChar import BaseChar
 
@@ -66,6 +69,8 @@ class Rebecca(BaseChar):
             if hasattr(self.task, 'next_frame'):
                 try:
                     self.task.next_frame()
+                except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+                    raise
                 except Exception:
                     pass
         # 图标亮后蓄力重击（长按 1.5s）

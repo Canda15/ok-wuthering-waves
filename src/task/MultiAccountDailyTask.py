@@ -2,25 +2,24 @@ import ctypes
 import re
 from ctypes import wintypes
 
-import win32con
 import win32gui
 import win32process
 
 from ok import Box
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from ok.task.exceptions import WaitFailedException
 from src.task.DailyTask import DailyTask
 from src.task.WWOneTimeTask import WWOneTimeTask
 from src.task.BaseCombatTask import BaseCombatTask
 from src.task.BaseWWTask import LOGIN_TEXTS
-from src.task.MouseResetTask import MouseResetTask
 from src.task.task_icons import task_icon
 
 account_pattern = re.compile(r'\*\*\*\*')
 PER_ACCOUNT_CONFIGURATION = 'Per-account Configuration'
 ACCOUNT_CONFIGURATION = 'Account Configuration'
 
-CB_GETCOUNT, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL = 0x146, 0x147, 0x148, 0x149, 0x14E
-CBN_SELCHANGE = 1
+CB_GETCOUNT, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN = 0x146, 0x147, 0x148, 0x149
+CB_GETITEMHEIGHT, CB_GETEXTENDEDUI, CB_GETDROPPEDSTATE = 0x154, 0x156, 0x157
 _SendMessageW = ctypes.windll.user32.SendMessageW
 _SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 _SendMessageW.restype = ctypes.c_ssize_t
@@ -34,7 +33,8 @@ def normalize_account_name(account):
 
 def find_login_combo(game_hwnd):
     """国际服 KRSDK 登录框是原生 #32770 对话框，账号列表是标准 ComboBox。
-    后台模式下点击下拉列表项后选择会被撤销（#1316 #1678），所以能找到时直接读写 ComboBox。找不到返回 None。"""
+    只读查询用于识别和确认，选项变更必须由真实前台键鼠完成。找不到返回 None。
+    """
     if not game_hwnd or not win32gui.IsWindow(game_hwnd):
         return None
     _, game_pid = win32process.GetWindowThreadProcessId(game_hwnd)
@@ -56,9 +56,16 @@ def find_login_combo(game_hwnd):
 
 def combo_items(combo):
     items = []
-    for i in range(_SendMessageW(combo, CB_GETCOUNT, 0, 0)):
-        buf = ctypes.create_unicode_buffer(max(_SendMessageW(combo, CB_GETLBTEXTLEN, i, 0), 0) + 1)
-        _SendMessageW(combo, CB_GETLBTEXT, i, ctypes.addressof(buf))
+    count = _SendMessageW(combo, CB_GETCOUNT, 0, 0)
+    if count < 0:
+        raise WaitFailedException('无法读取登录账号列表')
+    for i in range(count):
+        length = _SendMessageW(combo, CB_GETLBTEXTLEN, i, 0)
+        if length < 0:
+            raise WaitFailedException('无法读取登录账号选项')
+        buf = ctypes.create_unicode_buffer(length + 1)
+        if _SendMessageW(combo, CB_GETLBTEXT, i, ctypes.addressof(buf)) < 0:
+            raise WaitFailedException('无法读取登录账号选项')
         items.append(buf.value)
     return items
 
@@ -69,12 +76,49 @@ def combo_selected_item(combo):
     return items[index] if 0 <= index < len(items) else None
 
 
-def select_combo_item(combo, index):
-    """选中后通知父窗口 CBN_SELCHANGE，和用户手动选择一样让登录框更新当前账号。"""
-    _SendMessageW(combo, CB_SETCURSEL, index, 0)
-    parent = win32gui.GetParent(combo)
-    _SendMessageW(parent, win32con.WM_COMMAND, (CBN_SELCHANGE << 16) | win32gui.GetDlgCtrlID(combo), combo)
-    return _SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
+def select_combo_item(task, combo, index, expected_item):
+    """通过任务公共输入真实选号，随后只读确认；不伪造控件或父窗口通知。"""
+    task.next_frame()
+    if combo != task._login_combo():
+        return False
+    items = combo_items(combo)
+    if not 0 <= index < len(items) or items[index] != expected_item:
+        return False
+    if (_SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
+            and not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0)):
+        return True
+
+    left, top, right, bottom = win32gui.GetClientRect(combo)
+    field_height = _SendMessageW(combo, CB_GETITEMHEIGHT, -1, 0)
+    if right <= left or bottom <= top or field_height <= 0:
+        return False
+    # 原生查询返回屏幕位置，公共输入接收捕获像素；两边使用同一裁剪原点，
+    # 不能把登录子窗口的客户坐标直接当作游戏坐标，也不能再次乘 DPI 比例。
+    screen_x, screen_y = win32gui.ClientToScreen(
+        combo, ((left + right) // 2, top + min(bottom - top, field_height) // 2))
+    origin_x, origin_y = task.executor.interaction.capture.get_abs_cords(0, 0)
+    x, y = round(screen_x - origin_x), round(screen_y - origin_y)
+    if not (0 <= x < task.width and 0 <= y < task.height):
+        return False
+    task.click(x, y, after_sleep=.2)
+    if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
+        # 普通下拉框用 F4 展开，扩展界面用向下键展开；展开后 Home 才选择列表首项。
+        key = 'down' if _SendMessageW(combo, CB_GETEXTENDEDUI, 0, 0) else 'f4'
+        task.send_key(key, after_sleep=.1)
+    if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
+        return False
+    task.send_key('home', after_sleep=.05)
+    for _ in range(index):
+        task.send_key('down', after_sleep=.05)
+    task.send_key('enter', after_sleep=.3)
+
+    def confirmed():
+        return (combo == task._login_combo()
+                and _SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
+                and not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0)
+                and combo_selected_item(combo) == expected_item)
+
+    return bool(task.wait_until(confirmed, time_out=2, raise_if_not_found=False))
 
 
 class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):
@@ -156,13 +200,24 @@ class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):
 
     def _switch_to_login(self):
         self.log_info(self.tr('Switching back to login screen'))
-        self.send_key('esc', after_sleep=1.5)
-        self.wait_feature('esc_setting')
-        self.click_relative(0.04, 0.96, after_sleep=1)
-        self.click_confirm(timeout=10)
-        # 登录框显示的账号没有 **** 时（非邮箱/手机号账号）OCR 等不到下拉框，原生 ComboBox 也算回到登录界面
-        self.wait_until(lambda: self._login_combo() or self.do_find_account_drop_down(),
-                        time_out=60, settle_time=2, raise_if_not_found=True)
+        while True:
+            try:
+                self.next_frame()
+                if self._login_combo() or self.do_find_account_drop_down():
+                    break
+                # 退出点击可能已被接受；恢复后先检查确认框和设置页，不能再次按 Esc 关掉它们。
+                if not self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
+                    if not self.find_one('esc_setting'):
+                        self.send_key('esc', after_sleep=1.5)
+                        self.wait_feature('esc_setting')
+                    self.click_relative(0.04, 0.96, after_sleep=1)
+                self.click_confirm(timeout=10)
+                # 非掩码账号可由原生 ComboBox 确认登录页，不依赖 OCR 的 **** 匹配。
+                self.wait_until(lambda: self._login_combo() or self.do_find_account_drop_down(),
+                                time_out=60, settle_time=2, raise_if_not_found=True)
+                break
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
         self.log_info(self.tr('Back at login screen'))
 
     def _login_combo(self):
@@ -176,8 +231,8 @@ class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):
         for index, name in enumerate(accounts):
             if self._is_done(name):
                 continue
-            if not select_combo_item(combo, index):
-                raise Exception(self.tr('Failed to switch account'))
+            if not select_combo_item(self, combo, index, name):
+                raise WaitFailedException(self.tr('Failed to switch account'))
             self.log_info(self.tr('Confirmed selected account: {account}').format(account=name))
             return name
         return None
@@ -206,29 +261,14 @@ class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):
         self.log_info(self.tr('Click next account: {account}').format(account=next_account))
         return next_account
 
-    def _select_and_login_account(self):
-        current_account = None
-        mouse_reset_task = self.executor.get_task_by_class(MouseResetTask)
-        mouse_reset_was_enabled = mouse_reset_task.enabled if mouse_reset_task else False
-        if mouse_reset_was_enabled:
-            mouse_reset_task.disable()
-        try:
-            combo = self._login_combo()
-            if combo:
-                current_account = self._select_account_by_combo(combo)
-                if not current_account:
-                    self.log_info(self.tr('No remaining account to run; finishing multi-account daily task'))
-                    return None
-            # 找不到原生 ComboBox 时（如其他登录界面）走原有的 OCR + 点击流程
-            max_retries = 0 if combo else 5
-            for attempt in range(1, max_retries + 1):
-                # self.ensure_in_front()
-                # self.update_capture({
-                #     'windows': {
-                #         'interaction': 'Pynput',
-                #         'capture_method': 'ForegroundBitBlt',
-                #     }
-                # })
+    def _select_next_login_account(self):
+        attempt = 0
+        while attempt < 5:
+            try:
+                self.next_frame()
+                if combo := self._login_combo():
+                    return self._select_account_by_combo(combo)
+                # 每次从新画面打开列表；失焦中断不会消耗正常识别失败预算。
                 self.sleep(1)
                 drop_down = self.find_account_drop_down()
                 if drop_down:
@@ -236,57 +276,76 @@ class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):
                 if self.do_find_account_drop_down():
                     self.log_error(self.tr('click drop down no effect'))
                     self.screenshot('multi')
-                    continue
-                account = self.wait_until(
-                    lambda: self._click_account_in_list(),
-                    time_out=10, raise_if_not_found=False
-                )
-                if not account:
-                    # _click_account_in_list() returns None once every account the login
-                    # screen offers is already in done_set.  That is the normal end of a
-                    # multi-account sweep, so let run()'s while loop stop instead of
-                    # raising and failing the whole run after the work is already done.
-                    if self.all_accounts and all(self._is_done(name) for name in self.all_accounts):
-                        self.log_info(self.tr('No remaining account to run; finishing multi-account daily task'))
-                        return None
-                    # Nothing readable in the account list: keep the original failure signal.
-                    raise WaitFailedException()
-                self.sleep(1)
-                current_account = self._detect_current_account_from_login()
-                self.log_info(self.tr('Selected account: {selected}, displayed account: {displayed}').format(
-                    selected=account, displayed=current_account))
-                if self._same_account(account, current_account):
-                    self.log_info(self.tr('Confirmed selected account: {account}').format(account=account))
-                    break
-                if attempt < max_retries:
-                    self.log_info(self.tr('Account display does not match, retrying ({attempt}/{max_retries})').format(
-                        attempt=attempt, max_retries=max_retries))
                 else:
-                    self.log_error(self.tr(
-                        'Account selection failed after {max_retries} retries; {account} is still not displayed. Continuing login attempt'
-                    ).format(max_retries=max_retries, account=account))
-                    raise Exception(self.tr('Failed to switch account'))
-            self.sleep(4)
-            texts = self.ocr()
-            login_btn = self.find_boxes(texts, boundary=self.box_of_screen(0.3, 0.3, 0.7, 0.8),
-                                        match=LOGIN_TEXTS)
-            if login_btn:
-                self.click(login_btn, after_sleep=3)
-            else:
-                self.click_relative(0.5, 0.568, hcenter=True, vcenter=True, after_sleep=3)
-            self.logged_in = False
-            # self.update_capture({
-            #     'windows': {
-            #         'interaction': 'PostMessage',
-            #         'capture_method': ['WGC', 'BitBlt_RenderFull'],
-            #     }
-            # })
-            self.ensure_main(time_out=180)
-            self.log_info(self.tr('Login successful'))
-            return current_account
+                    account = self.wait_until(self._click_account_in_list,
+                                              time_out=10, raise_if_not_found=False)
+                    if not account:
+                        if self.all_accounts and all(self._is_done(name) for name in self.all_accounts):
+                            return None
+                        raise WaitFailedException()
+                    self.sleep(1)
+                    displayed = self._detect_current_account_from_login()
+                    self.log_info(self.tr('Selected account: {selected}, displayed account: {displayed}').format(
+                        selected=account, displayed=displayed))
+                    if self._same_account(account, displayed):
+                        self.log_info(self.tr('Confirmed selected account: {account}').format(account=account))
+                        return account
+                attempt += 1
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+        raise WaitFailedException(self.tr('Failed to switch account'))
+
+    def _login_selected_account(self, account, account_matches):
+        submitted = False
+
+        def confirm_account(require_visible=True):
+            displayed = self._detect_current_account_from_login()
+            if (require_visible and not displayed) or (displayed and not account_matches(account, displayed)):
+                stage = '恢复后' if submitted else '登录前'
+                raise WaitFailedException(f'{stage}账号确认失败，已停止登录')
+
+        missing = object()
+        previous = getattr(self, '_login_account_guard', missing)
+        # 保护贯穿 ensure_main 的内层恢复，不能只在外层等待前确认一次。
+        self._login_account_guard = confirm_account
+        try:
+            while True:
+                try:
+                    if not submitted:
+                        self.sleep(4)
+                        self.next_frame()
+                        login = self.find_boxes(self.ocr(), boundary=self.box_of_screen(.3, .3, .7, .8),
+                                                match=LOGIN_TEXTS)
+                        confirm_account()
+                        # 鼠标按下后失焦时，登录可能已发生；先登记进入确认阶段，避免重放旧点击。
+                        submitted = True
+                        if login:
+                            self.click(login, after_sleep=3)
+                        else:
+                            self.click_relative(.5, .568, hcenter=True, vcenter=True, after_sleep=3)
+                    else:
+                        self.next_frame()
+                        confirm_account(require_visible=False)
+                    self.logged_in = False
+                    # 已提交或中断的点击只通过现有登录页／加载页／主界面识别继续，不重发旧坐标。
+                    self.ensure_main(time_out=180)
+                    return
+                except ForegroundInputInterrupted:
+                    self.wait_foreground_frame()
         finally:
-            if mouse_reset_was_enabled:
-                mouse_reset_task.enable()
+            if previous is missing:
+                self.__dict__.pop('_login_account_guard', None)
+            else:
+                self._login_account_guard = previous
+
+    def _select_and_login_account(self):
+        current_account = MultiAccountDailyTask._select_next_login_account(self)
+        if not current_account:
+            self.log_info(self.tr('No remaining account to run; finishing multi-account daily task'))
+            return None
+        MultiAccountDailyTask._login_selected_account(self, current_account, self._same_account)
+        self.log_info(self.tr('Login successful'))
+        return current_account
 
     def find_account_drop_down(self):
         return self.wait_until(self.do_find_account_drop_down, time_out=60, settle_time=2, raise_if_not_found=True)

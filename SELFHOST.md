@@ -15,15 +15,15 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | `ok-script` 3.0.1 |
-| 权威来源 | `selfhost/ok_pin.json`（版本、wheel SHA-256、整树 SHA-256，由 `scripts/sync_ok.py` 维护） |
-| 来源 | PyPI wheel `ok_script-3.0.1-py3-none-any.whl`（1081899 字节） |
-| SHA-256 | `b170babcc3cda3e0014ad02dbf890b29a32b4a52e39eddade0b03dda5c317531` |
-| 内联范围 | 仅 wheel 内的 `ok/` 包，共 278 个文件 |
-| 未内联 | wheel 另外三个顶层内容：`diagnostics/`、`examples/`、`ok_script-3.0.1.dist-info/`。前两个 `ok/` 内没有任何引用，dist-info 只用于包元数据，`ok/` 也没有 `importlib.metadata` 之类的读取 |
+| 版本 | `ok-script` 3.0.5b4 |
+| 权威来源 | `selfhost/ok_pin.json`（版本、原始 wheel、完整补丁后树与逻辑差异集合的 SHA-256，由 `scripts/sync_ok.py` 维护） |
+| 来源 | PyPI wheel `ok_script-3.0.5b4-py3-none-any.whl` |
+| 原始 wheel SHA-256 | `be5839467f3acedf997deb3a824c2de27d35cb4c2dbcd14f6eedd9e55c6cf3e8` |
+| 内联范围 | wheel 的 `ok/` 基线共 281 个有效文件；逻辑差异后的实际数量由 `--check` 给出 |
+| 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info。前两个 `ok/` 内没有任何引用，dist-info 只用于包元数据，`ok/` 也没有 `importlib.metadata` 之类的读取 |
 
-内联内容和上游打 3.0.1 wheel 时用的源码一致，但**没有 git 历史**（本机沙箱禁止 `sh.exe` 创建命名管道，
-`git subtree` 无法运行，所以采用"下载 wheel 解包后入库"的方式）。
+内联以固定 wheel 为基线，再施加品牌与已登记的逻辑差异，但**没有上游框架的 git 历史**。
+最初因本机沙箱禁止 `sh.exe` 创建命名管道、`git subtree` 无法运行，采用了“下载 wheel 解包后入库”的方式。
 
 ## 落地改动（相对上游 aa543c4）
 
@@ -53,13 +53,19 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
     一并删掉。
 11. `selfhost/framework_patches.py`：`ok/` 源码里有几处字符串改 config 根本来不及（通知的
     AppUserModelID 在构造时就被交给 Windows，窗口类名在 `RegisterClass` 时写进内核），
-    只能改源码。它们是"补丁清单"而不是手改：`sync_ok.py` 每次替换完 `ok/` 会自动重放，
+    只能改源码。它们是"补丁清单"而不是手改：`sync_ok.py` 每次在隔离解包树内自动重放，
     并在算 pin 哈希之前施加，所以补丁丢失会被 `--check` 与冒烟测试同时发现。
+12. `selfhost/logic_patches.py` 与 `logic_patches.json`：独立维护框架控制流差异。文本保存可审查的
+    统一 diff，编译资源使用明确标记的二进制载荷；两者都必须匹配路径、品牌后基线与修改后摘要。
+    全部预检和重放成功后才整体替换 `ok/`，不把完整 Python 后端复制进 `selfhost/`。
 
 ## 自有差异放在哪（重要）
 
 上游跟踪的路径（`config.py`、`src/`、`pyproject.toml`、`pyappify.yml` …）尽量保持与上游一致，
-**我们的改动一律放进 `selfhost/`**。理由：上游的 git 树里没有 `selfhost/`，所以
+**我们的配置覆盖和框架差异来源放进 `selfhost/`**；框架实现仍在 `ok/`，由差异清单持久保存其改动。
+前台输入默认值、游戏／登录任务的恢复与旧任务撤出同时需要维护应用源码；这些正常源码差异参与上游合并，
+发生冲突时按现有同步规则停止并人工审查。
+理由：上游的 git 树里没有 `selfhost/`，所以
 `git merge upstream/<tag>` 不会在这里产生任何冲突；反之，往 `config.py` 里插三行，
 上游每改一次该文件我们就要手工解一次冲突。
 
@@ -69,15 +75,18 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 | --- | --- | --- |
 | `overrides.py` | 运行时改 config dict：把上游取消注册的两个页面加回 `custom_tabs`，并改品牌项 | `main.py` 里 `OK(config)` 之前 |
 | `framework_patches.py` | vendored `ok/` 源码的文字补丁清单（品牌标识） | `scripts/sync_ok.py` 每次内联时 |
-| `ok_pin.json` | 框架版本与两个哈希的权威来源 | 同步 / 校验时 |
+| `logic_patches.py`、`logic_patches.json`、`patches/` | 严格逻辑重放器、支持版本及基线清单、文本差异和二进制载荷 | 品牌补丁之后、覆盖 `ok/` 之前 |
+| `framework_tree.py` | 框架源码、差异来源及部署校验共用的树摘要算法 | 同步 / 校验时 |
+| `ok_pin.json` | 框架版本、原始 wheel、补丁后树与差异集合摘要的权威来源 | 同步 / 校验时 |
 | `runtime/host.c`、`runtime/host.rc` | 原生业务宿主及图标、产品名等 EXE 资源 | `scripts/build_runtime.ps1` 编译时 |
 
 当前 `selfhost/overrides.py` 负责把上游取消注册的两个页面（角色代码、多账号配置）加回
 `config['custom_tabs']`。时序上必须在 `OK(config)` 之前——`OK.__init__` 按引用保存这个
 dict，`MainWindow` 读的是同一个对象。
 
-`tests/TestSelfhostSmoke.py` 是为这个补丁面准备的五条冒烟断言（框架 import 链、注册键仍被
-`MainWindow` 消费、两个页面能在 offscreen 下实例化、品牌 override 生效、源码补丁已施加）。
+`tests/TestSelfhostSmoke.py` 覆盖框架 import 链、页面注册和实例化、品牌覆盖、原生宿主及严格差异重放。
+逻辑差异用例只操作隔离树，覆盖文本与二进制、新增／修改／删除、重复施加、覆盖前漂移失败、
+原始 wheel 摘要和部署一致性；它们不操作真实游戏或联系人。
 上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
 
 ## 业务进程为什么显示 NoNo.exe
@@ -111,7 +120,7 @@ EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍�
 的启动器启动一次即可使用新入口并刷新快捷方式。已有计划任务的 XML 仍指向旧解释器，需在
 界面里重新创建。开发调试仍使用原来的 Python 入口。
 
-上游跟踪文件里目前只有一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-63` 的工坊数据源。
+除前台输入与任务恢复迁移外，工坊数据源也保留一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-63`。
 三个历史入口全断了——上游自建的 `cfokwwchar.ok-script.com`（DNS NXDOMAIN）、旧 Pages 的
 `okwwcharcode.ok-script.com`（证书失效）、原仓库 `ok-oldking/ok-ww-char-code`（已删除，API 404）。
 社区把工坊改成 raw.githubusercontent.com 托管（见该仓库 `scripts/generate.js` 的 `BASE_DOMAIN`），
@@ -135,13 +144,15 @@ EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍�
 
 ## 更新框架的流程
 
-版本 pin 记在 `selfhost/ok_pin.json`（版本、wheel SHA-256、整树 SHA-256）。日常只需要：
+版本 pin 记在 `selfhost/ok_pin.json`。`wheel_sha256` 始终描述原始下载内容，`tree_sha256` 描述
+品牌及逻辑差异全部重放后的有效 `ok/` 树，`logic_patches_sha256` 描述清单和全部载荷。日常只需要：
 
 ```powershell
-python scripts/sync_ok.py            # 版本取"上游 pyproject 的声明"，没有声明才用 pin；重下 wheel → 校哈希 → 整体替换 ok/ → 重写依赖块
-python scripts/sync_ok.py --version 3.0.2   # 明确指定版本（覆盖上面的推断）
-python scripts/sync_ok.py --dry-run  # 只看差异
-python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py'            # 优先取上游 pyproject 版本，没有声明才用 pin
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b4   # 明确固定已经审查的版本
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --dry-run  # 下载并验证重放，只报告差异
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check    # 离线校验框架、基线及差异来源
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check --root 'E:\deploy\NoNo'  # 示例：校验另一棵部署树
 ```
 
 **版本以对方声明为准，不是以 pin 为准。** 上游每次发版都会在 `pyproject.toml` 里写
@@ -150,10 +161,12 @@ python scripts/sync_ok.py --check    # 离线校验 ok/ 未被手改
 某个功能被调用时炸。所以 `sync_ok.py` 先读出那一行再动手删它（顺序很重要：`--reapply` 一执行，
 版本依据就没了），`--version` 只在需要固定到某个版本时用。
 
-`sync_ok.py` 做六件事，替代了原先的手工步骤：按 pin 从 PyPI 取 wheel、核对 SHA-256 与 pin 一致
-（不一致直接中止，这是供应链断点）、把 wheel 内的 `ok/` **整树替换**（不是逐文件覆盖，否则上游删掉的
-模块会以旧文件形式残留）、按 `selfhost/framework_patches.py` 重新施加品牌补丁、按 wheel METADATA
-重写 `pyproject.toml` 的依赖生成块、更新 pin。
+新版本还必须匹配逻辑清单的支持版本与精确基线；不匹配时在覆盖源码或执行 `--reapply` 前中止，
+等待人工审查和重新收集，不能只改清单里的版本号。即使当前清单为空，也保留完整基线约束。
+
+`sync_ok.py` 先从 PyPI 取 wheel，核对原始 SHA-256，隔离解包 `ok/`，依次施加品牌补丁和逻辑差异，
+验证最终树后才**整树替换**，随后按 wheel METADATA 重写依赖块并更新 pin。逐文件覆盖会让上游删除的
+模块残留，因此不采用。`--dry-run` 包括真实重放验证，但不修改源码、依赖、差异清单或 pin。
 
 改 `pyproject.toml` 时有两处坑是踩过的，脚本里已经处理，改动那段逻辑时别丢：上游的 `dependencies`
 数组最后一项**不带尾逗号**，生成块插在它后面会让整个文件变成非法 TOML（`Unclosed array`），而
@@ -164,8 +177,34 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 补丁清单里的原文在新版本里找不到（或出现多次）时，同步会直接失败并要求人工核对：
 宁可停下来，也不要静默地少打一个补丁——那种情况没有任何报错，只是名字又回来了。
 
-手改了 `ok/` 里别的文件时，`--check` 会红。这不等于是错误，但要求把新哈希登记回 pin，
-免得下次同步把改动悄悄覆盖掉。
+### 维护框架逻辑差异
+
+修改 `ok/` 后必须收集可重放来源，不能只更新 pin。完成同一轮源码及资源编辑后串行执行：
+
+```powershell
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --record-patches --dry-run
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --record-patches
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check
+```
+
+收集命令重新校验原始 wheel，在隔离树施加品牌补丁，再比较当前完整 `ok/`。只有生成差异能够精确
+重放为当前树时，才更新清单、载荷与 pin；它不覆盖当前 `ok/`，也不改写依赖文件。审查时同时检查
+`ok/` 的源码 diff 与 `selfhost/patches/`，确认没有把意外改动登记成自有行为。
+
+清单使用 `schema_version: 1`，顶层记录 `framework_version`、`baseline_tree_sha256` 和 `entries`。
+每条记录含相对 `ok/` 的 `path`、`operation`（`add`／`modify`／`delete`）、`format`（`unified_diff`／`binary`）、
+`payload` 及 `before_sha256`／`after_sha256`；缺失文件的摘要为 `null`。文本使用三行上下文且保留原换行，
+二进制资源保存结果载荷，Python 源码禁止借二进制格式保存完整副本。删除也须有明确记录，目录里
+未登记、缺失或路径不规范的载荷均使同步失败。重复重放可识别已经满足后摘要的文件。
+
+离线检查逆向还原各条差异的基线文件摘要，并核对清单里的完整品牌后基线树，因此漏登记的文件
+变化即使重新填写 `tree_sha256` 也不能通过。部署检查从指定根目录读取同一套 `ok/`、清单、载荷与 pin，
+复用相同算法，仅延续既有 `__pycache__`、`.pyc`、`.pyo` 缓存例外，不排除源码或编译资源。
+
+升级框架时先人工合并并审查新版 `ok/` 与自有逻辑，再用 `--record-patches --version <已审查版本>`
+重建支持版本和基线；直接拿旧框架工作树与新版 wheel 比较可能把上游新增能力误登记为删除，不能
+用收集命令替代这一步审查。清单、载荷与 pin 的写入不是磁盘事务；若因 IO 中断，校验会保持失败，
+应修复来源文件并重新完整收集。
 
 ## 上游发版后由 CI 接手
 
@@ -177,8 +216,9 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 3. 冲突只允许出现在 `pyproject.toml` / `requirements.txt`——我们删过那里的 ok-script pin，上游每次
    bump 版本都会改那两行，属于必然冲突且完全可脚本复现：取上游版本后由 `sync_ok.py --reapply` 重新删掉。
    其他文件冲突一律失败退出，交给人；
-4. `python scripts/sync_ok.py --reapply`：重建 `ok/`、重写依赖块；
-5. `python -u run_test.py tests/TestSelfhostSmoke.py`（`QT_QPA_PLATFORM=offscreen`）；
+4. `python scripts/sync_ok.py --reapply`：在隔离树重放品牌与逻辑差异，成功后重建 `ok/`、重写依赖块；
+5. 复用 `.github/scripts/install_dependencies.py` 安装依赖，再运行 `scripts/check_foreground.ps1`：
+   同时核对完整框架来源和前台输入、通知、多账号、无音消除、公共恢复及自维护冒烟；
 6. 全绿才 `git push origin HEAD:master`，再把上游 tag 改指到本次合并提交并强推，然后
    `gh workflow run build.yml --ref <tag> --repo <本仓库>` 显式派发打包。
 
@@ -207,20 +247,22 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | --- | --- | --- |
 | 现在就要跟上上游最新 release | **Sync upstream release** | 自己取上游 `releases/latest`，合并、重建 `ok/`、跑冒烟、推 master、改 tag、派发打包，一条龙。该 tag 已合并时直接退出，勾 `force` 才会重来一遍 |
 | 只是重新打一次已有的版本 | **Windows Release** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
+| 检查普通源码提交能否编译 | **Windows 编译检查** | master 推送自动运行，也可手动派发；只验证和生成原生业务 EXE，不要求发布 tag |
 | 重新编启动器 | **Build launcher** | 约 12 分钟，全在 Tauri 冷编译；只有改名字/图标/UAC 才需要 |
 
 `Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
 源码打包，用的是 `pyappify.yml` 里 `git_url` 指向的镜像仓库里已有的那份部署树。
 
-### 只留三个工作流
+### 自维护工作流
 
-上游仓库面向社区，带了一堆对我们无意义的自动化。仓库的 Actions 侧状态刻意只留 `active` 三个：
+上游仓库面向社区，带了一堆对我们无意义的自动化。自维护源码保留以下工作流：
 
 | 保留 | 作用 |
 | --- | --- |
 | `Windows Release` | tag 一推就打包（由 `Sync upstream release` 派发） |
 | `Sync upstream release` | 12 小时轮询上游 release |
 | `Build launcher` | 手动重编启动器 |
+| `Windows 编译检查` | master 推送验证完整框架及前台核心，编译原生业务 EXE 并上传对应 SHA 的产物 |
 
 其余全部在 GitHub 侧 `disabled_manually`：`Documentation`、`close_stale_issues`、
 `issue-triage.lock`、`pull-request-review.lock`、`sync_issue_labels`、`sign_exe`、
@@ -231,6 +273,29 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 只改 GitHub 侧状态、不删文件：删掉上游跟踪的文件，等于在每次上游改动它时制造一次
 "deleted by us" 冲突。万一上游合并把这些工作流改回 `active`（比如改了 YAML 里的触发条件），
 重停一次即可：Actions 页面左侧选中该工作流 → 右上角 `...` → `Disable workflow`。
+
+### master 编译与前台核心门禁
+
+`.github/workflows/windows-compile.yml` 对每次 master 推送运行，不使用分支名生成发布版本，也不写入
+更新镜像。顺序为安装现有依赖 → `scripts/check_foreground.ps1` → `scripts/build_runtime.ps1` → 上传产物。
+仓库权限仅为 `contents: read`，检出固定到本次 SHA，测试进程不继承 CI 凭据。
+
+`check_foreground.ps1` 默认先运行 `sync_ok.py --check`，再通过既有 `run_test.py` 执行集中输入、桌面通知、
+多账号、无音消除、一次性战斗、公共资源恢复和自维护测试。每个文件使用独立进程及临时配置目录，
+避免加载开发机账号和通知设置。开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 调用默认完整门禁，
+只有最终差异收集后框架检查通过才能继续编译。
+
+`build_runtime.ps1` 继续负责唯一宿主编译入口和六项原生进程验证。编译成功后 Actions 保留
+`NoNo-native-windows-<本次完整 SHA>`，内含 `NoNo.exe`、EXE 校验文件及框架 pin，保留 14 天；运行摘要提供
+下载链接。业务宿主仍使用同一 `main.py`、`config` 和 `ok/`，完整便携目录继续由版本标签发布流程提供。
+
+提交后的验收按本次推送 SHA 查找这个工作流，确认核心检查、编译和上传均成功，不能用旧 SHA 的成功
+代替本次结果。`GITHUB_TOKEN` 产生的推送不会递归触发 push 工作流，既有上游同步仍通过显式派发标签
+发布完成编译交付。[GitHub 的触发规则](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow)
+
+Windows Release 保留全仓库测试与镜像发布链路，增加源码框架检查；便携包 setup 实际克隆部署树后，
+使用 `sync_ok.py --check --root` 再核对 pin、逻辑载荷、完整框架及生成资源，然后验证真实运行时中的原生进程。
+镜像遗漏或字节漂移会在发布前失败。
 
 ### 更新仓库：部署树镜像 `Canda15/nono-update`
 

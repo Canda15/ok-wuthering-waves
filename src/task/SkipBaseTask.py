@@ -1,9 +1,7 @@
-import re
-import time
 
 from ok import Logger
 
-from src.task.BaseWWTask import BaseWWTask, convert_bw, convert_dialog_icon
+from src.task.BaseWWTask import BaseWWTask, convert_dialog_icon
 
 logger = Logger.get_logger(__name__)
 
@@ -17,6 +15,12 @@ class SkipBaseTask(BaseWWTask):
 
     def run(self):
         pass
+
+    def on_foreground_resume(self):
+        super().on_foreground_resume()
+        self.confirm_dialog_checked = False
+        self.has_eye_time = 0
+        self.skip = None
 
     def skip_confirm(self):
         if self.click_skip_dialog_confirm():

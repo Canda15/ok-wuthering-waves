@@ -1,6 +1,8 @@
 import cv2
 
 from ok import Logger, find_color_rectangles
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+from src.task.BaseWWTask import TEAM_SCREEN_FEATURES
 from src.task.DomainTask import DomainTask
 from src.task.task_icons import task_icon
 
@@ -62,14 +64,43 @@ class ForgeryTask(DomainTask):
         self.ensure_main()
 
     def teleport_into_domain(self, serial_number, daily=False):
-        self.open_boss_book('ningsu')
         self.info_set('Teleport to Forgery Challenge', serial_number - 1)
         if serial_number > self.total_number:
             raise IndexError(self.tr('Index out of range, max is {total_number}').format(total_number=self.total_number))
-        self.click_on_book_target(serial_number, self.total_number, self.structure)
-        self.click(0.891, 0.910, after_sleep=1)
-        self.click_team_challenge()
-        self.wait_in_team_and_world(time_out=self.teleport_timeout)
+        phase = 'select'
+        recovering = False
+        while True:
+            try:
+                if recovering and phase != 'select' and self.in_team_and_world():
+                    return
+                if phase == 'select':
+                    self.openF2Book('gray_book_boss')
+                    self.open_boss_book('ningsu')
+                    self.click_on_book_target(serial_number, self.total_number, self.structure)
+                    phase = 'proceed'
+                if phase == 'proceed':
+                    if not recovering:
+                        self.click(.891, .910, after_sleep=1)
+                    elif self.find_one(TEAM_SCREEN_FEATURES):
+                        pass
+                    elif self._confirm_resumed_skip_dialog():
+                        pass
+                    elif proceed := self.find_one('boss_proceed', box=self.box_of_screen(.7, .75, 1, 1)):
+                        self.click(proceed, after_sleep=1)
+                    elif self.wait_in_team_and_world(time_out=self.teleport_timeout, raise_if_not_found=False):
+                        return
+                    else:
+                        self.screenshot('domain_entry_unknown')
+                        raise ForegroundInputError('无法确认锻造挑战入口的新画面，已停止操作')
+                    phase = 'team'
+                if phase == 'team':
+                    self.click_team_challenge()
+                    phase = 'wait'
+                self.wait_in_team_and_world(time_out=self.teleport_timeout)
+                return
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                recovering = True
 
     def get_material_mat(self):
         min_width = self.width_of_screen(80 / 2560)

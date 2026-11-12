@@ -1,0 +1,88 @@
+name: Windows 编译检查
+run-name: Windows 编译 · ${{ github.sha }}
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-compile-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
+  PYTHONIOENCODING: 'UTF-8'
+  PYTHONUTF8: '1'
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  compile:
+    name: 前台核心与原生 EXE
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 配置源码换行
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: 检出本次推送源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          lfs: true
+          persist-credentials: false
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
+      - name: 安装现有依赖
+        shell: pwsh
+        run: python .github/scripts/install_dependencies.py
+
+      - name: 校验框架来源与前台核心
+        timeout-minutes: 20
+        shell: pwsh
+        run: .\scripts\check_foreground.ps1
+
+      # 普通分支编译直接复用宿主脚本；该脚本包含六项原生进程验证，不创建发布版本。
+      - name: 编译并验证原生业务 EXE
+        shell: pwsh
+        run: |
+          .\scripts\build_runtime.ps1
+          $hash = (Get-FileHash -LiteralPath 'selfhost/NoNo.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  NoNo.exe" | Set-Content -LiteralPath 'selfhost/NoNo.exe.sha256' -Encoding ascii
+
+      - name: 上传本次 SHA 的业务 EXE
+        id: native_artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoNo-native-windows-${{ github.sha }}
+          path: |
+            selfhost/NoNo.exe
+            selfhost/NoNo.exe.sha256
+            selfhost/ok_pin.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 记录源码与产物
+        shell: pwsh
+        env:
+          BUILD_SHA: ${{ github.sha }}
+          NATIVE_ARTIFACT_URL: ${{ steps.native_artifact.outputs.artifact-url }}
+        run: |
+          "源码 SHA：$env:BUILD_SHA" >> $env:GITHUB_STEP_SUMMARY
+          "业务 EXE：[下载构建产物]($env:NATIVE_ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY

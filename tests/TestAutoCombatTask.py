@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ok import TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src.char.BaseChar import BaseChar
 from src.char.CharFactory import get_char_by_pos
 from src.scene.WWScene import WWScene
@@ -56,6 +57,29 @@ class TestAutoCombatTask(unittest.TestCase):
         self.assert_combat_cleared()
         self.task.combat_end.assert_not_called()
         self.task.switch_healer.assert_called_once()
+
+    def test_foreground_resume_drops_old_rotation_and_recognizes_current_team(self):
+        old_char = self.seed_combat()
+        old_char.perform.side_effect = ForegroundInputInterrupted()
+        fresh_char = BaseChar(self.task, 0, char_name='fresh_team')
+        fresh_char.is_current_char = True
+        fresh_char.perform = Mock()
+        self.task.in_combat = Mock(side_effect=[True, True, False])
+        self.task.load_chars = Mock(side_effect=lambda: setattr(self.task, 'chars', [fresh_char, None, None]))
+        self.task.wait_foreground_frame = Mock()
+        self.assertTrue(self.task.run())
+        old_char.perform.assert_called_once()
+        fresh_char.perform.assert_called_once()
+        self.task.load_chars.assert_called_once()
+        self.task.wait_foreground_frame.assert_called_once()
+
+    def test_system_input_failure_during_rotation_propagates_without_focus_retry(self):
+        old_char = self.seed_combat()
+        old_char.perform.side_effect = ForegroundInputError()
+        self.task.wait_foreground_frame = Mock()
+        with self.assertRaises(ForegroundInputError):
+            self.task.run()
+        self.task.wait_foreground_frame.assert_not_called()
 
     def test_disable_inside_combat_check_cleans_up_and_propagates(self):
         old_char = self.seed_combat()

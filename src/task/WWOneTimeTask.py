@@ -1,15 +1,16 @@
-from ok import BrowserInteraction, PostMessageInteraction
-from src.task.MouseResetTask import MouseResetTask
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 
 
 class WWOneTimeTask:
 
     def run(self):
-        # Reset interrupted rotations on the executor before startup can sleep.
+        # 启动等待前先清除上次中断的战斗状态；前台准备由执行器统一完成。
         if hasattr(self, 'reset_combat_state'):
             self.reset_combat_state('onetime task start')
-        mouse_reset_task = self.executor.get_task_by_class(MouseResetTask)
-        mouse_reset_task.run()
-        if isinstance(self.executor.interaction, PostMessageInteraction):
-            self.executor.interaction.activate()
-        self.sleep(0.5)
+        while True:
+            try:
+                self.sleep(.5)
+                return
+            except ForegroundInputInterrupted:
+                # 只恢复启动等待，不重新调用具体任务 run 或执行激活补救。
+                self.wait_foreground_frame()

@@ -1,0 +1,677 @@
+--- a/task/TaskExecutor.py
++++ b/task/TaskExecutor.py
+@@ -1,8 +1,13 @@
+ import itertools
+-import sys
+ import threading
+ import time
+ from concurrent.futures import Future
++from contextlib import contextmanager
++
++from ok.device.interaction_methods.foreground_input import (
++    ForegroundInputError, ForegroundInputInterrupted, release_shared_foreground_input,
++)
++from ok.device.interaction_methods.pynput import PynputInteraction
+ 
+ from ok.core.events import communicate
+ from ok.core.notifications import alert_info
+@@ -28,7 +33,8 @@
+     """
+     _ids = itertools.count(1)
+ 
+-    def __init__(self, executor, fn, name=None, owner=None, capture=None, interaction=None, ignore_pause=True):
++    def __init__(self, executor, fn, name=None, owner=None, capture=None, interaction=None, ignore_pause=True,
++                 defer_while_unfocused=False):
+         self.id = next(self._ids)
+         self.executor = executor
+         self.fn = fn
+@@ -37,6 +43,7 @@
+         self.capture = capture
+         self.interaction = interaction
+         self.ignore_pause = ignore_pause
++        self.defer_while_unfocused = defer_while_unfocused
+         self.future = Future()
+         self._cancel_requested = threading.Event()
+ 
+@@ -95,6 +102,12 @@
+         self.pause_start = time.time()
+         self.pause_end_time = time.time()
+         self._last_frame_time = 0
++        self._frame_target_generation = None
++        self._foreground_waiting = False
++        self._focus_wait_started = None
++        self._focus_wait_total = 0.0
++        self._needs_foreground_frame = False
++        self._notify_foreground_resume = False
+         self._snapshot_enabled = False
+         self._frame_snapshot = None
+         self.paused = True
+@@ -117,6 +130,7 @@
+         if self.config.get('ocr') and not self.config.get('ocr').get('default', False):
+             self.config['ocr']['default'] = self.config.get('ocr')
+         self.current_task = None
++        self._task_context_stack = []
+         self.config_folder = config_folder or "config"
+         self.trigger_task_index = -1
+         self.basic_options = global_config.get_config(basic_options)
+@@ -279,7 +293,7 @@
+     def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0):
+         if supported_ratio is None or min_size is None:
+             return True, '0x0'
+-        logger.info(f'start check_frame_and_resolution')
++        logger.info('start check_frame_and_resolution')
+         self.device_manager.update_resolution_for_hwnd()
+         start = time.time()
+         frame = None
+@@ -316,40 +330,199 @@
+         return (self.method is not None and self.method.connected()
+                 and self.interaction is not None and self.interaction.should_capture())
+ 
+-    def next_frame(self, time_out=6):
+-        self.reset_scene()
+-        start = time.time()
++    def release_inputs(self, raise_on_error=False):
++        """生命周期清理先释放真实持有状态，不经过任务检查或截图。"""
++        errors = []
++        interactions = (self.interaction, self.device_manager.interaction)
++        for interaction in dict.fromkeys(item for item in interactions if item is not None):
++            try:
++                interaction.release_all()
++            except Exception as error:
++                logger.error(f'输入清理失败：{error}')
++                errors.append(error)
++        try:
++            release_shared_foreground_input()
++        except ForegroundInputError as error:
++            logger.error(f'共享输入仍有待释放状态：{error}')
++            errors.append(error)
++        if raise_on_error and errors:
++            raise ForegroundInputError('本程序持有输入未全部清理，禁止开始下一步操作') from errors[0]
++        return not errors
++
++    def check_input_cancelled(self, allow_pause=False):
++        """输入监测线程也可调用；只读取取消状态，不等待、不抓帧。"""
++        if self.exit_event.is_set():
++            raise TaskDisabledException()
++        job = self.current_job
++        if job is not None and job.cancel_requested:
++            raise TaskDisabledException()
++        task = self.current_task
++        if task is not None and not task._enabled:
++            raise TaskDisabledException()
++        if (task is not None and self._exclusive_owner is not None
++                and (job is None or job.owner != self._exclusive_owner)):
++            raise TaskDisabledException()
++        # 观察器不在执行器线程；MCP/通知作业的 ignore_pause 仍适用于它持有的输入。
++        paused = self.paused and not self.debug_mode and not (job is not None and job.ignore_pause)
++        if not allow_pause and (paused or task is not None and task.paused):
++            raise ForegroundInputInterrupted('任务已暂停，持有输入已清理')
++
++    @property
++    def foreground_waiting(self):
++        interaction = self.interaction
++        scheduled = self.current_task is not None or any(task.enabled for task in self.get_all_tasks())
++        return (isinstance(interaction, PynputInteraction) and not interaction.should_capture()
++                and (getattr(self, '_foreground_waiting', False) or not self.paused and scheduled))
++
++    @property
++    def focus_wait_seconds(self):
++        elapsed = getattr(self, '_focus_wait_total', 0.0)
++        started = getattr(self, '_focus_wait_started', None)
++        return elapsed + (time.monotonic() - started if started is not None else 0)
++
++    def business_time(self):
++        """识别与重试的单调时钟；普通失焦等待不消耗业务预算。"""
++        return time.monotonic() - self.focus_wait_seconds
++
++    def _foreground_ready(self):
++        interaction = self.interaction
++        needs_foreground = isinstance(interaction, PynputInteraction)
++        ready = not needs_foreground or interaction.should_capture()
++        if not ready:
++            if not getattr(self, '_foreground_waiting', False):
++                self._foreground_waiting = True
++                self._focus_wait_started = time.monotonic()
++                self.release_inputs(raise_on_error=True)
++                self.reset_scene(check_enabled=False)
++                logger.info('目标失焦，已释放输入并等待真实前台')
++            return False
++        resumed = getattr(self, '_foreground_waiting', False)
++        if resumed:
++            self._focus_wait_total = getattr(self, '_focus_wait_total', 0.0) + time.monotonic() - self._focus_wait_started
++            self._focus_wait_started = None
++            self._foreground_waiting = False
++        if needs_foreground and (resumed or interaction.needs_refresh):
++            if not interaction.refresh_target(force=True):
++                return False
++            self.reset_scene(check_enabled=False)
++            self._needs_foreground_frame = True
++            self._notify_foreground_resume = resumed or self.current_task is not None
++        return True
++
++    def _capture_generation(self):
++        interaction = self.interaction
++        generation = interaction.target_generation if isinstance(interaction, PynputInteraction) else None
++        return id(self.method), generation
++
++    @contextmanager
++    def task_context(self, task):
++        """嵌套执行保持调度所有权，但恢复必须通知真实运行的内层任务。"""
++        stack = getattr(self, '_task_context_stack', None)
++        if stack is None:
++            stack = self._task_context_stack = []
++        stack.append(task)
++        try:
++            yield
++        finally:
++            stack.pop()
++
++    def _notify_tasks_resumed(self):
++        tasks = [self.current_task, *getattr(self, '_task_context_stack', [])]
++        interrupted = None
++        for task in dict.fromkeys(task for task in tasks if task is not None):
++            try:
++                task.on_foreground_resume()
++            except ForegroundInputInterrupted as error:
++                # 一个轮转要求退出时仍先清其它活跃实例，避免留下旧角色引用。
++                interrupted = error
++        if interrupted is not None:
++            raise interrupted
++
++    def prepare_foreground(self, request_focus=False, time_out=5, cancel_check=None):
++        """高层显式准备：绑定完成、真实前台、更新目标并清除旧帧。"""
++        deadline = time.monotonic() + max(0, time_out)
++        check = cancel_check or (lambda: self.check_input_cancelled(allow_pause=True))
++        wait = getattr(self.device_manager, 'wait_for_binding', None)
++        if callable(wait):
++            wait(time_out=time_out, cancel_check=check)
++        if check():
++            raise TaskDisabledException()
++        interaction = self.interaction
++        if isinstance(interaction, PynputInteraction):
++            remaining = max(0, deadline - time.monotonic())
++            if not interaction.prepare_foreground(request_focus=request_focus, time_out=remaining, cancel_check=check):
++                return False
++        elif interaction is None:
++            return False
++        elif request_focus:
++            interaction.on_run()
++        self.reset_scene(check_enabled=False)
++        self._frame_target_generation = None
++        self._needs_foreground_frame = True
++        return True
++
++    def wait_foreground_frame(self, time_out=None, deadline=None):
++        """安全检查点等待新帧；外部期限与取消有效，运行中绝不置前。"""
++        self.release_inputs(raise_on_error=True)
++        self.reset_scene(check_enabled=False)
++        if time_out is not None:
++            own_deadline = time.monotonic() + max(0, time_out)
++            deadline = min(deadline, own_deadline) if deadline is not None else own_deadline
+         while not self.exit_event.is_set():
+-            self.check_enabled()
+-            if time_out is not None and time.time() - start >= time_out:
++            frame = self.next_frame(time_out=0.25, deadline=deadline)
++            if frame is not None:
++                return frame
++            if deadline is not None and time.monotonic() >= deadline:
++                raise TimeoutError('等待目标前台新帧超时')
++        raise TaskDisabledException()
++
++    def next_frame(self, time_out=6, *, deadline=None):
++        self.reset_scene(check_enabled=False)
++        if time_out is not None:
++            own_deadline = time.monotonic() + max(0, time_out)
++            deadline = min(deadline, own_deadline) if deadline is not None else own_deadline
++        while not self.exit_event.is_set():
++            self.check_enabled(check_pause=False)
++            remaining = deadline - time.monotonic() if deadline is not None else None
++            if remaining is not None and remaining <= 0:
+                 return None
+-            if self.can_capture():
+-                # A one-off capture on another thread (debug screenshot,
+-                # template capture) owns the request for about one frame.
+-                # Waiting for it is far cheaper than the retry sleep below.
+-                busy_wait = NEXT_FRAME_BUSY_WAIT
+-                if time_out is not None:
+-                    busy_wait = min(busy_wait, max(0, time_out - (time.time() - start)))
+-                frame = self.method.get_frame(busy_wait=busy_wait)
+-                if frame is not None:
++            paused = self.blocked_by_pause() or self.current_task is not None and self.current_task.paused
++            ready = self._foreground_ready()
++            if not paused and ready and self.can_capture():
++                generation = self._capture_generation()
++                busy_wait = min(NEXT_FRAME_BUSY_WAIT, remaining) if remaining is not None else NEXT_FRAME_BUSY_WAIT
++                frame = self.method.get_frame(busy_wait=max(0, busy_wait))
++                self.check_enabled(check_pause=False)
++                if (frame is not None and generation == self._capture_generation()
++                        and self.interaction.should_capture()):
+                     height, width = frame.shape[:2]
+                     if height <= 0 or width <= 0:
+-                        logger.warning(f"captured wrong size frame: {width}x{height}")
++                        raise CaptureException('截图尺寸无效')
+                     self._frame = frame
++                    self._frame_target_generation = generation
+                     self._last_frame_time = time.time()
++                    self._needs_foreground_frame = False
+                     if getattr(self, '_snapshot_enabled', False):
+                         snapshot = (frame.copy(), self._last_frame_time)
+                         with self.lock:
+                             self._frame_snapshot = snapshot
+                     if self.blur_overlay_processor:
+                         self.blur_overlay_processor.next_frame(frame)
++                    if getattr(self, '_notify_foreground_resume', False):
++                        task = self.current_task
++                        if task is not None:
++                            self._notify_foreground_resume = False
++                            self._notify_tasks_resumed()
+                     return self._frame
+-            if time_out is not None and time.time() - start >= time_out:
++                if frame is not None:
++                    # 抓帧期间目标变化，丢弃旧代次，下一轮刷新后再取帧。
++                    self.release_inputs()
++                    self.reset_scene(check_enabled=False)
++            remaining = deadline - time.monotonic() if deadline is not None else 0.05
++            if remaining <= 0:
+                 return None
+-            sleep_time = 1
+-            if time_out is not None:
+-                sleep_time = min(sleep_time, max(0, time_out - (time.time() - start)))
+-            self.sleep(sleep_time)
++            # 不经过可能无限等待前台的 sleep，外部期限始终在本循环检查。
++            self._wait_for_activity(min(0.05, remaining))
+         raise FinishedException()
+ 
+     def is_executor_thread(self):
+@@ -360,14 +533,12 @@
+ 
+     @property
+     def frame(self):
+-        while self.blocked_by_pause():
+-            self.sleep(1)
+-        if self.exit_event.is_set():
+-            logger.info("frame Exit event set. Exiting early.")
+-            sys.exit(0)
+-        if self._frame is None:
++        while not self.exit_event.is_set():
++            if (not self.blocked_by_pause() and self._foreground_ready() and self._frame is not None
++                    and self._frame_target_generation == self._capture_generation()):
++                return self._frame
+             self.next_frame()
+-        return self._frame
++        raise FinishedException()
+ 
+     def blocked_by_pause(self):
+         """Whether the calling code should wait because the executor is paused.
+@@ -405,54 +576,44 @@
+             raise TaskDisabledException()
+ 
+     def sleep(self, timeout: float):
+-        """
+-        Sleeps for the specified timeout, checking for an exit event every 100ms, with adjustments to prevent oversleeping.
+-
+-        :param timeout: The total time to sleep in seconds.
+-        """
++        """业务等待排除失焦时间，恢复后取得新帧；取消检查不依赖输入守卫。"""
+         self.reset_scene(check_enabled=False)
+         if timeout <= 0:
+             return
+-        if self.debug_mode:
+-            time.sleep(timeout)
+-            return
++        deadline = self.business_time() + timeout
+         self.pause_end_time = time.time() + timeout
+-        task = None
+-        while True:
++        while not self.exit_event.is_set():
+             self.check_enabled(check_pause=False)
++            ready = self._foreground_ready()
++            if (self.blocked_by_pause() or self.current_task is not None and self.current_task.paused
++                    or self.interaction is None or not ready):
++                self._wait_for_activity(0.05)
++                continue
++            if getattr(self, '_needs_foreground_frame', False):
++                if self.next_frame(time_out=0.25) is None:
++                    continue
++            task = self.current_task
+             next_sleep_check = None
+-            if self.current_task is not None:
+-                task = self.current_task
+-                if task.sleep_check_interval >= 0:
+-                    elapsed = time.time() - task.last_sleep_check_time
+-                    if not task.in_sleep_check and elapsed >= task.sleep_check_interval:
+-                        task.in_sleep_check = True
+-                        try:
+-                            self.next_frame()
++            if task is not None and task.sleep_check_interval >= 0 and not task.in_sleep_check:
++                elapsed = time.time() - task.last_sleep_check_time
++                next_sleep_check = max(0, task.sleep_check_interval - elapsed)
++                if next_sleep_check <= 0:
++                    task.in_sleep_check = True
++                    try:
++                        if self.next_frame(time_out=0.25) is not None:
+                             task.sleep_check()
+-                            self.reset_scene()
+-                        except Exception as e:
+-                            logger.info(f"sleep_check error {task}")
+-                            raise
+-                        finally:
+-                            task.last_sleep_check_time = time.time()
+-                            task.in_sleep_check = False
+-                        next_sleep_check = task.sleep_check_interval
+-                    elif not task.in_sleep_check:
+-                        next_sleep_check = max(0, task.sleep_check_interval - elapsed)
+-            if self.exit_event.is_set():
+-                logger.info("sleep Exit event set. Exiting early.")
+-                sys.exit(0)
+-            if not (self.blocked_by_pause() or (
+-                    self.current_task is not None and self.current_task.paused) or self.interaction is None or not self.interaction.should_capture()):
+-                to_sleep = self.pause_end_time - time.time()
+-                if to_sleep <= 0:
+-                    return
+-                if next_sleep_check is not None:
+-                    to_sleep = min(to_sleep, next_sleep_check)
+-                self._wait_for_activity(to_sleep)
+-            else:
+-                self._wait_for_activity(0.1)
++                            self.reset_scene(check_enabled=False)
++                    finally:
++                        task.last_sleep_check_time = time.time()
++                        task.in_sleep_check = False
++                    next_sleep_check = task.sleep_check_interval
++            remaining = deadline - self.business_time()
++            if remaining <= 0:
++                return
++            if next_sleep_check is not None:
++                remaining = min(remaining, max(0.001, next_sleep_check))
++            self._wait_for_activity(min(0.05, remaining))
++        raise FinishedException()
+ 
+     def _wake_executor(self):
+         condition = getattr(self, '_wake_condition', None)
+@@ -485,7 +646,9 @@
+         if task is not None:
+             if self.current_task != task:
+                 raise Exception(f"Can only pause current task {self.current_task}")
++            self.release_inputs()
+         elif not self.paused:
++            self.release_inputs()
+             self.paused = True
+             self._wake_executor()
+             communicate.executor_paused.emit(self.paused)
+@@ -494,6 +657,7 @@
+             return True
+ 
+     def stop_current_task(self):
++        self.release_inputs()
+         if task := self.current_task:
+             task.disable()
+             task.unpause()
+@@ -519,7 +683,8 @@
+     def exclusive_owner(self):
+         return self._exclusive_owner
+ 
+-    def submit(self, fn, name=None, owner=None, capture=None, interaction=None, ignore_pause=True):
++    def submit(self, fn, name=None, owner=None, capture=None, interaction=None, ignore_pause=True,
++               defer_while_unfocused=False):
+         """Run ``fn`` once on the executor thread and return its ExecutorJob.
+ 
+         Jobs run before queued tasks, as soon as the running task finishes, and
+@@ -529,7 +694,7 @@
+         holder's jobs are accepted.
+         """
+         job = ExecutorJob(self, fn, name=name, owner=owner, capture=capture, interaction=interaction,
+-                          ignore_pause=ignore_pause)
++                          ignore_pause=ignore_pause, defer_while_unfocused=defer_while_unfocused)
+         with self.lock:
+             if self._exclusive_owner is not None and owner != self._exclusive_owner:
+                 raise ExecutorBusyException(self._exclusive_owner)
+@@ -554,6 +719,8 @@
+         if job.future.done():
+             return False
+         job._cancel_requested.set()
++        if self.current_job is job:
++            self.release_inputs()
+         self._wake_executor()
+         return True
+ 
+@@ -608,8 +775,10 @@
+ 
+     def _pop_job(self):
+         with self.lock:
+-            if self._job_queue:
+-                return self._job_queue.pop(0)
++            for index, job in enumerate(self._job_queue):
++                if job.defer_while_unfocused and self.foreground_waiting:
++                    continue
++                return self._job_queue.pop(index)
+         return None
+ 
+     def _run_job(self, job):
+@@ -622,57 +791,67 @@
+         logger.info(f'start {job}')
+         self.current_job = job
+         start = time.time()
++        error, result = None, None
+         try:
++            self.release_inputs(raise_on_error=True)
+             self.reset_scene(check_enabled=False)
+             result = job.fn()
+-        except BaseException as e:
+-            if isinstance(e, TaskDisabledException):
++        except BaseException as caught:
++            error = caught
++            if isinstance(caught, TaskDisabledException):
+                 logger.info(f'{job} cancelled')
+-            elif not isinstance(e, (FinishedException, SystemExit)):
+-                logger.error(f'{job} raised', e)
+-            job.future.set_exception(e)
++            elif not isinstance(caught, (FinishedException, SystemExit)):
++                logger.error(f'{job} raised', caught)
++        finally:
++            # Future 终态发布在真实清理之后，调用方才可开始下一轮工作。
++            try:
++                self.release_inputs(raise_on_error=True)
++            except ForegroundInputError as cleanup_error:
++                if error is None:
++                    error = cleanup_error
++            self.current_job = None
++            self.reset_scene(check_enabled=False)
++        if error is not None:
++            job.future.set_exception(error)
+         else:
+             job.future.set_result(result)
+-        finally:
+-            self.current_job = None
+-            self.reset_scene(check_enabled=False)
+         logger.info(f'end {job}, cost: {time.time() - start:.2f}s')
+ 
+     def wait_condition(self, condition, time_out=0, pre_action=None, post_action=None, settle_time=-1,
+-                       raise_if_not_found=False):
++                       raise_if_not_found=False, *, deadline=None):
+         self.reset_scene()
+-        start = time.time()
+-        if time_out == 0:
+-            time_out = self.wait_scene_timeout
+-        settled = 0
++        time_out = self.wait_scene_timeout if time_out == 0 else time_out
++        start = self.business_time()
++        settled = None
+         while not self.exit_event.is_set():
++            self.check_enabled(check_pause=False)
++            if deadline is not None and time.monotonic() >= deadline:
++                break
++            if not self._foreground_ready():
++                settled = None
++                self.next_frame(time_out=0.25, deadline=deadline)
++                continue
++            if self.business_time() - start >= time_out:
++                break
+             if pre_action is not None:
+                 pre_action()
+-            self.next_frame()
++            remaining = max(0, time_out - (self.business_time() - start))
++            if self.next_frame(time_out=min(0.25, remaining), deadline=deadline) is None:
++                continue
+             result = condition()
+             if result:
+-                result_str = list_or_obj_to_str(result)
+-                if settle_time == -1:
+-                    settle_time = self.wait_until_settle_time
+-                if settle_time > 0:
+-                    now = time.time()
+-                    if settled > 0 and now - settled > settle_time:
+-                        logger.debug(f"found result {result_str} {(now - start):.3f}")
+-                        return result
+-                    if settled == 0:
+-                        logger.debug(f"found result {result_str} {(now - start):.3f}")
+-                        settled = now
+-                    continue
+-                else:
+-                    logger.debug(f"found result {result_str} {(time.time() - start):.3f}")
++                settle = self.wait_until_settle_time if settle_time == -1 else settle_time
++                now = self.business_time()
++                if settle <= 0 or settled is not None and now - settled >= settle:
+                     return result
++                if settled is None:
++                    settled = now
+             else:
+-                settled = 0
++                settled = None
+             if post_action is not None:
+                 post_action()
+-            if time.time() - start > time_out:
+-                logger.info(f"wait_until timeout {condition} {time_out} seconds")
+-                break
++        if self.exit_event.is_set():
++            raise FinishedException()
+         if raise_if_not_found:
+             raise WaitFailedException()
+         return None
+@@ -724,7 +903,7 @@
+ 
+     def next_task(self) -> tuple:
+         if self.exit_event.is_set():
+-            logger.error(f"next_task exit_event.is_set exit")
++            logger.error("next_task exit_event.is_set exit")
+             return None, False, False
+         with self.lock:
+             while self.onetime_task_queue:
+@@ -764,20 +943,22 @@
+         ]
+         return min(delays, default=default)
+ 
+-    def _prepare_task_for_run(self, is_trigger_task):
+-        """Prepare a task's input backend before the first frame is requested.
+-
+-        Foreground interaction backends such as Pynput only report a capture
+-        frame while the target window is active.  One-time tasks used to
+-        request that frame first and only bring the target window forward from
+-        inside ``task.run()``, which is too late and can leave the task waiting
+-        indefinitely.
+-        """
+-        if not is_trigger_task and self.interaction is not None:
+-            self.interaction.on_run()
++    def _prepare_task_for_run(self, is_trigger_task, request_focus=False):
++        """保留首帧前准备；只有显式请求才允许 PC 后端置前一次。"""
++        wait = getattr(self.device_manager, 'wait_for_binding', None)
++        if callable(wait):
++            wait(cancel_check=lambda: self.check_input_cancelled(allow_pause=True))
++        interaction = self.interaction
++        if isinstance(interaction, PynputInteraction):
++            if request_focus and not is_trigger_task:
++                interaction.on_run()
++            else:
++                interaction.refresh_target()
++        elif not is_trigger_task and interaction is not None:
++            interaction.on_run()
+ 
+     def execute(self):
+-        logger.info(f"start execute")
++        logger.info("start execute")
+         while not self.exit_event.is_set():
+             wake_version = self._get_wake_version()
+             job = self._pop_job()
+@@ -804,10 +985,12 @@
+                     communicate.task.emit(task)
+                 self._prepare_task_for_run(is_trigger_task)
+                 if cycled or self._frame is None:
+-                    if self.next_frame(time_out=4) is None and is_trigger_task:
+-                        logger.info("no frame available, skip remaining trigger tasks")
+-                        self.trigger_task_index = len(self.trigger_tasks) - 1
+-                        continue
++                    if self.next_frame(time_out=4) is None:
++                        if is_trigger_task:
++                            logger.info("no frame available, skip remaining trigger tasks")
++                            self.trigger_task_index = len(self.trigger_tasks) - 1
++                            continue
++                        self.wait_foreground_frame()
+                 if is_trigger_task:
+                     if task.run():
+                         self.trigger_task_index = -1
+@@ -817,10 +1000,16 @@
+                     prevent_sleeping(True)
+                     try:
+                         logger.debug(f'start running onetime_task {task.name}')
+-                        task.run()
++                        if getattr(task, '_foreground_resume_pending', False):
++                            self.wait_foreground_frame()
++                            task._foreground_resume_pending = False
++                            task.resume_after_foreground()
++                        else:
++                            task.run()
+                         logger.debug(f'end running onetime_task {task.name}')
+                     finally:
+                         prevent_sleeping(False)
++                    self.release_inputs(raise_on_error=True)
+                     task.disable()
+                     communicate.task_done.emit(task)
+                     if task.exit_after_task or task.config.get('Exit After Task'):
+@@ -830,13 +1019,20 @@
+                         self.device_manager.stop_hwnd()
+                         time.sleep(5)
+                         communicate.quit.emit()
++            except ForegroundInputInterrupted as error:
++                self.release_inputs()
++                self.reset_scene(check_enabled=False)
++                self._notify_foreground_resume = True
++                logger.info(f'输入中断，等待安全恢复点：{error}')
++                if not is_trigger_task:
++                    task._foreground_resume_pending = True
+             except TaskDisabledException:
+                 logger.info(f"TaskDisabledException, continue {task}")
+                 self._finish_task(task, is_trigger_task)
+                 communicate.notification.emit('Stopped', task.name, False,
+                                               False, None, None, None)
+             except FinishedException:
+-                logger.info(f"FinishedException, breaking")
++                logger.info("FinishedException, breaking")
+                 break
+             except Exception as e:
+                 if isinstance(e, CaptureException):
+@@ -862,6 +1058,7 @@
+         self.destroy()
+ 
+     def _finish_task(self, task, is_trigger_task):
++        self.release_inputs()
+         if self.current_task is None and not task.running:
+             return
+         task.running = False
+@@ -871,6 +1068,7 @@
+ 
+     def stop(self):
+         logger.info('stop')
++        self.release_inputs()
+         self.exit_event.set()
+         self._wake_executor()
+ 
+@@ -882,7 +1080,8 @@
+             if getattr(self, '_destroyed', False):
+                 return
+             self._destroyed = True
+-        logger.info(f'Executor destroy')
++        logger.info('Executor destroy')
++        self.release_inputs()
+         with self.lock:
+             jobs, self._job_queue = self._job_queue, []
+         for job in jobs:

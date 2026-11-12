@@ -1,12 +1,10 @@
 # EnhanceEchoTask.py
 import re
-import time
 import os
 
-from ok import FindFeature, Logger
+from ok import FindFeature, Logger, ForegroundInputError, ForegroundInputInterrupted
 from ok.feature.Box import get_bounding_box
 from ok.util.file import clear_folder
-from src.scene.WWScene import WWScene
 from src.task.BaseWWTask import BaseWWTask
 from src.task.task_icons import task_icon
 
@@ -14,6 +12,8 @@ logger = Logger.get_logger(__name__)
 
 number_pattern = re.compile(r"^[\d.%％ ]+$")
 property_pattern = re.compile(r"[\u4e00-\u9fff]{2,}")
+TUNING_RESULT_PATTERN = re.compile(r'调谐成功|調諧成功|点击任意|點擊任意')
+TUNING_DIALOG_PATTERN = re.compile(r'不再提示|' + TUNING_RESULT_PATTERN.pattern)
 
 
 class EnhanceEchoTask(BaseWWTask, FindFeature):
@@ -61,93 +61,208 @@ class EnhanceEchoTask(BaseWWTask, FindFeature):
         return self.ocr(0.65, 0.35, 1, 0.57, match=re.compile('声骸技能'))
 
     def select_0_level_echo(self):
-        # 3.7 起从培养界面返回后, 背包选中并滚动到刚强化的声骸, 不再停在第一格
-        self.click(0.13, 0.21, after_sleep=0.5)  # 第一格
+        # 3.7 返回背包会选中刚强化的声骸；每次排序后都检查第一格，失焦中断一次排序也能恢复。
+        self.click(0.13, 0.21, after_sleep=0.5)
         if self.is_0_level():
             return True
-        for _ in range(2):  # 升降序切换两次, 列表回到顶部
+        for _ in range(2):
             self.click(0.35, 0.917, after_sleep=0.5)
-        self.click(0.13, 0.21, after_sleep=0.5)
-        return self.is_0_level()
+            self.click(0.13, 0.21, after_sleep=0.5)
+            if self.is_0_level():
+                return True
+        return False
 
     def run(self):
         self.info_set('成功声骸数量', 0)
         self.info_set('失败声骸数量', 0)
         clear_folder('screenshots')
-        while True:
+        self._enhance_phase = 'bag'
+        self._enhance_needs_refresh = False
+        return self.resume_after_foreground()
+
+    def on_foreground_resume(self):
+        super().on_foreground_resume()
+        self._enhance_needs_refresh = True
+        if getattr(self, '_enhance_active', False):
+            raise ForegroundInputInterrupted('声骸强化画面已变化，需要重新确认当前阶段')
+
+    def resume_after_foreground(self):
+        if not getattr(self, '_enhance_phase', None):
+            return super().resume_after_foreground()
+        self._enhance_active = True
+        try:
+            while self._enhance_phase != 'completed':
+                try:
+                    if self._enhance_needs_refresh:
+                        self.wait_foreground_frame()
+                        self._enhance_needs_refresh = False
+                        if self._enhance_phase in ('bag', 'enter'):
+                            self.esc()
+                            self._enhance_phase = 'bag'
+                        elif self._enhance_phase in ('materials', 'submit'):
+                            # 当前声骸可能已经强化数次；只核对原属性并重新放入未消耗的材料，不能换回下一只 +0。
+                            if not self.ocr(match=re.compile('声骸强化|聲骸強化')):
+                                self._enhance_unknown('恢复后已离开当前声骸强化页面，无法安全继续放入材料')
+                            if hasattr(self, '_enhance_snapshot'):
+                                self._verify_enhance_snapshot()
+                            self._enhance_phase = 'materials'
+                        elif self._enhance_phase in ('resolve', 'inspect'):
+                            self._enhance_resolving_after_resume = True
+                        elif self._enhance_phase == 'mark':
+                            self._verify_enhance_snapshot()
+                        elif self._enhance_phase == 'record':
+                            if self.find_echo_enhance():
+                                self._enhance_phase = 'pause' if (self._enhance_outcome == 'lock'
+                                    and self.config.get('Pause after Success')) else 'return'
+                            else:
+                                self._verify_enhance_snapshot()
+                    if self._enhance_phase == 'bag':
+                        if not self.find_echo_enhance():
+                            raise Exception(self.tr("Start after filtering Echoes on the bag's Echo screen!"))
+                        if not self.select_0_level_echo():
+                            self._finish_enhance_batch()
+                            self._enhance_phase = 'completed'
+                            return
+                        self._enhance_materials_requested = False
+                        self.__dict__.pop('_enhance_snapshot', None)
+                        self._enhance_phase = 'enter'
+                    if self._enhance_phase == 'enter':
+                        self._enter_enhance_page()
+                        self._enhance_phase = 'materials'
+                    if self._enhance_phase == 'materials':
+                        properties, values = self._read_echo_stats()
+                        self._enhance_snapshot = self._stat_signature(properties, values)
+                        self._enhance_baseline_signature = self._enhance_snapshot
+                        self._enhance_baseline_count = len(properties)
+                        self._enhance_result_seen = False
+                        self._enhance_resolving_after_resume = False
+                        self._put_staged_materials()
+                        self._enhance_phase = 'submit'
+                    if self._enhance_phase == 'submit':
+                        self._submit_enhance()
+                    if self._enhance_phase == 'resolve':
+                        self._resolve_enhance_result()
+                        self._enhance_phase = 'inspect'
+                    if self._enhance_phase == 'inspect':
+                        properties, values = self._read_echo_stats()
+                        if not self._is_enhance_progress(properties, values):
+                            self._enhance_unknown('无法确认本次强化新增的副词条，已停止以避免重复消耗')
+                        self._enhance_snapshot = self._stat_signature(properties, values)
+                        self.info_set('属性', properties)
+                        self.info_set('值', values)
+                        if not self.check_echo_stats(properties, values):
+                            self.trash_and_esc()
+                        elif len(properties) >= 5:
+                            self.lock_and_esc()
+                        else:
+                            self._enhance_phase = 'materials'
+                    if self._enhance_phase in ('mark', 'record', 'pause', 'return'):
+                        self._finish_echo()
+                except ForegroundInputInterrupted:
+                    self._enhance_needs_refresh = True
+        finally:
+            self._enhance_active = False
+
+    def _enter_enhance_page(self):
+        start = self.business_time()
+        while self.business_time() - start < 5:
             enhance = self.find_echo_enhance()
             if not enhance:
-                raise Exception(self.tr("Start after filtering Echoes on the bag's Echo screen!"))
-            if not self.select_0_level_echo():
-                total = self.info_get('成功声骸数量') + self.info_get('失败声骸数量')
-                if self.debug:
-                    self.screenshot('无可强化声骸')
-                self.log_info(self.tr('No more Echoes to enhance. Finished! Enhanced: {total}, matching: {matching}').format(total=total, matching=self.info_get('成功声骸数量')),
-                              notify=True)
-                if self.info_get('成功声骸数量') >= 1:
-                    try:
-                        os.startfile(os.path.abspath("screenshots"))
-                    except Exception as e:
-                        self.log_error(self.tr('Cannot open screenshot folder: {e}').format(e=e))
+                self.wait_ocr(match=re.compile('声骸强化|聲骸強化'), raise_if_not_found=True)
                 return
-            start = time.time()
-            while time.time() - start < 5:
-                if enhance:
-                    self.click(enhance, after_sleep=0.5)
-                enhance = self.find_echo_enhance()
-                if not enhance:
-                    break
+            self.click(enhance, after_sleep=.5)
+        raise Exception(self.tr('Cannot find Enhance and Tune!'))
 
-            while True:
-                start_wait = time.time()
-                have_add_mat = False
-                while time.time() - start_wait < 5:
-                    add_mat = self.find_add_mat()
-                    if add_mat:
-                        have_add_mat = True
-                        self.click(add_mat, after_sleep=0.3)
-                    else:
-                        self.next_frame()
-                        if have_add_mat:
-                            break
-                if not have_add_mat:
-                    raise Exception(self.tr('Enable staged material insertion in enhancement settings!'))
+    def _put_staged_materials(self):
+        start = self.business_time()
+        have_add_mat = getattr(self, '_enhance_materials_requested', False)
+        while self.business_time() - start < 5:
+            add_mat = self.find_add_mat()
+            if add_mat:
+                have_add_mat = True
+                self._enhance_materials_requested = True
+                self.click(add_mat, after_sleep=.3)
+            elif have_add_mat:
+                self._enhance_materials_requested = False
+                return
+            else:
+                self.next_frame()
+        raise Exception(self.tr('Enable staged material insertion in enhancement settings!'))
 
-                if not self.wait_click_ocr(0.1, 0.88, 0.29, 0.96, match=['强化并调谐'],
-                                           settle_time=0.1,
-                                           after_sleep=1.5):
-                    if self.ocr(0.17, 0.88, 0.29, 0.96, match=['强化']):
-                        raise Exception(self.tr('Enable simultaneous tuning in enhancement settings!'))
-                    else:
-                        raise Exception(self.tr('Cannot find Enhance and Tune!'))
-                while handle := self.wait_ocr(0.24, 0.18, 0.75, 0.98,
-                                              match=[re.compile('不再提示'), '调谐成功', re.compile('点击任')],
-                                              time_out=2):
-                    if handle[0].name in ['本次登录不再提示', '本次登入不再提示']:
-                        self.click_skip_dialog_confirm()
-                    elif handle[0].name in ['点击任意位置返回', '调谐成功']:
-                        self.click(handle, after_sleep=1)
-                    else:
-                        self.sleep(0.5)
-                self.sleep(0.1)
-                texts = self.ocr(0.09, 0.3, 0.40, 0.53)
-                self.log_info(self.tr('ocr values: {texts}').format(texts=texts))
-                properties = [p for p in self.find_boxes(texts, match=property_pattern) if '辅音' not in p.name]
-                for p in properties:
-                    match = property_pattern.search(p.name)
-                    if match:
-                        p.name = match.group()
-                values = self.find_boxes(texts, match=number_pattern)
-                self.info_set('属性', properties)
-                self.info_set('值', values)
+    def _submit_enhance(self):
+        button = self.wait_ocr(.1, .88, .29, .96, match=['强化并调谐'], settle_time=.1)
+        if not button:
+            if self.ocr(.17, .88, .29, .96, match=['强化']):
+                raise Exception(self.tr('Enable simultaneous tuning in enhancement settings!'))
+            raise Exception(self.tr('Cannot find Enhance and Tune!'))
+        # 先保存可能已消耗的阶段；点击或后续等待中断只能查结果，不能重新点击消耗按钮。
+        self._enhance_phase = 'resolve'
+        self.click(button, after_sleep=1.5)
 
-                if not self.check_echo_stats(properties, values):
-                    self.trash_and_esc()
-                    break
+    def _resolve_enhance_result(self):
+        start = self.business_time()
+        while self.business_time() - start < 6:
+            handle = self.ocr(.24, .18, .75, .98, match=TUNING_DIALOG_PATTERN)
+            result = next((box for box in handle if TUNING_RESULT_PATTERN.search(box.name)), None)
+            if result:
+                self._enhance_result_seen = True
+                self.click(result, after_sleep=1)
+                continue
+            if handle:
+                if getattr(self, '_enhance_resolving_after_resume', False):
+                    # 勾选可能已经生效；只重新定位仍在前台的确认，避免把“不再提示”反向切换。
+                    self._confirm_resumed_skip_dialog()
+                else:
+                    self.click_skip_dialog_confirm()
+                self.sleep(.2)
+                continue
+            properties, _ = self._read_echo_stats()
+            if len(properties) > self._enhance_baseline_count:
+                return
+            self.sleep(.2)
+        self._enhance_unknown('无法确认强化与调谐结果，已停止以避免重复消耗')
 
-                if len(properties) >= 5:
-                    self.lock_and_esc()
-                    break
+    def _read_echo_stats(self):
+        texts = self.ocr(.09, .3, .40, .53)
+        properties = [p for p in self.find_boxes(texts, match=property_pattern) if '辅音' not in p.name and '輔音' not in p.name]
+        for prop in properties:
+            prop.name = property_pattern.search(prop.name).group()
+        values = self.find_boxes(texts, match=number_pattern)
+        if len(properties) != len(values) or len(properties) > 5:
+            self._enhance_unknown('声骸副词条与数值识别不完整，已停止操作')
+        return properties, values
+
+    @staticmethod
+    def _stat_signature(properties, values):
+        return tuple(prop.name for prop in properties), tuple(value.name for value in values)
+
+    def _is_enhance_progress(self, properties, values):
+        before_properties, before_values = self._enhance_baseline_signature
+        after_properties, after_values = self._stat_signature(properties, values)
+        count = self._enhance_baseline_count
+        return (len(after_properties) > count and after_properties[:count] == before_properties
+                and after_values[:count] == before_values)
+
+    def _verify_enhance_snapshot(self):
+        properties, values = self._read_echo_stats()
+        if self._stat_signature(properties, values) != self._enhance_snapshot:
+            self._enhance_unknown('恢复后声骸属性已变化，无法确认原声骸的标记结果')
+
+    def _enhance_unknown(self, message):
+        self.screenshot('enhance_echo_result_unknown')
+        raise ForegroundInputError(message)
+
+    def _finish_enhance_batch(self):
+        total = self.info_get('成功声骸数量') + self.info_get('失败声骸数量')
+        if self.debug:
+            self.screenshot('无可强化声骸')
+        self.log_info(self.tr('No more Echoes to enhance. Finished! Enhanced: {total}, matching: {matching}').format(
+            total=total, matching=self.info_get('成功声骸数量')), notify=True)
+        if self.info_get('成功声骸数量') >= 1:
+            try:
+                os.startfile(os.path.abspath('screenshots'))
+            except OSError as error:
+                self.log_error(self.tr('Cannot open screenshot folder: {e}').format(e=error))
 
     def find_confirm(self):
         button_box = self.box_of_screen(0.60, 0.65, 0.82, 0.82)
@@ -281,70 +396,67 @@ class EnhanceEchoTask(BaseWWTask, FindFeature):
         return self.wait_ocr(0.09, 0.6, 0.38, 0.86, match=['阶段放入'], time_out=1)
 
     def esc(self):
-        start = time.time()
-        while not self.find_echo_enhance() and time.time() - start < 10:
+        start = self.business_time()
+        while not self.find_echo_enhance() and self.business_time() - start < 10:
             self.send_key('esc', interval=4, after_sleep=0.2)
+        if not self.find_echo_enhance():
+            self._enhance_unknown('无法返回原筛选背包页面')
         self.sleep(0.1)
 
     def trash_and_esc(self):
-        self.info_incr('失败声骸数量')
-        start = time.time()
-        success = False
-        drop_status_box = get_bounding_box([
-            self.get_box_by_name('echo_dropped'),
-            self.get_box_by_name('echo_not_dropped'),
-        ]).scale(1.05)
-        while time.time() - start < 5:
-            drop_status = self.find_best_match_in_box(drop_status_box,
-                                                      ['echo_dropped', 'echo_not_dropped'], threshold=0.7)
-            if not drop_status:
-                raise Exception(self.tr("Cannot determine the Echo's discard state!"))
-            if drop_status.name == 'echo_not_dropped':
-                self.send_key('z', after_sleep=1)
-            else:
-                self.log_info(self.tr('Discarded successfully!'))
-                success = True
-                break
-        if not success:
-            raise Exception(self.tr('Failed to discard!'))
-        safe_reason = re.sub(r'[<>:"/\\|?*]', '', self.fail_reason)
-        self.screenshot_echo(f'failed/{self.info_get("失败声骸数量")}_{safe_reason}')
-        self.esc()
-        self.log_info(self.tr('Does not meet the requirements; discarding'))
-        self.wait_ocr(0.82, 0.86, 0.97, 0.96, match='培养', settle_time=0.1)
+        self._enhance_outcome = 'discard'
+        self._enhance_phase = 'mark'
+        self._finish_echo()
 
     def screenshot_echo(self, name):
         echo = self.box_of_screen(0.09, 0.09, 0.37, 0.55).crop_frame(self.frame)
         self.screenshot(name=name, frame=echo)
 
     def lock_and_esc(self):
-        self.info_incr('成功声骸数量')
-        start = time.time()
-        success = False
-        lock_status_box = get_bounding_box([
-            self.get_box_by_name('echo_locked'),
-            self.get_box_by_name('echo_not_locked'),
-        ]).scale(1.05)
-        while time.time() - start < 5:
-            drop_status = self.find_best_match_in_box(lock_status_box,
-                                                      ['echo_locked', 'echo_not_locked'], threshold=0.7)
-            if not drop_status:
-                raise Exception(self.tr("Cannot determine the Echo's lock state!"))
-            if drop_status.name == 'echo_not_locked':
-                self.send_key('c', after_sleep=1)
+        self._enhance_outcome = 'lock'
+        self._enhance_phase = 'mark'
+        self._finish_echo()
+
+    def _mark_echo_flag(self):
+        discard = self._enhance_outcome == 'discard'
+        names = ['echo_dropped', 'echo_not_dropped'] if discard else ['echo_locked', 'echo_not_locked']
+        # 搜索框必须同时覆盖两张状态模板，防止另一张模板较大时 OpenCV 匹配崩溃。
+        status_box = get_bounding_box([self.get_box_by_name(name) for name in names]).scale(1.05)
+        start = self.business_time()
+        while self.business_time() - start < 5:
+            status = self.find_best_match_in_box(status_box, names, threshold=.7)
+            if not status:
+                self._enhance_unknown('无法确定声骸的丢弃状态' if discard else '无法确定声骸的锁定状态')
+            if status.name == names[0]:
+                return
+            self.send_key('z' if discard else 'c', after_sleep=1)
+        self._enhance_unknown('声骸标记未能确认，已停止操作')
+
+    def _finish_echo(self):
+        discard = self._enhance_outcome == 'discard'
+        counter = '失败声骸数量' if discard else '成功声骸数量'
+        if self._enhance_phase == 'mark':
+            self._mark_echo_flag()
+            # 标记结果确认后才计数；之后的截图、暂停和返回中断都不会重复计数或反向切换。
+            self.info_incr(counter)
+            self._enhance_phase = 'record'
+        if self._enhance_phase == 'record':
+            if discard:
+                safe_reason = re.sub(r'[<>:"/\\|?*]', '', self.fail_reason)
+                self.screenshot_echo(f'failed/{self.info_get(counter)}_{safe_reason}')
+                self.log_info(self.tr('Does not meet the requirements; discarding'))
             else:
-                self.log_info(self.tr('Locked successfully!'))
-                success = True
-                break
-        if not success:
-            raise Exception(self.tr('Failed to lock!'))
-        self.screenshot_echo(f'success/{self.info_get("成功声骸数量")}')
-        self.log_info(self.tr('Succeeded and locked'))
-        if self.config.get('Pause after Success'):
+                self.screenshot_echo(f'success/{self.info_get(counter)}')
+                self.log_info(self.tr('Succeeded and locked'))
+            self._enhance_phase = 'pause' if not discard and self.config.get('Pause after Success') else 'return'
+        if self._enhance_phase == 'pause':
             self.log_info(self.tr('Matching Echo found; task paused'), notify=True)
+            self._enhance_phase = 'return'
             self.pause()
-        self.esc()
-        self.wait_ocr(0.82, 0.86, 0.97, 0.96, match='培养', settle_time=0.1)
+        if self._enhance_phase == 'return':
+            self.esc()
+            self.wait_ocr(.82, .86, .97, .96, match='培养', settle_time=.1, raise_if_not_found=True)
+            self._enhance_phase = 'bag'
 
 
 def parse_number(text):

@@ -1259,6 +1259,14 @@
     <context>
         <name>app</name>
         <message>
+            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
+            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
             <source>Diagnosis</source>
             <translation>Diagnosis</translation>
         </message>
@@ -1765,14 +1773,6 @@
         <message>
             <source>Requires the local QQ or WeChat client window to be open and running</source>
             <translation>Requires the local QQ or WeChat client window to be open and running</translation>
-        </message>
-        <message>
-            <source>Requires the local QQ client window to be open and running</source>
-            <translation>Requires the local QQ client window to be open and running</translation>
-        </message>
-        <message>
-            <source>Requires the local WeChat client window to be open and running</source>
-            <translation>Requires the local WeChat client window to be open and running</translation>
         </message>
         <message>
             <source>SMTP Notification</source>
@@ -3343,20 +3343,12 @@
     <context>
         <name>SelectInteractionListView</name>
         <message>
-            <source>Pynput</source>
-            <translation>Pynput - Foreground, most compatible</translation>
+            <source>前台系统键鼠</source>
+            <translation>前台系统键鼠</translation>
         </message>
         <message>
-            <source>PostMessage</source>
-            <translation>PostMessage - Background, most App and a Few Games</translation>
-        </message>
-        <message>
-            <source>PyDirect</source>
-            <translation>PyDirect - Foreground, backup for Pynput</translation>
-        </message>
-        <message>
-            <source>Genshin</source>
-            <translation>Genshin - Background Support for Some Unity Game</translation>
+            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
+            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
         </message>
         <message>
             <source>ADBInteraction</source>
@@ -3369,10 +3361,6 @@
         <message>
             <source>Default Interaction</source>
             <translation>Default Interaction</translation>
-        </message>
-        <message>
-            <source>WindowsInteraction</source>
-            <translation>WindowsInteraction</translation>
         </message>
     </context>
     <context>

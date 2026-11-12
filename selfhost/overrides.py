@@ -38,7 +38,21 @@ def apply(config):
     构造之后再改就不会生效了。
     """
     apply_branding(config)
+    apply_input_policy(config)
     return apply_custom_tabs(config)
+
+
+def apply_input_policy(config):
+    """上游配置同步后继续使用前台后端，并撤出后台光标补救任务。"""
+    windows = config.get('windows')
+    if windows is not None:
+        # 与 DeviceManager 的历史配置迁移共同守住输入边界，不保留后台备选。
+        windows['interaction'] = 'Pynput'
+    if 'trigger_tasks' in config:
+        config['trigger_tasks'] = [
+            task for task in config['trigger_tasks']
+            if tuple(task) != ('src.task.MouseResetTask', 'MouseResetTask')
+        ]
 
 
 def apply_branding(config):

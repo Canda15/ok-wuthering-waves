@@ -51,3 +51,7 @@ class BaseInteraction:
 
     def on_destroy(self):
         pass
+
+    def release_all(self):
+        """停止与换目标的专用清理入口，不经过普通任务输入检查。"""
+        pass

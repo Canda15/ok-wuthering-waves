@@ -1,6 +1,8 @@
 import unittest
 import re
+from unittest.mock import Mock
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src.task.BaseCombatTask import CharRevivedException
 from src.task.NightmareNestTask import NestTarget, NightmareNestTask
 
@@ -14,8 +16,92 @@ class FakeBox:
         self.width = width
         self.height = height
 
+    def copy(self):
+        return FakeBox(self.name, self.x, self.y, self.width, self.height)
+
 
 class TestNightmareNestTask(unittest.TestCase):
+
+    def make_nest_combat(self):
+        task = NightmareNestTask.__new__(NightmareNestTask)
+        task.tr = str
+        task._capture_mode = False
+        task._capture_success = False
+        task._unreachable_nests = set()
+        task._nest_deaths = {}
+        task.click = Mock()
+        task.wait_feature = Mock(return_value=FakeBox('team_start_challenge'))
+        task.click_team_challenge = Mock()
+        task.wait_in_team_and_world = Mock(return_value=True)
+        task.combat_once = Mock(return_value=False)
+        task.sleep = Mock()
+        task._should_continue_combat_after_pickup = Mock(return_value=False)
+        task.log_info = Mock()
+        task.esc_world_confirm = Mock()
+        task.wait_foreground_frame = Mock()
+        task.in_team_and_world = Mock(return_value=False)
+        task.in_realm = Mock(return_value=True)
+        task.find_one = Mock(return_value=None)
+        return task
+
+    def test_focus_before_nest_selection_requeries_current_row_coordinates(self):
+        task = self.make_nest_combat()
+        old = NestTarget(FakeBox('0/24', y=100), 'go_nest:24:5')
+        fresh = NestTarget(FakeBox('0/24', y=160), old.cache_key)
+        task.get_nest_to_go = Mock(return_value=fresh)
+        task.click.side_effect = [ForegroundInputInterrupted(), None]
+        task.combat_nest(old)
+        self.assertEqual([call.args[0] for call in task.click.call_args_list], [old.box, fresh.box])
+        self.assertEqual(task._nest_deaths, {})
+        self.assertEqual(task._unreachable_nests, set())
+
+    def test_focus_during_exit_keeps_finished_combat_and_pickup(self):
+        task = self.make_nest_combat()
+        task.esc_world_confirm.side_effect = [ForegroundInputInterrupted(), None]
+        task._pick_nest_echo = Mock(return_value=True)
+        task.combat_nest(NestTarget(FakeBox('0/24'), 'go_nest:24:5'))
+        task.combat_once.assert_called_once()
+        task._pick_nest_echo.assert_called_once()
+        task.wait_foreground_frame.assert_called_once()
+
+    def test_accepted_travel_focus_interrupt_does_not_mark_nest_unreachable(self):
+        task = self.make_nest_combat()
+        world = [False]
+        task.in_team_and_world = lambda: world[0]
+        task.wait_until = lambda condition, **kwargs: FakeBox('gray_teleport')
+        task.back = Mock()
+
+        def travel(*args, **kwargs):
+            world[0] = True
+            raise ForegroundInputInterrupted()
+
+        task.click.side_effect = travel
+        target = NestTarget(FakeBox('0/24'), 'go_nest:24:5')
+        self.assertTrue(task._travel_to_nest_or_skip(target))
+        self.assertEqual(task._unreachable_nests, set())
+        task.back.assert_not_called()
+
+    def test_nest_system_input_failure_is_not_retried(self):
+        task = self.make_nest_combat()
+        task.click.side_effect = ForegroundInputError()
+        with self.assertRaises(ForegroundInputError):
+            task.combat_nest(NestTarget(FakeBox('0/24'), 'go_nest:24:5'))
+        task.wait_foreground_frame.assert_not_called()
+        task.combat_once.assert_not_called()
+
+    def test_fallback_refreshes_completed_nest_row_without_reusing_old_coordinates(self):
+        task = NightmareNestTask.__new__(NightmareNestTask)
+        task.queues = [task.go_nest]
+        task.count_re = re.compile(r'(\d{1,2})/(\d{1,2})')
+        task.height_of_screen = lambda fraction: fraction * 1000
+        task.width_of_screen = lambda fraction: fraction * 1000
+        completed = FakeBox('24/24', x=400, y=100)
+        key = task._make_nest_cache_key(completed, '24')
+        task.ocr = Mock(return_value=[completed])
+        refreshed = task._refresh_nest_target(NestTarget(object(), key))
+        self.assertEqual(refreshed.cache_key, key)
+        self.assertIsNot(refreshed.box, completed)
+        self.assertEqual(refreshed.box.x, 900)
 
     def test_nest_is_checked_before_nightmare_changes_book_scroll(self):
         task = NightmareNestTask.__new__(NightmareNestTask)

@@ -10,16 +10,17 @@
 生成块:内联之后 ok-script 不再是 pip 的解析来源,少写一条依赖不会报错,
 只会等到某个功能跑起来才炸。
 
-替换之后会把 selfhost/framework_patches.py 里的品牌补丁重新施加一遍:那里面
-是"必须改在源码里、改 config 来不及"的字符串(通知 app_id、窗口类名等)。
-补丁在计算 pin 哈希之前施加,所以 ok/ 的 tree_sha256 描述的是"打完补丁的树",
-补丁丢失会被 --check 立刻发现。
+隔离解包后先重放 selfhost/framework_patches.py 的品牌字符串，再严格重放
+selfhost/logic_patches.json 登记的逻辑差异，全部验证成功才替换 ok/。
+原始 wheel、完整补丁后树和逻辑差异集合分别记录摘要，--check 同时验证来源契约。
 
 用法:
     python scripts/sync_ok.py              # 版本取"上游 pyproject 的声明",没有声明才用 pin
     python scripts/sync_ok.py --dry-run    # 只报告差异,不落盘
     python scripts/sync_ok.py --version 3.0.2   # 明确指定版本(覆盖上面的推断)
     python scripts/sync_ok.py --check      # 离线校验 ./ok 与 pin 是否一致
+    python scripts/sync_ok.py --check --root E:/deploy/NoNo  # 校验另一棵部署树
+    python scripts/sync_ok.py --record-patches  # 从经核验 wheel 收集当前 ok/ 的全部自有差异
 """
 
 from __future__ import annotations
@@ -47,9 +48,17 @@ for _stream in (sys.stdout, sys.stderr):
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # 补丁清单住在 selfhost/ 里(与运行时配置覆盖同目录),脚本只是施加者。
 sys.path.insert(0, str(REPO_ROOT))
-from selfhost import framework_patches  # noqa: E402  (必须在 REPO_ROOT 之后)
+from selfhost import framework_patches, logic_patches  # noqa: E402  (必须在 REPO_ROOT 之后)
+from selfhost.framework_tree import (  # noqa: E402
+    IGNORED_DIR_NAMES as IGNORED_DIR_NAMES,
+    IGNORED_SUFFIXES as IGNORED_SUFFIXES,
+    hash_tree,
+    iter_payload_files as iter_payload_files,
+    tree_digest,
+)
 OK_DIR = REPO_ROOT / "ok"
 PIN_FILE = REPO_ROOT / "selfhost" / "ok_pin.json"
+PATCH_MANIFEST = REPO_ROOT / "selfhost" / logic_patches.MANIFEST_NAME
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 REQUIREMENTS_FILE = REPO_ROOT / "requirements.txt"
 # 暂存目录刻意用显式 mkdir 建在仓库内:tempfile 在 Windows 上会创建 0o700 的
@@ -62,11 +71,6 @@ BEGIN_MARK = "# >>> generated: vendored ok-script dependencies (scripts/sync_ok.
 END_MARK = "# <<< generated: vendored ok-script dependencies"
 
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/{version}/json"
-
-# 编译产物不属于源码树;__pycache__ 若混进 deploy.txt 的打包树会污染更新包。
-IGNORED_DIR_NAMES = {"__pycache__"}
-IGNORED_SUFFIXES = {".pyc", ".pyo"}
-
 
 def read_text(path: Path) -> str:
     return path.read_bytes().decode("utf-8")
@@ -89,39 +93,11 @@ def package_name(spec: str) -> str:
     return normalize(match.group(0))
 
 
-def iter_payload_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if IGNORED_DIR_NAMES & set(path.parts):
-            continue
-        if path.suffix in IGNORED_SUFFIXES:
-            continue
-        files.append(path)
-    return files
-
-
-def hash_tree(root: Path) -> dict[str, str]:
-    """返回 {相对 posix 路径: sha256}。路径一律用 / 以保持跨平台可比。"""
-    digests: dict[str, str] = {}
-    for path in iter_payload_files(root):
-        rel = path.relative_to(root).as_posix()
-        digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return digests
-
-
-def tree_digest(digests: dict[str, str]) -> str:
-    h = hashlib.sha256()
-    for rel in sorted(digests):
-        h.update(f"{rel}\0{digests[rel]}\n".encode())
-    return h.hexdigest()
-
-
-def load_pin() -> dict:
-    if not PIN_FILE.exists():
-        raise SystemExit(f"缺少 pin 文件: {PIN_FILE}")
-    return json.loads(PIN_FILE.read_text(encoding="utf-8"))
+def load_pin(path: Path | None = None) -> dict:
+    path = path or PIN_FILE
+    if not path.exists():
+        raise SystemExit(f"缺少 pin 文件: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def save_pin(pin: dict) -> None:
@@ -388,30 +364,80 @@ def summarize(current: dict[str, str], incoming: dict[str, str]) -> list[str]:
     return added + removed + modified
 
 
-def do_check() -> int:
-    pin = load_pin()
-    if not OK_DIR.is_dir():
+def load_logic_patches(pin: dict, version: str, manifest_path: Path | None = None) -> logic_patches.PatchSet:
+    patches = logic_patches.load(manifest_path or PATCH_MANIFEST, version)
+    expected = pin.get("logic_patches_sha256")
+    if patches.digest() != expected:
+        raise SystemExit(
+            f"逻辑差异集合与 pin 不一致:\n  pin  {expected}\n  实际 {patches.digest()}\n"
+            "请用 --record-patches 收集完整来源并验证重放，不能只更新 pin"
+        )
+    return patches
+
+
+def do_check(root: Path | None = None) -> int:
+    ok_dir = root / "ok" if root is not None else OK_DIR
+    pin_path = root / "selfhost" / "ok_pin.json" if root is not None else PIN_FILE
+    manifest = root / "selfhost" / logic_patches.MANIFEST_NAME if root is not None else PATCH_MANIFEST
+    if not ok_dir.is_dir():
         print("ok/ 不存在,先运行同步")
         return 1
-    absent = framework_patches.missing(OK_DIR)
+    try:
+        pin = load_pin(pin_path)
+        patches = load_logic_patches(pin, pin["version"], manifest)
+        current = hash_tree(ok_dir)
+        patches.baseline_digests(current)
+    except SystemExit as exc:
+        print(str(exc))
+        return 1
+    # 逻辑差异可能重写或删除品牌所在文件；它们已由品牌后基线与精确后摘要保护。
+    covered = {entry.path for entry in patches.entries}
+    absent = [relative for relative in framework_patches.missing(ok_dir) if relative not in covered]
     if absent:
         print("这些源码补丁没有生效(ok/ 被手改或未重新施加):")
         for rel in absent:
             print(f"  ok/{rel}")
         print("跑一次 python scripts/sync_ok.py 会重新施加。")
         return 1
-    actual = tree_digest(hash_tree(OK_DIR))
+    actual = tree_digest(current)
     expected = pin.get("tree_sha256", "")
     if actual != expected:
         print(f"ok/ 与 pin 不一致:\n  pin  {expected}\n  实际 {actual}")
-        print("说明 ./ok 被手改过或未重新同步;手改需在此登记新哈希(见 SELFHOST.md)。")
+        print("请核对完整逻辑差异与重放结果，不能只登记新的树哈希(见 SELFHOST.md)。")
         return 1
-    print(f"ok/ 与 pin 一致({pin['package']} {pin['version']},{len(hash_tree(OK_DIR))} 个文件)")
+    print(f"ok/、基线和逻辑差异与 pin 一致({pin['package']} {pin['version']},{len(current)} 个文件)")
     return 0
 
 
+def prepare_staging() -> Path:
+    staging = STAGING_DIR.resolve()
+    if (
+        staging.parent != REPO_ROOT.resolve() or staging.name != ".sync-ok-stage" or STAGING_DIR.is_symlink()
+        or (hasattr(STAGING_DIR, "is_junction") and STAGING_DIR.is_junction())
+    ):
+        raise SystemExit("同步暂存目录必须是仓库内的 .sync-ok-stage，不能删除其它路径")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    return staging
+
+
+def stage_wheel(pin: dict, version: str, staging: Path) -> tuple[Path, str, str]:
+    url, pypi_sha256 = fetch_release(pin["package"], version)
+    expected = pin.get("wheel_sha256", "") if version == pin["version"] else ""
+    if expected and expected != pypi_sha256:
+        raise SystemExit(f"wheel 哈希与 pin 不符(供应链告警):\n  pin  {expected}\n  PyPI {pypi_sha256}")
+    payload = download(url)
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != pypi_sha256:
+        raise SystemExit(f"下载内容与 PyPI 摘要不符: {actual} != {pypi_sha256}")
+    wheel_path = staging / "ok_script.whl"
+    wheel_path.write_bytes(payload)
+    return wheel_path, url, actual
+
+
 def do_sync(
-    version_override: str | None, dry_run: bool, upstream_version: str | None = None
+    version_override: str | None, dry_run: bool, upstream_version: str | None = None,
+    *, reapply: bool = False,
 ) -> int:
     pin = load_pin()
     package = pin["package"]
@@ -422,27 +448,15 @@ def do_sync(
     else:
         print(f"目标: {package} {version}")
 
-    url, pypi_sha256 = fetch_release(package, version)
-    expected = pin.get("wheel_sha256", "") if version == pin["version"] else ""
-    if expected and expected != pypi_sha256:
-        raise SystemExit(
-            f"wheel 哈希与 pin 不符(供应链告警):\n  pin  {expected}\n  PyPI {pypi_sha256}"
-        )
-
-    staging = STAGING_DIR
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True)
+    patches = load_logic_patches(pin, version)
+    staging = prepare_staging()
     try:
-        wheel_path = staging / "ok_script.whl"
-        payload = download(url)
-        actual_sha256 = hashlib.sha256(payload).hexdigest()
-        if actual_sha256 != pypi_sha256:
-            raise SystemExit(f"下载内容与 PyPI 摘要不符: {actual_sha256} != {pypi_sha256}")
-        wheel_path.write_bytes(payload)
-
+        wheel_path, url, actual_sha256 = stage_wheel(pin, version, staging)
         package_root = extract_ok_package(wheel_path, staging / "unpacked")
         applied, already = framework_patches.apply_to(package_root)
-        print(f"  源码补丁: 新施加 {len(applied)} 处,已生效 {len(already)} 处")
+        print(f"  品牌补丁: 新施加 {len(applied)} 处,已生效 {len(already)} 处")
+        applied, already = patches.apply_to(package_root)
+        print(f"  逻辑差异: 新施加 {len(applied)} 个文件,已生效 {len(already)} 个文件")
         incoming = hash_tree(package_root)
         current = hash_tree(OK_DIR) if OK_DIR.is_dir() else {}
 
@@ -462,10 +476,24 @@ def do_sync(
             print("dry-run:未落盘")
             return 0
 
+        if reapply:
+            dropped = reapply_upstream_overwrites()
+            if dropped:
+                print("已重新移除上游带回来的 pin:")
+                for line in dropped:
+                    print(f"  {line}")
+            else:
+                print("没有需要移除的 pin")
+
         if changed:
             # 整树替换而不是逐文件覆盖:上游删掉的文件必须真的消失,否则旧的
             # __pycache__ 与残留模块会让"已删除的 API"继续可导入。最坏情况
             # (move 中途失败)可从 git 恢复。
+            if (
+                OK_DIR.resolve() != REPO_ROOT.resolve() / "ok" or OK_DIR.is_symlink()
+                or (hasattr(OK_DIR, "is_junction") and OK_DIR.is_junction())
+            ):
+                raise SystemExit("整体替换目标必须是仓库内的 ok/ 实目录")
             shutil.rmtree(OK_DIR, ignore_errors=True)
             shutil.move(str(package_root), str(OK_DIR))
 
@@ -478,6 +506,7 @@ def do_sync(
                 "version": version,
                 "wheel_sha256": actual_sha256,
                 "tree_sha256": tree_digest(incoming),
+                "logic_patches_sha256": patches.digest(),
                 "source_url": url,
             }
         )
@@ -491,11 +520,58 @@ def do_sync(
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def do_record_patches(version_override: str | None, dry_run: bool) -> int:
+    """显式收集完整自有差异，绝不替换已编辑的 ok/ 或改写依赖文件。"""
+    if not OK_DIR.is_dir():
+        raise SystemExit("收集差异前必须有完整 ok/ 工作树")
+    pin = load_pin()
+    version = version_override or pin["version"]
+    print(f"收集逻辑差异: {pin['package']} {version}")
+    current = hash_tree(OK_DIR)
+    staging = prepare_staging()
+    try:
+        wheel_path, url, wheel_sha256 = stage_wheel(pin, version, staging)
+        base_root = extract_ok_package(wheel_path, staging / "unpacked")
+        framework_patches.apply_to(base_root)
+        summarize(hash_tree(base_root), current)
+        staged_manifest = staging / "captured" / logic_patches.MANIFEST_NAME
+        patches = logic_patches.capture(base_root, OK_DIR, version, staged_manifest)
+        applied, _already = patches.apply_to(base_root)
+        if hash_tree(base_root) != current or hash_tree(OK_DIR) != current:
+            raise SystemExit("差异重放与工作树不一致或收集期间发生编辑，未写入来源和 pin")
+        print(f"  已验证 {len(applied)} 个逻辑差异文件，集合摘要 {patches.digest()}")
+        if dry_run:
+            print("dry-run:未落盘")
+            return 0
+        target = PATCH_MANIFEST.parent / "patches"
+        if (
+            not target.resolve().is_relative_to(REPO_ROOT.resolve()) or target.is_symlink()
+            or (hasattr(target, "is_junction") and target.is_junction())
+        ):
+            raise SystemExit("逻辑差异载荷目录必须位于仓库内，不能删除其它路径")
+        shutil.rmtree(target, ignore_errors=True)
+        source = staged_manifest.parent / "patches"
+        if source.is_dir():
+            shutil.copytree(source, target)
+        PATCH_MANIFEST.write_bytes(patches.manifest_content)
+        save_pin({
+            "package": pin["package"], "version": version, "wheel_sha256": wheel_sha256,
+            "tree_sha256": tree_digest(current), "logic_patches_sha256": patches.digest(), "source_url": url,
+        })
+        print("已登记差异清单、载荷与 pin；请审查源码 diff 和差异文件")
+        return 0
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="同步内联在 ./ok 的 ok-script")
     parser.add_argument("--version", help="同步到指定版本(默认取 selfhost/ok_pin.json)")
     parser.add_argument("--dry-run", action="store_true", help="只报告差异,不写文件")
-    parser.add_argument("--check", action="store_true", help="离线校验 ./ok 与 pin 是否一致")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="离线校验框架、基线与差异集合")
+    modes.add_argument("--record-patches", action="store_true", help="收集当前 ok/ 的完整差异并隔离验证后登记")
+    parser.add_argument("--root", type=Path, help="--check 的目标根目录，包含 ok/ 与 selfhost/")
     parser.add_argument(
         "--reapply",
         action="store_true",
@@ -503,19 +579,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.root is not None and not args.check:
+        parser.error("--root 只能与 --check 一起使用")
     if args.check:
-        return do_check()
+        if args.version or args.reapply or args.dry_run:
+            parser.error("--check 不能与 --version、--reapply 或 --dry-run 一起使用")
+        return do_check(args.root.resolve() if args.root is not None else None)
+    if args.record_patches:
+        if args.reapply:
+            parser.error("--record-patches 不能改写上游依赖，不能与 --reapply 一起使用")
+        return do_record_patches(args.version, args.dry_run)
     # 顺序不能反:reapply 会把上游那行 pin 删掉,之后再读就没有版本依据了。
     upstream_version = upstream_pinned_version()
-    if args.reapply:
-        dropped = reapply_upstream_overwrites()
-        if dropped:
-            print("已重新移除上游带回来的 pin:")
-            for line in dropped:
-                print(f"  {line}")
-        else:
-            print("没有需要移除的 pin")
-    return do_sync(args.version, args.dry_run, upstream_version=upstream_version)
+    return do_sync(args.version, args.dry_run, upstream_version=upstream_version, reapply=args.reapply)
 
 
 if __name__ == "__main__":

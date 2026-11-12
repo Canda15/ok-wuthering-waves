@@ -1,0 +1,127 @@
+--- a/notification/messenger_images.py
++++ b/notification/messenger_images.py
+@@ -1,84 +1,42 @@
+ import time
+ 
+-import win32api
+ import win32con
+ import win32gui
+ import win32process
+ 
+ 
+ def insert_messenger_image(automation, method, hwnd, input_target, input_point, frame):
+-    """Insert one frame using the provider's background-safe native UI path."""
++    """在通知持有的前台会话内粘贴一张图片。"""
++    automation._check()
+     if method == 'context_menu':
+         return _paste_from_context_menu(automation, hwnd, input_point, frame)
+ 
+     automation._set_clipboard_image(frame)
+     automation._hotkey(input_target, win32con.VK_CONTROL, ord('V'))
+-    time.sleep(1)
++    automation._wait(1)
+     return True
+ 
+ 
+ def _paste_from_context_menu(automation, hwnd, input_point, frame):
++    automation._check()
+     automation._set_clipboard_image(frame)
+-    _left_click(hwnd, input_point)
+-    time.sleep(1)
+-    _right_click(hwnd, input_point)
+-    # Let Chromium finish drawing the menu before PrintWindow/OCR begins;
+-    # capturing too early can keep a background QQ renderer from presenting it.
+-    time.sleep(1)
++    automation._click(hwnd, input_point)
++    automation._wait(1)
++    automation._click(hwnd, input_point, key='right')
++    # 等前台菜单完成绘制再识别；等待期间仍检查焦点和取消。
++    automation._wait(1)
+     popup, paste = _wait_popup_text(
+-        automation, hwnd, {'Paste', '粘贴', '貼上'}, timeout=5,
++        automation, hwnd, {'Paste', '粘贴', '貼上'}, timeout=8,
+         match_end=automation.paste_match_end)
+-    if paste is None:
+-        # A throttled background Chromium renderer may present the menu only
+-        # after the first RenderFull polling pass yields.
+-        time.sleep(.5)
+-        popup, paste = _wait_popup_text(
+-            automation, hwnd, {'Paste', '粘贴', '貼上'}, timeout=3,
+-            match_end=automation.paste_match_end)
+     if paste is None:
+         try:
+             automation._save_error_screenshot('paste_menu')
+         except Exception:
+             pass
+-        raise RuntimeError('Could not find Paste/粘贴 in the messenger context menu')
+-    if popup == hwnd:
+-        _click_render_surface(hwnd, paste)
+-    else:
+-        automation._click(popup, paste, focus=False)
+-    time.sleep(1)
++        raise RuntimeError('无法在桌面通知菜单中确认粘贴选项')
++    automation._click(popup, paste)
++    automation._wait(1)
+     return True
+-
+-
+-def _left_click(hwnd, point):
+-    """Synchronously focus the composer before opening its context menu."""
+-    target = _render_surface(hwnd)
+-    local = (int(point[0]), int(point[1]))
+-    lparam = win32api.MAKELONG(*local)
+-    win32gui.SendMessage(target, win32con.WM_MOUSEMOVE, 0, lparam)
+-    win32gui.SendMessage(target, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
+-    win32gui.SendMessage(target, win32con.WM_LBUTTONUP, 0, lparam)
+-
+-
+-def _right_click(hwnd, point):
+-    target = _render_surface(hwnd)
+-    local = (int(point[0]), int(point[1]))
+-    lparam = win32api.MAKELONG(*local)
+-    # Keep this sequence synchronous so the menu exists before OCR starts.
+-    # QQ can otherwise defer queued background clicks until after the timeout.
+-    win32gui.SendMessage(target, win32con.WM_MOUSEMOVE, 0, lparam)
+-    win32gui.SendMessage(target, win32con.WM_RBUTTONDOWN, win32con.MK_RBUTTON, lparam)
+-    win32gui.SendMessage(target, win32con.WM_RBUTTONUP, 0, lparam)
+-
+-
+-def _click_render_surface(hwnd, point):
+-    """Click Chromium-rendered context menus without foreground activation."""
+-    target = _render_surface(hwnd)
+-    local = (int(point[0]), int(point[1]))
+-    lparam = win32api.MAKELONG(*local)
+-    win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, 0, lparam)
+-    win32gui.PostMessage(
+-        target, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
+-    win32gui.PostMessage(target, win32con.WM_LBUTTONUP, 0, lparam)
+ 
+ 
+ def _render_surface(hwnd):
+@@ -97,6 +55,7 @@
+     wanted = {name.casefold() for name in names}
+     deadline = time.monotonic() + timeout
+     while time.monotonic() < deadline:
++        automation._check()
+         try:
+             candidates = _tool_popups(hwnd)
+         except Exception:
+@@ -109,6 +68,9 @@
+             pass
+         candidates.append(hwnd)
+         for popup in candidates:
++            if not automation.window_belongs_to(hwnd, popup):
++                continue
++            automation._check()
+             try:
+                 frame = automation._capture(popup)
+                 automation._last_frame = frame
+@@ -120,7 +82,7 @@
+                         return popup, (x + width // 2, y + height // 2)
+             except Exception:
+                 continue
+-        time.sleep(.15)
++        automation._wait(.15)
+     return hwnd, None
+ 
+ 

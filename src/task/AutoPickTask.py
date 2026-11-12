@@ -2,6 +2,7 @@ import time
 
 from ok import Logger
 from ok import TriggerTask
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.task.AutoCombatTask import AutoCombatTask
 from src.task.BaseWWTask import BaseWWTask, f_white_color
 from src.task.task_icons import task_icon
@@ -24,14 +25,13 @@ class AutoPickTask(TriggerTask, BaseWWTask):
 
     def send_fs(self):
         self.scene.reset_abyss_start()
-        # if self.debug:
-        #     self.screenshot('pick_up', show_box=True)
-        self.send_key('f')
-        self.sleep(0.2)
-        self.send_key('f')
-        self.sleep(0.2)
-        self.send_key('f')
-        self.sleep(0.2)
+        epoch = getattr(self, '_foreground_epoch', 0)
+        for _ in range(3):
+            self.send_key('f')
+            self.sleep(.2)
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                # 周期任务下一轮会重新查白名单／黑名单，不能继续旧提示下剩余的 F。
+                raise ForegroundInputInterrupted('拾取提示已刷新，需要重新识别当前交互')
 
     def run(self):
         if not self.scene.in_team(self.in_team_and_world):
@@ -60,9 +60,6 @@ class AutoPickTask(TriggerTask, BaseWWTask):
                                    y_offset=-f.height,
                                    name='search_dialog')
 
-            text_area = dialog_search.copy(x_offset=dialog_search.width, width_offset=f.width * 6,
-                                           height_offset=0,
-                                           y_offset=0)
             dialog_3_dots = self.find_feature('dialog_3_dots', box=dialog_search,
                                               threshold=0.6)
 

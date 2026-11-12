@@ -3,6 +3,7 @@ import cv2
 from dataclasses import dataclass
 
 from ok import Logger
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.task.BaseCombatTask import BaseCombatTask, CharRevivedException
 from src.task.BaseWWTask import TEAM_SCREEN_FEATURES
 from src.task.WWOneTimeTask import WWOneTimeTask
@@ -45,32 +46,44 @@ class NightmareNestTask(WWOneTimeTask, BaseCombatTask):
                                              'options': ['Nightmare Purification', 'Tacet Discord Nest']}
 
     def run(self):
-        self._capture_mode = False
-        self._capture_success = False
-        self._unreachable_nests.clear()
-        self._nest_deaths.clear()
-        WWOneTimeTask.run(self)
-        self.ensure_main(time_out=30)
-        self._init_queue()
-        self.log_info(self.tr('opened gray_book_boss'))
-        while nest := self.get_nest_to_go():
-            self.combat_nest(nest)
-        self.ensure_main(time_out=30)
+        return self._start_nest_run(capture=False)
 
     def run_capture_mode(self):
-        self._capture_mode = True
+        return self._start_nest_run(capture=True)
+
+    def _start_nest_run(self, capture):
+        self._capture_mode = capture
         self._capture_success = False
         self._unreachable_nests.clear()
         self._nest_deaths.clear()
+        self._nest_phase = 'prepare'
         WWOneTimeTask.run(self)
-        self.ensure_main(time_out=30)
-        self._init_queue()
-        self.log_info(self.tr('opened gray_book_boss'))
-        while nest := self.get_nest_to_go():
-            self.combat_nest(nest)
-            if self._capture_success:
-                break
-        self.ensure_main(time_out=30)
+        return self._continue_nest_run()
+
+    def resume_after_foreground(self):
+        if not getattr(self, '_nest_phase', None):
+            return super().resume_after_foreground()
+        return self._continue_nest_run()
+
+    def _continue_nest_run(self):
+        while self._nest_phase != 'completed':
+            try:
+                if self._nest_phase == 'prepare':
+                    self.ensure_main(time_out=30)
+                    self._init_queue()
+                    self._nest_phase = 'next'
+                if self._nest_phase == 'next':
+                    self._current_nest = self.get_nest_to_go()
+                    self._nest_phase = 'nest' if self._current_nest else 'leave'
+                if self._nest_phase == 'nest':
+                    self.combat_nest(self._current_nest)
+                    self._nest_phase = 'leave' if self._capture_mode and self._capture_success else 'next'
+                if self._nest_phase == 'leave':
+                    self.ensure_main(time_out=30)
+                    self._nest_phase = 'completed'
+            except ForegroundInputInterrupted:
+                # 保留队列和已经完成的聚落，不把失焦记成死亡或不可达。
+                self.wait_foreground_frame()
 
     def on_combat_check(self):
         if self._capture_mode:
@@ -88,27 +101,76 @@ class NightmareNestTask(WWOneTimeTask, BaseCombatTask):
 
     def combat_nest(self, nest):
         target_box = nest.box if isinstance(nest, NestTarget) else nest
-        self.click(target_box, after_sleep=2)
-        feature = self.wait_feature(['fast_travel_custom', 'gray_teleport', 'remove_custom', *TEAM_SCREEN_FEATURES],
-                                    time_out=10, settle_time=0.5, raise_if_not_found=True)
-        is_team = feature.name in TEAM_SCREEN_FEATURES
-        if is_team:
-            self.click_team_challenge()
-            self.wait_in_team_and_world(time_out=120)
-        else:
-            if not self._travel_to_nest_or_skip(nest):
-                return
-            self.sleep(1)
-            while self.find_f_with_text():
-                self.send_key('f', after_sleep=1)
-                self.wait_in_team_and_world(time_out=40, raise_if_not_found=False)
-            self.sleep(2)
-            self.run_until(self.in_combat, 'w', time_out=10, running=False, target=True)
+        phase = 'select'
+        recovering = False
+        is_team = False
         wait_combat_time = 10
         while True:
+            if phase == 'completed':
+                return
             try:
-                need_find = self.combat_once(wait_combat_time=wait_combat_time, target=True,
-                                             raise_if_not_found=False)
+                if recovering and phase in ('select', 'feature'):
+                    if self.in_team_and_world():
+                        is_team = bool(self.in_realm())
+                        phase = 'combat'
+                    elif feature := self.find_one([*TRAVEL_FEATURES, *TEAM_SCREEN_FEATURES]):
+                        is_team = feature.name in TEAM_SCREEN_FEATURES
+                        phase = 'enter'
+                    else:
+                        # 列表被用户滚动或目标已完成，旧行坐标不能继续使用。
+                        fresh = self.get_nest_to_go()
+                        if not fresh or (isinstance(nest, NestTarget) and fresh.cache_key != nest.cache_key):
+                            return
+                        nest = fresh
+                        target_box = fresh.box
+                        phase = 'select'
+                if phase == 'select':
+                    self.click(target_box, after_sleep=2)
+                    phase = 'feature'
+                if phase == 'feature':
+                    feature = self.wait_feature([*TRAVEL_FEATURES, *TEAM_SCREEN_FEATURES], time_out=10,
+                                                settle_time=.5, raise_if_not_found=True)
+                    is_team = feature.name in TEAM_SCREEN_FEATURES
+                    phase = 'enter'
+                if phase == 'enter':
+                    if is_team:
+                        self.click_team_challenge()
+                    elif not self._travel_to_nest_or_skip(nest):
+                        return
+                    phase = 'approach'
+                if phase == 'approach':
+                    self.wait_in_team_and_world(time_out=120)
+                    if not is_team:
+                        while self.find_f_with_text():
+                            self.pick_f(handle_claim=False)
+                            self.wait_in_team_and_world(time_out=40, raise_if_not_found=False)
+                        self.sleep(2)
+                        self.run_until(self.in_combat, 'w', time_out=10, running=False, target=True)
+                    phase = 'combat'
+                if phase == 'combat':
+                    need_find = self.combat_once(wait_combat_time=wait_combat_time, target=True,
+                                                 raise_if_not_found=False)
+                    phase = 'pickup'
+                if phase == 'pickup':
+                    if not (self._capture_mode and (self._capture_success
+                            or self.wait_until(self.has_echo_notification, time_out=3))):
+                        self._capture_success = self._pick_nest_echo(nest, need_find, is_team)
+                    phase = 'recheck'
+                if phase == 'recheck':
+                    if self._should_continue_combat_after_pickup():
+                        self.log_info(self.tr('nightmare nest: combat detected after pickup'))
+                        wait_combat_time = 1
+                        phase = 'combat'
+                        continue
+                    phase = 'leave'
+                if is_team:
+                    self.esc_world_confirm()
+                phase = 'completed'
+                self.sleep(1)
+                return
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                recovering = True
             except CharRevivedException:
                 if isinstance(nest, NestTarget):
                     deaths = self._nest_deaths.get(nest.cache_key, 0) + 1
@@ -120,70 +182,61 @@ class NightmareNestTask(WWOneTimeTask, BaseCombatTask):
                         return
                 self.log_info(self.tr('nightmare nest: death recovered, re-enter from F2 book'))
                 return
-            captured_early = False
-            if self._capture_mode:
-                if self._capture_success or self.wait_until(self.has_echo_notification, time_out=3):
-                    self.log_info(self.tr('Captured echo during combat, skipping search.'))
-                    captured_early = True
-            if not captured_early:
-                self.sleep(3)
-                if need_find and not self.walk_find_echo(time_out=5, backward_time=2.5):
-                    dropped = self.yolo_find_echo(turn=True, use_color=False, time_out=30)[0]
-                    logger.info(f'farm echo yolo find {dropped}')
-                    if not dropped and not is_team:
-                        # 保底：没有收取到声骸时，重新打开图鉴传送回当前聚落（传送点面朝金色声骸群），再搜索一次
-                        self.log_info(self.tr('no echo collected, re-teleport to current nest as fallback'))
-                        self.ensure_main(time_out=30)
-                        self.openF2Book("gray_book_boss")
-                        getattr(self, self._nest_tab_of_current_nest)()
-                        self.sleep(1)
-                        self.click(target_box, after_sleep=2)
-                        if self.wait_feature(TRAVEL_FEATURES, time_out=5, settle_time=0.5,
-                                            raise_if_not_found=False) and self._travel_to_nest_or_skip(nest):
-                            self.sleep(2)
-                            self.run_until(lambda: False, 'w', time_out=2, running=True)
-                            if not self.walk_find_echo(time_out=5, backward_time=2.5):
-                                dropped = self.yolo_find_echo(turn=True, use_color=False, time_out=30)[0]
-                                logger.info(f'farm echo yolo find after re-teleport {dropped}')
-                            else:
-                                dropped = True
-                                self.log_info(self.tr('farm echo walk find true after re-teleport'))
-                else:
-                    dropped = True
-                    self.log_info(self.tr('farm echo walk find true'))
-                self._capture_success = dropped
-            if not self._should_continue_combat_after_pickup():
-                break
-            self.log_info(self.tr('nightmare nest: combat detected after pickup'))
-            wait_combat_time = 1
-        # 与刷全部一致：退本后再结束 combat_nest，避免还在巢穴内回 Daily/开书
-        if is_team:
-            self.esc_world_confirm()
+
+    def _pick_nest_echo(self, nest, need_find, is_team):
+        self.sleep(3)
+        if not need_find or self.walk_find_echo(time_out=5, backward_time=2.5):
+            self.log_info(self.tr('farm echo walk find true'))
+            return True
+        dropped = self.yolo_find_echo(turn=True, use_color=False, time_out=30)[0]
+        if dropped or is_team:
+            return dropped
+        self.log_info(self.tr('no echo collected, re-teleport to current nest as fallback'))
+        self.ensure_main(time_out=30)
+        self.openF2Book('gray_book_boss')
+        getattr(self, self._nest_tab_of_current_nest)()
         self.sleep(1)
+        fresh = self._refresh_nest_target(nest)
+        if not fresh:
+            return False
+        self.click(fresh.box, after_sleep=2)
+        if (self.wait_feature(TRAVEL_FEATURES, time_out=5, settle_time=.5, raise_if_not_found=False)
+                and self._travel_to_nest_or_skip(fresh)):
+            self.sleep(2)
+            self.run_until(lambda: False, 'w', time_out=2, running=True)
+            return bool(self.walk_find_echo(time_out=5, backward_time=2.5)
+                        or self.yolo_find_echo(turn=True, use_color=False, time_out=30)[0])
+        return False
 
     def _should_continue_combat_after_pickup(self):
         return not self._capture_mode and self.wait_combat(
             target=True, time_out=3, raise_if_not_found=False)
 
     def _travel_to_nest_or_skip(self, nest):
-        travel = self.wait_until(self._find_travel_button, raise_if_not_found=False, time_out=1)
-        if travel:
-            self.click(travel, after_sleep=1)
-            if confirm := self._find_first_feature(CONFIRM_FEATURES, threshold=0.6):
-                self.click(confirm, after_sleep=1)
-
-        button_still_visible = travel and self.find_one(travel.name, threshold=0.7)
-        if travel and not button_still_visible and self.wait_in_team_and_world(
-                time_out=120, raise_if_not_found=False):
-            return True
-
-        if isinstance(nest, NestTarget):
-            self._unreachable_nests.add(nest.cache_key)
-            self.log_info(self.tr('nightmare nest unreachable, skip this run: {cache_key}').format(cache_key=nest.cache_key))
-        else:
-            self.log_info(self.tr('nightmare nest unreachable, skip this run'))
-        self.back(after_sleep=1)
-        return False
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world():
+                    return True
+                travel = self.wait_until(self._find_travel_button, raise_if_not_found=False, time_out=1)
+                if travel:
+                    self.click(travel, after_sleep=1)
+                if confirm := self._find_first_feature(CONFIRM_FEATURES, threshold=.6):
+                    self.click(confirm, after_sleep=1)
+                button_still_visible = travel and self.find_one(travel.name, threshold=.7)
+                if travel and not button_still_visible and self.wait_in_team_and_world(
+                        time_out=120, raise_if_not_found=False):
+                    return True
+                self.back(after_sleep=1)
+                if isinstance(nest, NestTarget):
+                    self._unreachable_nests.add(nest.cache_key)
+                    self.log_info(self.tr('nightmare nest unreachable, skip this run: {cache_key}').format(cache_key=nest.cache_key))
+                else:
+                    self.log_info(self.tr('nightmare nest unreachable, skip this run'))
+                return False
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                recovering = True
 
     def _find_travel_button(self):
         return self._find_first_feature(TRAVEL_FEATURES, threshold=0.7)
@@ -255,6 +308,20 @@ class NightmareNestTask(WWOneTimeTask, BaseCombatTask):
         row_slot = round(row_y / 0.02)
         # 使用粗粒度行槽位，避免 OCR 坐标轻微抖动导致同一目标被重复点击。
         return f'{action_name}:{denominator}:{row_slot}'
+
+    def _refresh_nest_target(self, nest):
+        """保底收取仍允许回到已完成聚落，但必须从当前列表重新定位同一行。"""
+        if not isinstance(nest, NestTarget):
+            return self.find_nest()
+        for box in self.ocr(.35, .25, 1, .96, match=self.count_re):
+            for match in re.finditer(self.count_re, box.name):
+                if self._make_nest_cache_key(box, match.group(2)) == nest.cache_key:
+                    fresh = box.copy()
+                    fresh.x = self.width_of_screen(.9)
+                    fresh.y -= fresh.height * .9
+                    fresh.height = fresh.width = 1
+                    return NestTarget(fresh, nest.cache_key)
+        return None
 
 
 def convert_image_to_negative(img):

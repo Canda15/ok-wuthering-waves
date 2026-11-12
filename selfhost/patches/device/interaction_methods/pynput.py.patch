@@ -1,0 +1,322 @@
+--- a/device/interaction_methods/pynput.py
++++ b/device/interaction_methods/pynput.py
+@@ -1,211 +1,149 @@
++"""公共任务坐标到共享前台系统输入的薄适配。"""
++
++from dataclasses import replace
+ import time
++
++from pynput.mouse import Button
+ 
+ from ok.device.capture_methods.base import BaseCaptureMethod
+ from ok.device.interaction_methods.base import BaseInteraction
+-from ok.device.interaction_methods.keys import is_mouse_button, get_mouse_button, XBUTTON1
+-from ok.util.logger import Logger
+-from ok.util.process import is_admin
++from ok.device.interaction_methods.foreground_input import (
++    ForegroundInputInterrupted, KEY_ALIASES, get_shared_foreground_input,
++)
++from ok.task.exceptions import TaskDisabledException
+ 
+-logger = Logger.get_logger(__name__)
+ 
+ class PynputInteraction(BaseInteraction):
+-    KEY_MAP = {
+-        'lshift': 'shift_l',
+-        'rshift': 'shift_r',
+-        'lctrl': 'ctrl_l',
+-        'rctrl': 'ctrl_r',
+-        'lalt': 'alt_l',
+-        'ralt': 'alt_r',
+-        'lcontrol': 'ctrl_l',
+-        'rcontrol': 'ctrl_r',
+-        'return': 'enter',
+-        'pageup': 'page_up',
+-        'pagedown': 'page_down',
+-        'capslock': 'caps_lock',
+-        'numlock': 'num_lock',
+-        'scrolllock': 'scroll_lock',
+-        'printscreen': 'print_screen',
+-        'windows': 'cmd',
+-        'win': 'cmd',
+-        'command': 'cmd',
+-        'meta': 'cmd'
+-    }
++    KEY_MAP = KEY_ALIASES
++
+     def __init__(self, capture: BaseCaptureMethod, hwnd_window):
+         super().__init__(capture)
+         self.hwnd_window = hwnd_window
+-        self.check_clickable = True
+-        if not is_admin():
+-            logger.error(f"You must be an admin to use PynputInteraction")
++        self._input = get_shared_foreground_input().session(
++            ('game', id(self)), self._target, self._check_cancel)
++
++    def _target(self):
++        target = self.hwnd_window.foreground_target
++        return replace(target, generation=(id(self.capture), target.generation))
++
++    @property
++    def check_clickable(self):
++        return True
++
++    @check_clickable.setter
++    def check_clickable(self, value):
++        if not value:
++            raise ValueError('本应用前台输入不能关闭焦点检查')
++
++    def _check_cancel(self):
++        exit_event = getattr(self.hwnd_window, 'app_exit_event', None)
++        stop_event = getattr(self.hwnd_window, 'stop_event', None)
++        if (exit_event is not None and exit_event.is_set()) or (stop_event is not None and stop_event.is_set()):
++            raise TaskDisabledException()
++        manager = getattr(self.hwnd_window, 'device_manager', None)
++        executor = getattr(manager, 'executor', None)
++        if executor is not None:
++            executor.check_input_cancelled()
+ 
+     def clickable(self):
+-        if self.check_clickable:
+-            return self.hwnd_window.is_foreground()
+-        else:
+-            return True
++        return self._input.is_foreground()
+ 
+-    def _parse_key(self, key):
+-        from pynput import keyboard
+-        if not isinstance(key, str):
+-            return key
+-        key_lower = key.lower()
+-        target_name = self.KEY_MAP.get(key_lower, key_lower)
++    @property
++    def target_generation(self):
++        return self._input.target().generation
++
++    @property
++    def needs_refresh(self):
++        return self._input._interrupted is not None or self._input._expected != self._input.target()
++
++    def refresh_target(self, force=False):
++        self.hwnd_window.do_update_window_size()
++        if not self.clickable():
++            return False
++        if force or self.needs_refresh:
++            self._input.activate()
++            self._input.acknowledge()
++        return True
++
++    def prepare_foreground(self, request_focus=False, time_out=5, cancel_check=None):
++        # GUI 准备与通知交接串行，绑定准备也不能在通知会话中途抢窗口。
++        deadline = time.monotonic() + max(0, time_out)
++        lock = self._input.core._ownership_lock
++        while True:
++            if self.hwnd_window.app_exit_event.is_set() or cancel_check is not None and cancel_check():
++                raise TaskDisabledException()
++            remaining = max(0, deadline - time.monotonic())
++            if lock.acquire(timeout=min(0.05, remaining)):
++                break
++            if remaining <= 0:
++                return False
+         try:
+-            return keyboard.Key[target_name]
+-        except KeyError:
+-            return key
++            self._input.activate()
++            self.hwnd_window.do_update_window_size()
++            remaining = max(0, deadline - time.monotonic())
++            if request_focus and not self.hwnd_window.bring_to_front(timeout=remaining, cancel_check=cancel_check):
++                return False
++            return self.refresh_target(force=True)
++        finally:
++            lock.release()
+ 
+-    def _key_controller(self, key):
+-        if is_mouse_button(key):
+-            from pynput import mouse
+-            return mouse.Controller(), self.get_mouse_button(key)
+-        from pynput import keyboard
+-        return keyboard.Controller(), self._parse_key(str(key))
++    def _point(self, x, y):
++        if x == -1 and y == -1:
++            return None, None
++        return self.capture.get_abs_cords(x, y)
+ 
+     def send_key(self, key, down_time=0.01):
+-        if not self.clickable():
+-            logger.error(f"can't click on {key}, because capture is not clickable")
+-            return
+-
+-        controller, parsed_key = self._key_controller(key)
+-        controller.press(parsed_key)
+-        time.sleep(down_time)
+-        controller.release(parsed_key)
++        return self._input.send_key(key, down_time)
+ 
+     def send_key_down(self, key):
+-        if not self.clickable():
+-            logger.error(f"can't click on {key}, because capture is not clickable")
+-            return
+-
+-        controller, parsed_key = self._key_controller(key)
+-        controller.press(parsed_key)
++        return self._input.key_down(key)
+ 
+     def send_key_up(self, key):
+-        if not self.clickable():
+-            logger.error(f"can't click on {key}, because capture is not clickable")
+-            return
+-
+-        controller, parsed_key = self._key_controller(key)
+-        controller.release(parsed_key)
++        return self._input.key_up(key)
+ 
+     def scroll(self, x, y, scroll_amount):
+-        from pynput import mouse
+-        if scroll_amount < 0:
+-            sign = -1
+-        elif scroll_amount > 0:
+-            sign = 1
+-        else:
+-            sign = 0
+-        logger.debug(f'pynput do_scroll {x}, {y}, {scroll_amount}')
+-        self.move(x, y)
+-        time.sleep(0.001)
+-
+-        controller = mouse.Controller()
+-        for i in range(abs(scroll_amount)):
+-            controller.scroll(0, sign)
+-            time.sleep(0.001)
+-        time.sleep(0.02)
++        abs_x, abs_y = self.capture.get_abs_cords(x, y)
++        return self._input.scroll(scroll_amount, x=abs_x, y=abs_y)
+ 
+     def move(self, x, y):
+-        from pynput import mouse
+-        if not self.clickable():
+-            return
+-
+-        abs_x, abs_y = self.capture.get_abs_cords(x, y)
+-        controller = mouse.Controller()
+-        controller.position = (abs_x, abs_y)
++        return self._input.move(*self.capture.get_abs_cords(x, y))
+ 
+     def swipe(self, x1, y1, x2, y2, duration, settle_time=0):
+-        from pynput import mouse
+         x1, y1 = self.capture.get_abs_cords(x1, y1)
+         x2, y2 = self.capture.get_abs_cords(x2, y2)
++        # BaseTask 保留既有毫秒适配签名，此处仅转换一次为核心的秒。
++        return self._input.swipe(x1, y1, x2, y2, duration / 1000, settle_time=settle_time)
+ 
+-        controller = mouse.Controller()
+-        controller.position = (x1, y1)
+-        time.sleep(0.1)
++    def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=False, key='left'):
++        super().click(x, y, name=name)
++        return self._input.click(*self._point(x, y), key=key, down_time=down_time, move_back=move_back)
+ 
+-        controller.press(mouse.Button.left)
+-
+-        dx = x2 - x1
+-        dy = y2 - y1
+-
+-        steps = int(duration / 100)
+-        if steps <= 0:
+-            steps = 1
+-
+-        step_dx = dx / steps
+-        step_dy = dy / steps
+-
+-        for i in range(steps):
+-            controller.position = (x1 + int(i * step_dx), y1 + int(i * step_dy))
+-            time.sleep(0.01)
+-        controller.position = (x2, y2)
+-
+-        controller.release(mouse.Button.left)
+-
+-    def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=False, key="left"):
+-        from pynput import mouse
+-        super().click(x, y, name=name)
+-        if not self.clickable():
+-            logger.info(f"window in background, not clickable")
+-            return
+-
+-        controller = mouse.Controller()
+-        current_pos = None
+-        if move_back:
+-            current_pos = controller.position
+-
+-        if x != -1 and y != -1:
+-            abs_x, abs_y = self.capture.get_abs_cords(x, y)
+-            logger.info(f"left_click {abs_x, abs_y}")
+-            controller.position = (abs_x, abs_y)
+-            time.sleep(0.02)
+-
++    def mouse_down(self, x=-1, y=-1, name=None, key='left'):
+         button = self.get_mouse_button(key)
+-        controller.press(button)
+-        time.sleep(down_time)
+-        controller.release(button)
+-
+-        if current_pos:
+-            controller.position = current_pos
+-
+-    def mouse_down(self, x=-1, y=-1, name=None, key="left"):
+-        from pynput import mouse
+-        if not self.clickable():
+-            logger.info(f"window in background, not clickable")
+-            return
+-
+-        controller = mouse.Controller()
+-        if x != -1 and y != -1:
+-            abs_x, abs_y = self.capture.get_abs_cords(x, y)
+-            logger.info(f"mouse_down {abs_x, abs_y}")
+-            controller.position = (abs_x, abs_y)
+-            time.sleep(0.02)
+-
+-        button = self.get_mouse_button(key)
+-        controller.press(button)
++        abs_x, abs_y = self._point(x, y)
++        if abs_x is not None:
++            self._input.move(abs_x, abs_y)
++        return self._input.key_down(button)
+ 
+     def get_mouse_button(self, key):
+-        from pynput import mouse
+-        if is_mouse_button(key):
+-            return mouse.Button.x1 if get_mouse_button(key) == XBUTTON1 else mouse.Button.x2
+-        if key == "right":
+-            return mouse.Button.right
+-        if key == "middle":
+-            return mouse.Button.middle
+-        return mouse.Button.left
++        return {1: Button.left, 2: Button.right, 3: Button.middle,
++                4: Button.x1, 5: Button.x2}[self._input.core._button(key).code]
+ 
+-    def mouse_up(self, key="left"):
+-        from pynput import mouse
+-        if not self.clickable():
+-            logger.info(f"window in background, not clickable")
+-            return
++    def mouse_up(self, key='left'):
++        return self._input.key_up(self.get_mouse_button(key))
+ 
+-        controller = mouse.Controller()
+-        button = self.get_mouse_button(key)
+-        controller.release(button)
++    def input_text(self, text):
++        return self._input.input_text(text)
++
++    def release_all(self):
++        return self._input.release_all()
+ 
+     def should_capture(self):
+         return self.clickable()
+ 
+     def on_run(self):
+-        self.hwnd_window.bring_to_front()
++        if not self.prepare_foreground(request_focus=True):
++            raise ForegroundInputInterrupted('无法取得目标前台，请等待并重新识别')
++
++    def on_destroy(self):
++        self.release_all()

@@ -1,8 +1,8 @@
 import time
 
 from ok import TriggerTask, Logger, TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.char.CharFactory import char_names
-from src.scene.WWScene import WWScene
 from src.task.BaseCombatTask import BaseCombatTask, NotInCombatException, CharDeadException
 from src.task.task_icons import task_icon
 
@@ -24,13 +24,11 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
         self.default_config.update({
             'Auto Target': True,
             'Use Liberation': True,
-            'Check Levitator': True,
             'Switch to Healer before and after Combat': True,
         })
         self.config_description = {
             'Auto Target': 'Turn off to enable auto combat only when manually target enemy using middle click',
             'Use Liberation': 'Do not use Liberation in Open World to Save Time',
-            'Check Levitator': 'Toggle the levitator and verify if the character is floating',
             'Switch to Healer before and after Combat': 'Better Chance to Keep Character Alive',
         }
         self.op_index = 0
@@ -79,13 +77,26 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
             self.use_liberation = True
         combat_start = time.time()
         switched_to_healer = False
-        while self.in_combat():
-            ret = True
+        while True:
             try:
+                if not self.in_combat():
+                    break
+                ret = True
                 if not switched_to_healer:
                     self.switch_healer()
                     switched_to_healer = True
-                self.get_current_char().perform()
+                current_char = self.get_current_char()
+                if current_char is None:
+                    self.load_chars()
+                    current_char = self.get_current_char()
+                if current_char is None:
+                    self.next_frame()
+                    continue
+                current_char.perform()
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                self.on_foreground_resume()
+                switched_to_healer = False
             except CharDeadException:
                 self.log_error(self.tr('Characters dead'), notify=True)
                 break

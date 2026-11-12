@@ -1,5 +1,10 @@
 import unittest
+from unittest.mock import Mock
+import re
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+from ok.task.exceptions import WaitFailedException
+from src.Labels import Labels
 from src.task.BaseWWTask import BaseWWTask, LOGIN_CLICK_SETTLE_TIME, LOGIN_TEXTS
 
 
@@ -65,6 +70,60 @@ class FakeLoginTask:
 
 
 class TestWaitLogin(unittest.TestCase):
+
+    def test_authentication_progress_checks_account_before_agree_or_enter_fallback(self):
+        for step in ('agree', 'enter_fallback'):
+            with self.subTest(step=step):
+                texts = [TextBox('同意'), TextBox('隐私政策')] if step == 'agree' else [TextBox('账号B')]
+                task = FakeLoginTask(frames=[texts])
+                task._login_account_guard = Mock(side_effect=WaitFailedException('账号确认失败'))
+                task.click_relative = Mock()
+                task.find_one = lambda name, **kwargs: object() if (
+                    step == 'enter_fallback' and name == Labels.switch_account) else None
+
+                def find_boxes(values, match=None, **kwargs):
+                    if match is None:
+                        return values
+                    if isinstance(match, str):
+                        return [box for box in values if match in box.name]
+                    if isinstance(match, re.Pattern):
+                        return [box for box in values if match.search(box.name)]
+                    return None
+
+                task.find_boxes = find_boxes
+                with self.assertRaises(WaitFailedException):
+                    BaseWWTask.wait_login(task)
+                task._login_account_guard.assert_called_once_with(require_visible=False)
+                self.assertEqual(task.clicked, [])
+                task.click_relative.assert_not_called()
+
+    def test_monthly_card_focus_after_accepted_click_checks_world_without_replay(self):
+        task = BaseWWTask.__new__(BaseWWTask)
+        world = [False]
+        task.find_monthly_card = Mock(return_value=object())
+        task.in_team_and_world = lambda: world[0]
+        task.sleep = Mock()
+        task.wait_foreground_frame = Mock()
+        task.set_check_monthly_card = Mock()
+
+        def accept(*args, **kwargs):
+            world[0] = True
+            raise ForegroundInputInterrupted()
+
+        task.click_relative = Mock(side_effect=accept)
+        self.assertTrue(task.handle_monthly_card())
+        task.click_relative.assert_called_once()
+        task.set_check_monthly_card.assert_called_once_with(next_day=True)
+
+    def test_monthly_card_system_input_failure_is_not_retried(self):
+        task = BaseWWTask.__new__(BaseWWTask)
+        task.find_monthly_card = Mock(return_value=object())
+        task.click_relative = Mock(side_effect=ForegroundInputError())
+        task.wait_foreground_frame = Mock()
+        with self.assertRaises(ForegroundInputError):
+            task.handle_monthly_card()
+        task.click_relative.assert_called_once()
+        task.wait_foreground_frame.assert_not_called()
 
     def test_transient_login_button_is_not_clicked(self):
         # Global server auto login: the login button disappears by itself,

@@ -1,13 +1,11 @@
 import re
 import time
 
-import win32api
-
-from ok import find_boxes_by_name, Logger, calculate_color_percentage, TaskDisabledException
-from ok import find_color_rectangles, get_mask_in_color_range, is_pure_black
+from ok import Logger, TaskDisabledException
+from ok import find_color_rectangles, get_mask_in_color_range
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src import text_white_color
 from src.Labels import Labels
-from src.char.Roccia import Roccia
 from src.task.BaseWWTask import BaseWWTask
 
 logger = Logger.get_logger(__name__)
@@ -158,7 +156,7 @@ class CombatCheck(BaseWWTask):
             has_health = self.check_health_bar()
             retarget_timeout = 30 if has_health else self.target_enemy_time_out
             if self.target_enemy(wait=True, time_out=retarget_timeout, check_health=has_health):
-                logger.debug(f'retarget enemy succeeded')
+                logger.debug('retarget enemy succeeded')
                 return self.scene.set_in_combat()
             if self.should_check_monthly_card() and self.handle_monthly_card():
                 return self.scene.set_in_combat()
@@ -191,54 +189,12 @@ class CombatCheck(BaseWWTask):
             return self.do_check_in_combat(target)
         except TaskDisabledException:
             raise
+        except (ForegroundInputError, ForegroundInputInterrupted):
+            raise
         except Exception as e:
-            logger.error(f'do_check_in_combat:', e)
+            logger.error('do_check_in_combat:', e)
         finally:
             self.in_sleep_check = False
-
-    def ensure_levitator(self):  # 目前未使用
-        if not self.config.get('Check Levitator', True):
-            return True
-        if levi := self.find_one('edge_levitator', threshold=0.6):
-            self.log_debug('edge levitator found {}'.format(levi))
-            return True
-        if self.has_char(Roccia):
-            if self.find_one('levitator_roccia', threshold=0.6):
-                return True
-        if self.is_open_world_auto_combat():
-            return False
-        start = time.time()
-        self.sleep(0.2)
-        if levi := self.find_one('edge_levitator', threshold=0.6):
-            self.log_debug('recheck edge levitator found {}'.format(levi))
-            return True
-        while time.time() - start < 1 and self.in_team()[0]:
-            self.send_key_down(self.key_config.get('Wheel Key'))
-            self.sleep(0.4)
-        if self.in_team()[0]:
-            self.log_info(self.tr('can not open wheel'))
-            self.send_key_up(self.key_config.get('Wheel Key'))
-            self.sleep(0.1)
-            return False
-        levitator = self.wait_feature('wheel_levitator', threshold=0.65, box=self.box_of_screen(0.27, 0.16, 0.68, 0.76))
-        self.sleep(0.1)
-        if not levitator:
-            self.send_key_up(self.key_config.get('Wheel Key'))
-            raise Exception('no levitator tool in the tab wheel!')
-        old = win32api.GetCursorPos()
-        self.move(levitator.x, levitator.y)
-        abs_pos = self.executor.interaction.capture.get_abs_cords(levitator.x, levitator.y)
-        win32api.SetCursorPos(abs_pos)
-        self.sleep(0.1)
-        self.send_key_up(self.key_config.get('Wheel Key'))
-        self.sleep(0.2)
-        win32api.SetCursorPos(old)
-        if not self.wait_feature('edge_levitator', threshold=0.6, time_out=1):
-            if self.has_char(Roccia):
-                if self.find_one('levitator_roccia', threshold=0.6):
-                    return True
-        self.log_debug(f'ensuring leviator succees {levitator}')
-        return self.target_enemy()
 
     def log_time(self, start, name):
         logger.debug(f'check cost {name} {time.time() - start}')
@@ -289,7 +245,7 @@ class CombatCheck(BaseWWTask):
                                                threshold=threshold)
             if best and self.esc_count == 0:
                 if double_check:
-                    logger.error(f'try fix bear echo')
+                    logger.error('try fix bear echo')
                     self.send_key('esc', after_sleep=2)
                     self.send_key('esc', after_sleep=1.5)
                     self.esc_count = 1
@@ -366,7 +322,7 @@ class CombatCheck(BaseWWTask):
                 mask, area = get_mask_in_color_range(cropped,
                                                      boss_red_text_color)
                 if area / mask.shape[0] * mask.shape[1] < 0.05:
-                    logger.error(f'keep_boss_text_white cant find text with the correct color')
+                    logger.error('keep_boss_text_white cant find text with the correct color')
                     return None, 0
         return cropped, mask
 

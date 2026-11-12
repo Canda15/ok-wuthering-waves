@@ -1,3 +1,6 @@
+from ok import TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+
 from src.char.BaseChar import BaseChar, SwitchPriority, forte_white_color
 
 class Linnai(BaseChar):
@@ -40,7 +43,7 @@ class Linnai(BaseChar):
             
     def perform_under_intro(self):
         if not self.wait_for_accelerate_ready():
-            self.logger.debug(f'Linnai fails entering accelerate mode!')
+            self.logger.debug('Linnai fails entering accelerate mode!')
             return False
         self.task.wait_until(lambda: self.is_color_full() or self.is_con_full(), post_action=self.click,
                                      time_out=1)
@@ -89,6 +92,8 @@ class Linnai(BaseChar):
             box = self.task.get_box_by_name(box_name)
             return self.task.find_best_match_in_box(box, list(self.get_target_names()),
                                                     threshold=self.RES_CHECK_THRESHOLD)
+        except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+            raise
         except Exception as e:
             self.logger.debug(f'Linnai check res skipped {box_name}: {e}')
             return None
@@ -103,6 +108,8 @@ class Linnai(BaseChar):
         if not best:
             try:
                 best = self.task.find_one('target_box_short', threshold=self.RES_CHECK_THRESHOLD)
+            except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+                raise
             except Exception as e:
                 self.logger.debug(f'Linnai check res skipped target_box_short: {e}')
                 best = None

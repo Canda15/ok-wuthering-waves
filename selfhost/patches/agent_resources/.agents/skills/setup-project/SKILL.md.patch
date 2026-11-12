@@ -1,0 +1,38 @@
+--- a/agent_resources/.agents/skills/setup-project/SKILL.md
++++ b/agent_resources/.agents/skills/setup-project/SKILL.md
+@@ -15,7 +15,7 @@
+ - For Windows, which installed executable or running window is the target? Inspect running processes and windows when possible; ask for the executable path or window choice when the target cannot be identified unambiguously. Determine whether the launcher should open the target or attach to an already-running instance. Automatic startup requires its actual launch path or command.
+ - For Android, which device or emulator and which app should be targeted? Inspect available devices and the installed library's configuration before asking for identifiers the agent can discover itself. Ask the user to choose when multiple targets match.
+ 
+-Use a sensible project folder name derived from the app unless the user supplies one. Use the current workspace as the parent unless another location was requested. Ask about additional requirements, such as background operation, only when they affect the requested setup. Select and verify capture/input backends using the installed APIs; the user need not know their technical names.
++Use a sensible project folder name derived from the app unless the user supplies one. Use the current workspace as the parent unless another location was requested. 本应用 Windows 采用唯一前台系统键鼠；说明它会占用真实键鼠，失焦时释放并等待，回到游戏后刷新画面自动继续。使用现有 API 验证截图与输入，不要求用户选择已撤出的后台后端。
+ 
+ Wait for essential target details before writing target-dependent configuration. Do not use example executable names or window titles as if they were verified. If environment setup is still needed, it can proceed while the target question is pending.
+ 
+@@ -75,7 +75,7 @@
+         'exe': ['target.exe'],
+         'title': 'Target Window',
+         'capture_method': ['BitBlt'],
+-        'interaction': 'PostMessage',
++        'interaction': 'Pynput',
+         'start_exe': True,
+         'calculate_pc_exe_path': str(ROOT / 'target.exe'),
+     },
+@@ -89,7 +89,7 @@
+ }
+ ```
+ 
+-Adapt this example. BitBlt and PostMessage are initial candidates, not proof of target compatibility. Register a completed task as `['task_module', 'Task']` in `onetime_tasks`, using an import path available to both launchers.
++按实际目标调整示例。截图方式需要验证，Windows 输入固定使用 `Pynput` 前台适配，旧窗口消息名称只用于配置迁移。任务以 `['task_module', 'Task']` 注册到 `onetime_tasks`，使用两个启动器都能导入的模块路径。
+ 
+ If the task needs named template matching, add `template_matching` with
+ `'template_folder': str(ROOT / 'assets' / 'templates')` and the project's matching
+@@ -109,7 +109,7 @@
+ 
+ ## Verify against the real target
+ 
+-Start the development launcher and inspect an MCP screenshot for a complete, current target image. Test reset, left/right clicks, keys, or other required input against observable UI changes. Prioritize PostMessage, checking background operation while the target is unfocused or covered and confirming that foreground focus and the cursor remain undisturbed. Do not infer minimized-window support from those checks.
++启动开发入口，通过 MCP 确认完整且最新的目标画面；以可见界面变化验证恢复、左右键、按键和必要手势。操作前确认真实前台与屏幕坐标，验证失焦释放、可取消等待和返回前台后刷新画面自动继续。中断的长按、拖拽和部分文本不能直接重放；QQ／微信桌面通知复用同一核心，在执行器空闲或任务安全边界发送，长任务或用户失焦时允许延后。
+ 
+ If capture is cropped or stale, inspect backend behavior and DPI/coordinate scaling before changing recognition code. For a legacy application, a child-only `HIGHDPIAWARE` compatibility environment may help; apply it only when verified, rather than globally changing Windows settings.
+ 

@@ -2,6 +2,7 @@ import re
 
 
 from ok import Logger, TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src.task.BaseWWTask import number_re
 from src.task.FarmEchoTask import FarmEchoTask
 from src.task.ForgeryTask import ForgeryTask
@@ -80,64 +81,97 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
 
     def run(self):
         self.validate_additional_tasks()
-
+        self._daily_phase = 'prepare'
+        self._daily_additional_index = 0
         WWOneTimeTask.run(self)
         self.logged_in = False
-        self.ensure_main(time_out=180)
+        return self._continue_daily()
 
+    def resume_after_foreground(self):
+        if not getattr(self, '_daily_phase', None):
+            return super().resume_after_foreground()
+        return self._continue_daily()
+
+    def _continue_daily(self):
+        """阶段完成后才推进；恢复不能重新启动已完成的资源任务或附加任务。"""
         additional_tasks = self.config.get(ADDITIONAL_TASKS) or []
         condition1 = AUTO_FARM_NIGHTMARE_NEST in additional_tasks
         condition2 = self.config.get('Farm Nightmare Nest for Daily Echo')
-
-        used_stamina, daily_reward_ready = self.open_daily()
-        need_stamina = not daily_reward_ready and used_stamina < 180
-        need_nightmare = condition1 or (
-                condition2
-                and not daily_reward_ready
-                and self.config.get('Which to Farm', self.support_tasks[0]) != self.support_tasks[0]
-        )
-
-        if need_nightmare:
+        while self._daily_phase != 'completed':
             try:
-                # 劫持 NightmareNestTask.ensure_main 避免梦魇打完关书
-                self.get_task_by_class(NightmareNestTask).ensure_main = lambda *args, **kwargs: None
-
-                if condition1:
-                    self.log_debug('Auto Farm all Nightmare Nest')
-                    self.run_task_by_class(NightmareNestTask)
-                elif condition2:
-                    self.log_debug('Farm Nightmare Nest for Daily Echo')
-                    self.get_task_by_class(NightmareNestTask).run_capture_mode()
-            except TaskDisabledException:
-                raise
-            except Exception as e:
-                self.log_error(self.tr('NightmareNestTask Failed'), e)
-                self.screenshot('NightmareNestTask')
-                self.ensure_main(time_out=180)
-            finally:
-                # 还原 ensure_main，防范实例状态污染
-                self.get_task_by_class(NightmareNestTask).__dict__.pop('ensure_main', None)
-
-        if need_stamina:
-            target = self.config.get('Which to Farm', self.support_tasks[0])
-            if target == self.support_tasks[0]:
-                self.get_task_by_class(TacetTask).farm_tacet(daily=True, used_stamina=used_stamina,
-                                                             config=self.config)
-            elif target == self.support_tasks[1]:
-                self.get_task_by_class(ForgeryTask).farm_forgery(daily=True, used_stamina=used_stamina,
-                                                                 config=self.config)
-            else:
-                self.get_task_by_class(SimulationTask).farm_simulation(daily=True, used_stamina=used_stamina,
-                                                                       config=self.config)
-            self.sleep(4)
-
-        self.claim_daily()
-
-        self.claim_mail()
-        self.sleep(1)
-        self.claim_battle_pass()
-        self.run_additional_tasks()
+                if self._daily_phase == 'prepare':
+                    self.ensure_main(time_out=180)
+                    _, daily_reward_ready = self.open_daily()
+                    self._daily_need_nightmare = condition1 or (
+                        condition2 and not daily_reward_ready
+                        and self.config.get('Which to Farm', self.support_tasks[0]) != self.support_tasks[0])
+                    self._daily_phase = 'nightmare'
+                if self._daily_phase == 'nightmare':
+                    if self._daily_need_nightmare:
+                        self._farm_daily_nightmare(condition1)
+                    self._daily_phase = 'stamina'
+                if self._daily_phase == 'stamina':
+                    # 梦魇和登录期间日常进度可能变化，资源决策必须重新读取真实 UI。
+                    used_stamina, ready = self.open_daily()
+                    if not ready and used_stamina < 180:
+                        target = self.config.get('Which to Farm', self.support_tasks[0])
+                        task_class, method = {
+                            self.support_tasks[0]: (TacetTask, 'farm_tacet'),
+                            self.support_tasks[1]: (ForgeryTask, 'farm_forgery'),
+                            self.support_tasks[2]: (SimulationTask, 'farm_simulation'),
+                        }.get(target, (SimulationTask, 'farm_simulation'))
+                        farm_task = self.get_task_by_class(task_class)
+                        # 自定义入口也注册实际内层实例，使失焦恢复清到内层角色和导航缓存。
+                        with self.executor.task_context(farm_task):
+                            getattr(farm_task, method)(daily=True, used_stamina=used_stamina, config=self.config)
+                    self._daily_phase = 'daily'
+                    self.sleep(4)
+                if self._daily_phase == 'daily':
+                    self.claim_daily()
+                    self._daily_phase = 'mail'
+                if self._daily_phase == 'mail':
+                    self.claim_mail()
+                    self._daily_phase = 'battle_pass'
+                    self.sleep(1)
+                if self._daily_phase == 'battle_pass':
+                    self.claim_battle_pass()
+                    self._daily_phase = 'additional'
+                if self._daily_phase == 'additional':
+                    self.run_additional_tasks()
+                    self._daily_phase = 'completed'
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
         self.log_info(self.tr('Daily Task Completed'), notify=True)
+
+    def _farm_daily_nightmare(self, farm_all):
+        nightmare_task = self.get_task_by_class(NightmareNestTask)
+        try:
+            # 保留日常的图鉴衔接；退出时还原实例方法，避免下次独立任务沿用此覆盖。
+            nightmare_task.ensure_main = lambda *args, **kwargs: None
+            if farm_all:
+                self.log_debug('Auto Farm all Nightmare Nest')
+                self.run_task_by_class(NightmareNestTask)
+            else:
+                self.log_debug('Farm Nightmare Nest for Daily Echo')
+                with self.executor.task_context(nightmare_task):
+                    try:
+                        nightmare_task.run_capture_mode()
+                    except ForegroundInputInterrupted:
+                        while True:
+                            try:
+                                self.wait_foreground_frame()
+                                nightmare_task.resume_after_foreground()
+                                break
+                            except ForegroundInputInterrupted:
+                                continue
+        except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+            raise
+        except Exception as e:
+            self.log_error(self.tr('NightmareNestTask Failed'), e)
+            self.screenshot('NightmareNestTask')
+            self.ensure_main(time_out=180)
+        finally:
+            nightmare_task.__dict__.pop('ensure_main', None)
 
     def validate_additional_tasks(self):
         additional_tasks = self.config.get(ADDITIONAL_TASKS) or []
@@ -161,13 +195,22 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
 
     def run_additional_tasks(self):
         additional_tasks = self.config.get(ADDITIONAL_TASKS) or []
+        actions = []
         if CHECK_WEEKLY_GARDEN in additional_tasks:
-            self.check_weekly_garden()
+            actions.append(self.check_weekly_garden)
         if MERGE_ECHO_IF_DISCARDED_OVER_1000 in additional_tasks:
-            self.check_discarded_echo()
+            actions.append(self.check_discarded_echo)
         if TELEPORT_AND_FARM_4C_ECHO in additional_tasks:
-            self.log_info(self.tr('Daily task completed, start teleport to farm 4C echo'), notify=True)
-            self.run_task_by_class(FarmEchoTask)
+            actions.append(self._farm_additional_echo)
+        index = getattr(self, '_daily_additional_index', 0)
+        while index < len(actions):
+            actions[index]()
+            index += 1
+            self._daily_additional_index = index
+
+    def _farm_additional_echo(self):
+        self.log_info(self.tr('Daily task completed, start teleport to farm 4C echo'), notify=True)
+        self.run_task_by_class(FarmEchoTask)
 
     def check_weekly_garden(self):
         self.info_set('current task', 'check weekly garden')
@@ -180,7 +223,7 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
                 return
             self.log_info(self.tr('weekly garden not completed, run GardenTask'))
             self.run_task_by_class(GardenTask)
-        except TaskDisabledException:
+        except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
             raise
         except Exception as e:
             self.log_error(self.tr('GardenTask Failed'), e)
@@ -195,7 +238,7 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
         try:
             merge_echo_task.notify_if_not_enough = False
             self.run_task_by_class(MergeEchoTask)
-        except TaskDisabledException:
+        except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
             raise
         except Exception as e:
             self.log_error(self.tr('MergeEchoTask Failed'), e)
@@ -206,10 +249,13 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
 
     def claim_battle_pass(self):
         self.log_info(self.tr('battle pass'))
-        self.send_key_down('alt')
-        self.sleep(0.05)
-        self.click_relative(0.86, 0.05)
-        self.send_key_up('alt')
+        self.ensure_main()
+        try:
+            self.send_key_down('alt')
+            self.sleep(.05)
+            self.click_relative(.86, .05)
+        finally:
+            self.send_key_up('alt')
         if not self.wait_ocr(0.2, 0.13, 0.32, 0.22, match=re.compile(r'\d+'), settle_time=1, raise_if_not_found=False):
             self.log_error(self.tr('can not battle pass, maybe ended'))
         else:
@@ -230,13 +276,17 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
         if not progress:
             self.click(0.974, 0.6, after_sleep=1)
             progress = self.ocr(0.1, 0.1, 0.5, 0.75, match=re.compile(r'^(\d+)/180$'))
+        ready = self.get_total_daily_points() >= 100
         if progress:
             current = int(progress[0].name.split('/')[0])
+        elif ready:
+            current = 180
         else:
-            current = 0
+            # 已完成任务可能不再显示进度，识别缺失不能当成零再消费一遍波片。
+            self.screenshot('daily_stamina_progress_unknown')
+            raise ForegroundInputError('无法确认日常已用结晶波片，已停止资源操作')
         self.info_set('current daily progress', current)
-        return current, self.get_total_daily_points() >= 100
-        # 请注意：如果任务【累计消耗180点结晶波片】已完成，current 也可能为 0，因为翻页后也有可能识别不到已用体力。
+        return current, ready
 
     def get_total_daily_points(self):
         points_boxes = self.ocr(0.19, 0.8, 0.30, 0.93, match=number_re)
@@ -263,6 +313,7 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
 
     def claim_mail(self):
         self.info_set('current task', 'claim mail')
+        self.ensure_main()
         self.back(after_sleep=1.5)
         self.click(0.64, 0.95, after_sleep=1)
         self.click(0.14, 0.9, after_sleep=1)

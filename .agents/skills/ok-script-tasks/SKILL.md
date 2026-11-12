@@ -28,7 +28,7 @@ When more detail is needed, read:
    Prefer existing project helpers over inheriting directly from `BaseTask` when the project already has a base task class.
 2. Decide the task type:
    - Use `BaseTask` or a project one-time base for user-started workflows that should finish and disable themselves.
-   - Use `TriggerTask` for background checks that run repeatedly while enabled.
+   - 使用 `TriggerTask` 执行启用期间的周期检查；需要游戏输入时同样遵守真实前台契约。
    - Mix in feature/OCR/project helpers only when the task actually needs them.
 3. Add or update task metadata in `__init__`:
    `name`, `description`, `default_config`, `config_description`, `config_type`, `supported_languages`, icons, grouping, and scheduling flags.
@@ -54,6 +54,9 @@ Support English and Chinese in both code review and generated code.
 
 ## Essential Rules
 
+- 本项目任务输入遵循 [前台系统键鼠契约](../ok-script-develop/SKILL.md#本项目的-windows-输入契约)。使用 BaseTask 公共方法，不直接移动光标、发送窗口键鼠消息或创建局部控制器。
+- 失焦等待后使用新画面重新判断，拖拽和长按中断不续接，部分文本不自动重放；原生账号选号必须回读确认，并在登录前再次确认账号。
+- 任务保存已完成阶段和已确认的资源额度，恢复时不重跑整段 `run()`。领取结果依新 UI 确认，未知结果留图并上抛 `ForegroundInputError`；输入失败不得冒充可重试的焦点中断。
 - Always call `super().__init__(*args, **kwargs)` before setting task fields.
 - Do not bypass `Config`: set defaults in `self.default_config`; read values through `self.config.get(...)` after `after_init()` loads config.
 - For `TriggerTask`, keep `self.default_config['_enabled']` intentional and set `trigger_interval` to avoid excessive polling.

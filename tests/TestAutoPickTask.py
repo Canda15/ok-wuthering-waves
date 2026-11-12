@@ -7,6 +7,7 @@ import numpy as np
 
 from config import config
 from ok.feature.FeatureSet import FeatureSet
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.task.AutoPickTask import AutoPickTask
 
 
@@ -28,6 +29,21 @@ def make_task(frame):
 
 
 class TestAutoPickTask(unittest.TestCase):
+
+    def test_focus_resume_discards_remaining_f_presses_and_rechecks_blacklist(self):
+        frame = self.source_frame()
+        frame[449:480, 1076:1106] = 0
+        task = make_task(frame)
+        task._foreground_epoch = 0
+        task.sleep.side_effect = lambda seconds: setattr(task, '_foreground_epoch', 1)
+        with self.assertRaises(ForegroundInputInterrupted):
+            task.run()
+        task.send_key.assert_called_once_with('f')
+        task.config['Pick Up Black List'] = ['领取奖励']
+        task.find_f_with_text = Mock(return_value=True)
+        self.assertIs(task.run(), False)
+        task.send_key.assert_called_once_with('f')
+        task.find_f_with_text.assert_called_once_with(['领取奖励'])
     def source_frame(self):
         frame = cv2.imread('ok_templates/62.png')
         self.assertIsNotNone(frame)

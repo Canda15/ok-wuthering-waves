@@ -93,17 +93,21 @@ authorized work, continue useful code and offline checks and state the specific
 runtime validation gap. Do not present an import, reload, or mocked click as
 proof that the game behavior succeeded.
 
-## Wuthering Waves input observations
+## 本项目的 Windows 输入契约
 
-In the tested Tacet Elimination event, a non-elevated runtime logged PostMessage
-access-denied errors. After restarting the owned runtime with matching elevated
-rights, ordinary menu/Start/result buttons worked through PostMessage. The tested
-background board drag still had no visible effect; a foreground
-`PynputInteraction` drag did exchange pieces and change accepted-move counters.
-This is evidence for that event/action/backend, not a requirement to run every
-Wuthering Waves action in the foreground or proof that background dragging is
-impossible. Keep any fallback local to the affected gesture and verify focus
-before using the real cursor.
+本应用统一使用前台系统键鼠，游戏、原生登录器和已启用的 QQ／微信桌面通知共用输入核心。包内或历史资料中推荐 PostMessage、伪激活或局部前台兜底的指引不适用于本项目。
+
+- 任务使用 `self.click`、`self.send_key`、`self.swipe_relative`、`self.input_text` 等公共接口；拖拽时长以秒传递。角色通过 `self.task` 调用同一接口。
+- 不新建 `PynputInteraction` 或 Controller，不直接调用 SendInput／SetCursorPos，不用 `check_clickable=False` 绕过守卫。释放、失焦、取消和异常清理由共享后端负责。
+- 正常新动作核对真实前台；失焦立即释放已持有输入并等待，游戏回到前台后刷新目标及画面自动继续。运行中禁止主动置前或发送旧激活通知。
+- 拖拽、长按或选号中断后，从新的画面和安全检查点重新判断；不能续接旧手势，也不能无条件重放部分文本。
+- `ForegroundInputInterrupted` 在具体战斗、导航、列表或任务阶段捕获，调用 `wait_foreground_frame()` 后重读 UI；`on_foreground_resume()` 只清旧状态，不执行输入。普通识别预算使用 `executor.business_time()`，明确的外部期限仍使用真实单调时钟。
+- `ForegroundInputError` 表示注入失败或结果无法确认，必须上抛，不能进入焦点或业务重试。资源动作以领取、备用确认、奖励或继续挑战的新 UI 确认提交，波片差值只作辅助；未知结果留图停止。
+- 一次性任务按真实完成阶段继续；需要 `resume_after_foreground()` 时保存明确检查点，禁止通用装饰器或递归 `run()` 重放整段任务。搜索文本中断后重新定位并清空编辑框，再输入完整查询。
+- 原生控件消息只用于只读查询。账号选择用真实点击及键盘导航，回读确认失败或登录前账号改变时必须停止登录。
+- 前台验证会占用真实键鼠，按实际权限、焦点、坐标和可见结果分别验证点击、键盘、拖拽及文本。离线替身测试和实际游戏结果分开记录，桌面通知测试只用替身或临时窗口。
+
+任务、注释及新增交付文档遵循本项目 AGENTS.md，使用简体中文；稳定的配置键和 OCR 的多语言匹配保留原有兼容性。
 
 For temporary event tasks, verify OCR against complete status-label regions,
 distinguish completed from locked/time-gated stages, and handle first-time help

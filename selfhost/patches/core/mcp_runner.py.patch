@@ -1,0 +1,19 @@
+--- a/core/mcp_runner.py
++++ b/core/mcp_runner.py
+@@ -268,7 +268,7 @@
+                         if self.prepare is not None:
+                             self.prepare()
+                         task.ensure_capture()
+-                        self.executor._prepare_task_for_run(is_trigger_task=False)
++                        self.executor._prepare_task_for_run(is_trigger_task=False, request_focus=True)
+                         self._phase(run_id, 'resetting')
+                         if task.reset_to_start() is False:
+                             raise RuntimeError('reset_to_start() returned False')
+@@ -283,6 +283,7 @@
+                         self.executor.check_enabled()
+                         return None if result is None else repr(result)[:2000]
+                     finally:
++                        self.executor.release_inputs()
+                         if self.executor.current_task is task:
+                             self.executor.current_task = None
+                         if task is not None:

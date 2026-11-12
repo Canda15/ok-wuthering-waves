@@ -1,0 +1,728 @@
+"""游戏和桌面通知共用的受检前台输入及持有状态。"""
+
+import ctypes
+import logging
+import math
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from ctypes import wintypes
+
+from pynput.keyboard import Key, KeyCode
+from pynput.mouse import Button
+
+from ok.device.interaction_methods.keys import MOUSE_BUTTON_MAP
+
+logger = logging.getLogger(__name__)
+
+
+class ForegroundInputInterrupted(Exception):
+    """目标失焦或代次已变；调用方必须重新识别，不能重放旧手势。"""
+
+
+class ForegroundInputError(Exception):
+    """系统注入或清理失败，动作结果不能视为成功。"""
+
+
+@dataclass(frozen=True)
+class ForegroundTarget:
+    hwnd: int
+    generation: object = 0
+    process_id: int | None = None
+    allowed_hwnds: tuple = ()
+
+
+@dataclass(frozen=True)
+class InputEvent:
+    kind: str
+    code: int
+    flags: int = 0
+    data: int = 0
+    up: bool = False
+
+    def released(self):
+        return InputEvent(self.kind, self.code, self.flags, self.data, True)
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD),
+                ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [('wVk', wintypes.WORD), ('wScan', wintypes.WORD), ('dwFlags', wintypes.DWORD),
+                ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [('uMsg', wintypes.DWORD), ('wParamL', wintypes.WORD), ('wParamH', wintypes.WORD)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [('mi', _MOUSEINPUT), ('ki', _KEYBDINPUT), ('hi', _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ('event',)
+    _fields_ = [('type', wintypes.DWORD), ('event', _INPUTUNION)]
+
+
+class Win32InputBackend:
+    """只保留需要检查返回值的 Win32 边界，不依赖 pynput 私有后端。"""
+
+    _BUTTON_FLAGS = {1: (0x0002, 0x0004), 2: (0x0008, 0x0010), 3: (0x0020, 0x0040),
+                     4: (0x0080, 0x0100), 5: (0x0080, 0x0100)}
+
+    def __init__(self):
+        self.user32 = ctypes.WinDLL('user32', use_last_error=True)
+        self.user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+        self.user32.SendInput.restype = wintypes.UINT
+        self.user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        self.user32.SetCursorPos.restype = wintypes.BOOL
+        self.user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+        self.user32.GetCursorPos.restype = wintypes.BOOL
+        self.user32.GetForegroundWindow.restype = wintypes.HWND
+        self.user32.IsWindow.argtypes = (wintypes.HWND,)
+        self.user32.IsWindow.restype = wintypes.BOOL
+        self.user32.IsChild.argtypes = (wintypes.HWND, wintypes.HWND)
+        self.user32.IsChild.restype = wintypes.BOOL
+        self.user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+        self.user32.GetAncestor.restype = wintypes.HWND
+        self.user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+        self.user32.GetWindow.restype = wintypes.HWND
+        self.user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+        self.user32.WindowFromPoint.restype = wintypes.HWND
+        self.user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        self.user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        self.user32.GetKeyboardLayout.argtypes = (wintypes.DWORD,)
+        self.user32.GetKeyboardLayout.restype = wintypes.HANDLE
+        self.user32.MapVirtualKeyExW.argtypes = (wintypes.UINT, wintypes.UINT, wintypes.HANDLE)
+        self.user32.MapVirtualKeyExW.restype = wintypes.UINT
+        self.user32.VkKeyScanExW.argtypes = (wintypes.WCHAR, wintypes.HANDLE)
+        self.user32.VkKeyScanExW.restype = ctypes.c_short
+        self.last_error = 0
+
+    @staticmethod
+    def make_input(event):
+        item = _INPUT()
+        if event.kind == 'mouse':
+            item.type = 0
+            item.mi.dwFlags = Win32InputBackend._BUTTON_FLAGS[event.code][event.up]
+            item.mi.mouseData = event.code - 3 if event.code >= 4 else 0
+        elif event.kind == 'wheel':
+            item.type = 0
+            item.mi.dwFlags = 0x0800
+            item.mi.mouseData = event.code & 0xFFFFFFFF
+        else:
+            item.type = 1
+            item.ki.dwFlags = event.flags | (0x0002 if event.up else 0)
+            if event.flags & (0x0004 | 0x0008):
+                item.ki.wScan = event.code
+            else:
+                item.ki.wVk = event.code
+        return item
+
+    def send(self, events):
+        inputs = (_INPUT * len(events))(*(self.make_input(event) for event in events))
+        ctypes.set_last_error(0)
+        inserted = int(self.user32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT)))
+        self.last_error = ctypes.get_last_error()
+        return inserted
+
+    def set_cursor_pos(self, x, y):
+        ctypes.set_last_error(0)
+        if not self.user32.SetCursorPos(x, y):
+            raise ForegroundInputError(f'移动系统光标失败，系统错误码：{ctypes.get_last_error()}')
+
+    def cursor_pos(self):
+        point = wintypes.POINT()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise ForegroundInputError('读取系统光标位置失败')
+        return point.x, point.y
+
+    def foreground_window(self):
+        return int(self.user32.GetForegroundWindow() or 0)
+
+    def window_at(self, point):
+        return int(self.user32.WindowFromPoint(wintypes.POINT(*point)) or 0)
+
+    def is_window(self, hwnd):
+        return bool(self.user32.IsWindow(hwnd))
+
+    def process_id(self, hwnd):
+        pid = wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
+
+    def is_child(self, parent, child):
+        return bool(self.user32.IsChild(parent, child))
+
+    def root_window(self, hwnd, owned=False):
+        return int(self.user32.GetAncestor(hwnd, 3 if owned else 2) or 0)
+
+    def owner_window(self, hwnd):
+        return int(self.user32.GetWindow(hwnd, 4) or 0)
+
+    def _layout(self):
+        thread_id = self.user32.GetWindowThreadProcessId(self.foreground_window(), None)
+        return self.user32.GetKeyboardLayout(thread_id)
+
+    def scan_code(self, vk):
+        return int(self.user32.MapVirtualKeyExW(vk, 4, self._layout()))
+
+    def vk_key_scan(self, char):
+        return int(self.user32.VkKeyScanExW(char, self._layout()))
+
+
+KEY_ALIASES = {
+    'lshift': 'shift_l', 'rshift': 'shift_r', 'lctrl': 'ctrl_l', 'rctrl': 'ctrl_r',
+    'lalt': 'alt_l', 'ralt': 'alt_r', 'lcontrol': 'ctrl_l', 'rcontrol': 'ctrl_r',
+    'control': 'ctrl', 'return': 'enter', 'pageup': 'page_up', 'pagedown': 'page_down',
+    'capslock': 'caps_lock', 'numlock': 'num_lock', 'scrolllock': 'scroll_lock',
+    'printscreen': 'print_screen', 'windows': 'cmd', 'win': 'cmd', 'command': 'cmd', 'meta': 'cmd',
+    'altleft': 'alt_l', 'altright': 'alt_r', 'ctrlleft': 'ctrl_l', 'ctrlright': 'ctrl_r',
+    'shiftleft': 'shift_l', 'shiftright': 'shift_r', 'winleft': 'cmd_l', 'winright': 'cmd_r',
+}
+_BUTTONS = {Button.left: 1, Button.right: 2, Button.middle: 3, Button.x1: 4, Button.x2: 5}
+_BUTTON_NAMES = {'left': 1, 'right': 2, 'middle': 3, 'x1': 4, 'x2': 5,
+                 **{name: value + 3 for name, value in MOUSE_BUTTON_MAP.items()}}
+
+
+def _seconds(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError('输入时长必须是有限的非负秒数')
+    return value
+
+
+class ForegroundInputSession:
+    """绑定一个拥有者；坐标为屏幕像素，全部时长为秒。"""
+
+    def __init__(self, core, owner, target_provider, cancel_check):
+        self.core = core
+        self.owner = owner
+        self.target_provider = target_provider
+        self.cancel_check = cancel_check
+        self._expected = None
+        self._interrupted = None
+        self._revision = 0
+        self._actions = []
+        self._previous = []
+
+    def target(self):
+        target = self.target_provider() if callable(self.target_provider) else self.target_provider
+        if not isinstance(target, ForegroundTarget):
+            raise TypeError('前台输入需要明确的 ForegroundTarget')
+        return target
+
+    def activate(self):
+        """声明当前目标所有者，不置前；真实新事件仍由普通守卫核对。"""
+        with self.core._ownership_lock:
+            with self.core._lock:
+                self.core._activate(self)
+
+    def __enter__(self):
+        self.core._ownership_lock.acquire()
+        try:
+            with self.core._lock:
+                self._previous.append(self.core._active)
+                self.core._activate(self)
+            return self
+        except BaseException:
+            with self.core._lock:
+                self._previous.pop()
+            self.core._ownership_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.release_all()
+        finally:
+            with self.core._lock:
+                self.core._active = self._previous.pop()
+            self.core._ownership_lock.release()
+
+    def is_foreground(self):
+        with self.core._lock:
+            target = self.target()
+            return self.core._valid(target) and self.core._allowed(target, self.core.native.foreground_window())
+
+    def acknowledge(self):
+        """取得新目标和画面后，由调度器确认安全恢复点。"""
+        with self.core._lock:
+            target = self.target()
+            if not self.core._valid(target) or not self.core._allowed(target, self.core.native.foreground_window()):
+                self.core._interrupt(self, '目标窗口当前不在前台')
+            self.core.release_all(self.owner)
+            self._expected = target
+            self._interrupted = None
+
+    def check(self):
+        with self.core._operation(self):
+            return True
+
+    def release_all(self):
+        self.core.release_all(self.owner)
+
+    def key_down(self, key):
+        token, events = self.core._key(key)
+        with self.core._operation(self) as target:
+            hold = (self.owner, token)
+            if hold not in self.core._logical_holds:
+                self.core._press(self, target, events)
+                self.core._logical_holds[hold] = events
+
+    def key_up(self, key):
+        token, events = self.core._key(key)
+        with self.core._lock:
+            events = self.core._logical_holds.pop((self.owner, token), events)
+            self.core._release(self.owner, events)
+
+    def send_key(self, key, down_time=0.01):
+        return self.hotkey(key, down_time=down_time)
+
+    def hotkey(self, *keys, down_time=0.01):
+        down_time = _seconds(down_time)
+        parsed = [self.core._key(key)[1] for key in keys]
+        acquired = []
+        with self.core._operation(self) as target:
+            try:
+                for events in parsed:
+                    acquired.extend(self.core._press(self, target, events))
+                self.core._wait(self, target, down_time)
+            finally:
+                self.core._release(self.owner, acquired)
+
+    def move(self, x, y):
+        point = (round(x), round(y))
+        with self.core._operation(self) as target:
+            self.core._move(self, target, point)
+
+    def click(self, x=None, y=None, key='left', down_time=0.01, move_back=False):
+        down_time = _seconds(down_time)
+        event = self.core._button(key)
+        if (x is None) != (y is None):
+            raise ValueError('点击坐标必须同时提供横坐标和纵坐标')
+        acquired = []
+        with self.core._operation(self) as target:
+            original = self.core.native.cursor_pos() if move_back else None
+            try:
+                if x is not None:
+                    self.core._move(self, target, (round(x), round(y)))
+                acquired = self.core._press(self, target, (event,))
+                self.core._wait(self, target, down_time)
+            finally:
+                self.core._release(self.owner, acquired)
+            # 只有原目标和落点仍安全时恢复光标，失焦清理绝不移动光标。
+            if original is not None and self.core._valid(target) and self.is_foreground():
+                if self.core._allowed(target, self.core.native.window_at(original)):
+                    self.core._move(self, target, original)
+
+    def scroll(self, amount, x=None, y=None):
+        if not isinstance(amount, int):
+            raise ValueError('滚轮步数必须是整数')
+        if (x is None) != (y is None):
+            raise ValueError('滚轮坐标必须同时提供横坐标和纵坐标')
+        with self.core._operation(self) as target:
+            if x is not None:
+                self.core._move(self, target, (round(x), round(y)))
+            for _ in range(abs(amount)):
+                self.core._guard(self, target, pointer=True)
+                self.core._emit(self, target, (InputEvent('wheel', 120 if amount > 0 else -120),))
+                self.core._wait(self, target, 0.001)
+
+    def swipe(self, x1, y1, x2, y2, duration, settle_time=0):
+        duration, settle_time = _seconds(duration), _seconds(settle_time)
+        start_point, end_point = (round(x1), round(y1)), (round(x2), round(y2))
+        acquired = []
+        with self.core._operation(self) as target:
+            try:
+                self.core._move(self, target, start_point)
+                acquired = self.core._press(self, target, (self.core._button('left'),))
+                start = self.core.clock()
+                while duration > 0:
+                    elapsed = self.core.clock() - start
+                    if elapsed >= duration - 0.000001:
+                        break
+                    fraction = min(1.0, elapsed / duration)
+                    self.core._move(self, target, tuple(round(a + (b - a) * fraction)
+                                                       for a, b in zip(start_point, end_point)))
+                    if fraction >= 1:
+                        break
+                    self.core._wait(self, target, min(0.01, duration * (1 - fraction)))
+                self.core._move(self, target, end_point)
+                self.core._wait(self, target, settle_time)
+            finally:
+                self.core._release(self.owner, acquired)
+
+    def input_text(self, text):
+        if not isinstance(text, str):
+            raise TypeError('文本输入必须是字符串')
+        # 在任何注入之前拒绝非法代理项；日志与异常都不保存文本正文。
+        try:
+            encoded = text.encode('utf-16-le')
+        except UnicodeEncodeError:
+            raise ValueError('文本包含无效的 Unicode 代理项') from None
+        with self.core._operation(self) as target:
+            try:
+                for offset in range(0, len(encoded), 2):
+                    self.core._guard(self, target)
+                    unit = int.from_bytes(encoded[offset:offset + 2], 'little')
+                    event = InputEvent('keyboard', unit, 0x0004)
+                    self.core._emit(self, target, (event, event.released()))
+                self.core._guard(self, target)
+            finally:
+                # Unicode 部分成功只释放尚未配对的本程序事件，不重复文本。
+                pending = [event for event, session in self.core._held.items()
+                           if session is self and event.flags & 0x0004]
+                self.core._release(self.owner, pending)
+
+
+class ForegroundInput:
+    def __init__(self, native=None, *, clock=time.monotonic, sleep=time.sleep, start_monitor=True):
+        self.native = native if native is not None else Win32InputBackend()
+        self.clock, self.sleep = clock, sleep
+        self._lock = threading.RLock()
+        self._ownership_lock = threading.RLock()
+        self._held = {}
+        self._pending_release = set()
+        self._logical_holds = {}
+        self._active = None
+        self._closed = threading.Event()
+        self._last_cleanup_warning = 0
+        self._monitor = None
+        if start_monitor:
+            self._monitor = threading.Thread(target=self._observe, name='ForegroundInput', daemon=True)
+            self._monitor.start()
+
+    def session(self, owner, target_provider, cancel_check=None):
+        if owner is None:
+            raise ValueError('前台输入必须指定拥有者')
+        return ForegroundInputSession(self, owner, target_provider, cancel_check)
+
+    def _valid(self, target):
+        return (target.hwnd > 0 and self.native.is_window(target.hwnd)
+                and (target.process_id is None or self.native.process_id(target.hwnd) == target.process_id))
+
+    def _owned_by(self, hwnd, anchor):
+        # 共同启动器的拥有根不能授予权限，必须沿即时拥有链真正到达具体输入锚点。
+        current, seen = self.native.root_window(hwnd), set()
+        while current and current not in seen and self.native.is_window(current):
+            if current == anchor:
+                return True
+            seen.add(current)
+            owner = self.native.owner_window(current)
+            if owner == anchor:
+                return True
+            current = self.native.root_window(owner) if owner and self.native.is_window(owner) else 0
+        return False
+
+    def _allowed(self, target, hwnd):
+        if not hwnd or not self.native.is_window(hwnd):
+            return False
+        for anchor in (target.hwnd, *target.allowed_hwnds):
+            if not anchor or not self.native.is_window(anchor):
+                continue
+            if hwnd == anchor:
+                return True
+            # 同进程、同根或拥有关系才允许；同进程的其它无关窗口不自动放行。
+            if self.native.process_id(hwnd) != self.native.process_id(anchor):
+                continue
+            root, anchor_root = self.native.root_window(hwnd), self.native.root_window(anchor)
+            if (self.native.is_child(anchor, hwnd) or self.native.is_child(hwnd, anchor)
+                    or root and root == anchor_root or self._owned_by(hwnd, anchor)):
+                return True
+        return False
+
+    def _activate(self, session):
+        # 上一会话释放失败时 active 可能已回到游戏；外来持有仍必须先清空。
+        foreign = {holder.owner for holder in self._held.values() if holder is not session}
+        for owner in foreign:
+            self.release_all(owner)
+        if self._active is session:
+            return
+        previous = self._active
+        if previous is not None:
+            previous._interrupted = '输入所有权已交接，请刷新目标和画面'
+            self.release_all(previous.owner)
+        self._active = session
+
+    def _interrupt(self, session, reason):
+        session._interrupted = reason
+        self.release_all(session.owner)
+        raise ForegroundInputInterrupted(reason)
+
+    def _guard(self, session, target, pointer=False, pending=True):
+        try:
+            if session.cancel_check is not None and session.cancel_check():
+                raise ForegroundInputError('前台输入已取消')
+        except BaseException:
+            try:
+                self.release_all(session.owner)
+            except ForegroundInputError:
+                logger.warning('取消输入后仍有待释放状态')
+            raise
+        if self._closed.is_set():
+            self.release_all(session.owner)
+            raise ForegroundInputError('前台输入核心已关闭')
+        if any(self._held.get(event) is not None and self._held[event].owner == session.owner
+               for event in self._pending_release):
+            raise ForegroundInputError('本程序仍有释放失败的输入，请先清理并重新确认目标')
+        current = session.target()
+        if not self._valid(target) or current != target:
+            self._interrupt(session, '输入目标或坐标代次已变化，请重新识别')
+        if not self._allowed(target, self.native.foreground_window()):
+            self._interrupt(session, '目标窗口已失焦，请等待前台并重新识别')
+        if pending and session._interrupted:
+            self._interrupt(session, session._interrupted)
+        if pending and session._actions and session._actions[-1] != session._revision:
+            self._interrupt(session, '输入手势已被生命周期清理中断，请重新识别')
+        if pointer and not self._allowed(target, self.native.window_at(self.native.cursor_pos())):
+            self._interrupt(session, '鼠标落点不属于输入目标，请重新识别')
+
+    @contextmanager
+    def _operation(self, session):
+        with self._ownership_lock:
+            with self._lock:
+                self._activate(session)
+                target = session.target()
+                if session._expected is None:
+                    session._expected = target
+                self._guard(session, session._expected)
+                session._actions.append(session._revision)
+            try:
+                yield target
+            except BaseException:
+                try:
+                    self.release_all(session.owner)
+                except ForegroundInputError:
+                    logger.warning('输入异常后仍有待释放状态')
+                raise
+            finally:
+                with self._lock:
+                    session._actions.pop()
+
+    def _emit(self, session, target, events):
+        with self._lock:
+            if any(not event.up for event in events):
+                self._guard(session, target, pointer=any(event.kind in ('mouse', 'wheel') for event in events))
+            inserted = self.native.send(events)
+            # SendInput 串行插入已成功的前缀，部分成功仍要保留其释放台账。
+            for event in events[:max(0, min(inserted, len(events)))]:
+                if event.up:
+                    self._held.pop(InputEvent(event.kind, event.code, event.flags, event.data), None)
+                elif event.kind != 'wheel':
+                    self._held[event] = session
+            if inserted != len(events):
+                try:
+                    self.release_all(session.owner)
+                except ForegroundInputError:
+                    pass
+                raise ForegroundInputError(f'系统输入未完整注入：{inserted}/{len(events)}，'
+                                           f'系统错误码：{getattr(self.native, "last_error", 0)}')
+
+    def _press(self, session, target, events):
+        acquired = []
+        try:
+            for event in events:
+                with self._lock:
+                    self._guard(session, target, pointer=event.kind == 'mouse')
+                    if event not in self._held:
+                        self._emit(session, target, (event,))
+                        acquired.append(event)
+            return tuple(acquired)
+        except BaseException:
+            self._release(session.owner, acquired)
+            raise
+
+    def _release(self, owner, events):
+        errors = []
+        with self._lock:
+            references = {event for (holder, _), held in self._logical_holds.items()
+                          if holder == owner for event in held}
+            for event in reversed(tuple(dict.fromkeys(events))):
+                session = self._held.get(event)
+                if session is None or session.owner != owner or event in references:
+                    continue
+                try:
+                    inserted = self.native.send((event.released(),))
+                    if inserted != 1:
+                        raise ForegroundInputError('系统拒绝释放本程序持有的输入')
+                    self._held.pop(event, None)
+                    self._pending_release.discard(event)
+                except Exception as error:
+                    self._pending_release.add(event)
+                    errors.append(error)
+        if errors:
+            raise ForegroundInputError(f'仍有 {len(errors)} 项输入待释放') from errors[0]
+
+    def release_all(self, owner=None):
+        """清理绝不核对焦点、取消、暂停或截图，失败项留待后续重试。"""
+        with self._lock:
+            owners = ({session.owner for session in self._held.values()} | {key[0] for key in self._logical_holds}
+                      if owner is None else {owner})
+            if owner is None and self._active is not None:
+                owners.add(self._active.owner)
+            errors = []
+            for holder in owners:
+                sessions = {session for session in self._held.values() if session.owner == holder}
+                if self._active is not None and self._active.owner == holder:
+                    sessions.add(self._active)
+                for session in sessions:
+                    session._revision += 1
+                    if session._actions:
+                        session._interrupted = '输入手势已被清理中断，请重新识别'
+                previous_holds = {key: value for key, value in self._logical_holds.items() if key[0] == holder}
+                self._logical_holds = {key: value for key, value in self._logical_holds.items() if key[0] != holder}
+                events = [event for event, session in self._held.items() if session.owner == holder]
+                try:
+                    self._release(holder, events)
+                except ForegroundInputError as error:
+                    errors.append(error)
+                    # 保留失败键的原始扫描码，失焦后键盘布局变化也能正确补松键。
+                    for key, value in previous_holds.items():
+                        pending = tuple(event for event in value if event in self._held)
+                        if pending:
+                            self._logical_holds[key] = pending
+            if errors:
+                raise ForegroundInputError(f'{len(errors)} 个输入拥有者仍有待释放状态') from errors[0]
+
+    def _move(self, session, target, point):
+        with self._lock:
+            self._guard(session, target)
+            if not self._allowed(target, self.native.window_at(point)):
+                self._interrupt(session, '移动落点不属于输入目标，请重新识别')
+            self.native.set_cursor_pos(*point)
+            if self.native.cursor_pos() != point:
+                raise ForegroundInputError('系统光标没有到达请求位置')
+            self._guard(session, target, pointer=True)
+
+    def _wait(self, session, target, seconds):
+        deadline = self.clock() + seconds
+        while True:
+            with self._lock:
+                self._guard(session, target)
+            remaining = deadline - self.clock()
+            if remaining <= 0.000001:
+                return
+            self.sleep(min(0.01, remaining))
+
+    def _vk_event(self, vk):
+        vk = {0x10: 0xA0, 0x11: 0xA2, 0x12: 0xA4}.get(vk, vk)
+        if not 1 <= vk <= 254:
+            raise ValueError('虚拟键代码超出有效范围')
+        scan = self.native.scan_code(vk)
+        extended = (scan >> 8) == 0xE0 or vk in {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                                                 0x2C, 0x2D, 0x2E, 0x5B, 0x5C, 0x5D, 0x6F, 0xA3, 0xA5}
+        # Pause 使用 E1 序列，普通扫描码标志无法表达；保留其公开虚拟键语义。
+        if scan and vk != 0x13:
+            return InputEvent('keyboard', scan & 0xFF, 0x0008 | int(extended))
+        return InputEvent('keyboard', vk, int(extended))
+
+    def _button(self, key):
+        code = _BUTTONS.get(key) if isinstance(key, Button) else _BUTTON_NAMES.get(str(key).strip().lower())
+        if code is None:
+            raise ValueError('不支持该鼠标按钮')
+        return InputEvent('mouse', code)
+
+    def _key(self, key):
+        if isinstance(key, Button) or isinstance(key, str) and key.strip().lower() in MOUSE_BUTTON_MAP:
+            event = self._button(key)
+            return ('mouse', event.code), (event,)
+        if isinstance(key, int):
+            # 任务历史整数表示字符；通知的 VK 必须显式使用 KeyCode.from_vk。
+            key = str(key)
+        if isinstance(key, str):
+            name = KEY_ALIASES.get(key.lower(), key.lower())
+            if len(name) == 4 and name.startswith('num') and name[-1].isdigit():
+                key = KeyCode.from_vk(0x60 + int(name[-1]))
+            elif name in Key.__members__:
+                key = Key[name]
+            elif len(key) == 1:
+                key = KeyCode.from_char(key)
+            else:
+                raise ValueError('不支持该按键，请检查按键配置')
+        if isinstance(key, Key):
+            key = key.value
+        if not isinstance(key, KeyCode):
+            raise ValueError('按键必须使用字符、Key 或 KeyCode')
+        if key.vk is not None:
+            vk = {0x10: 0xA0, 0x11: 0xA2, 0x12: 0xA4}.get(key.vk, key.vk)
+            return ('vk', vk), (self._vk_event(vk),)
+        if not key.char or len(key.char) != 1:
+            raise ValueError('字符按键必须包含一个 Unicode 字符')
+        try:
+            encoded = key.char.encode('utf-16-le')
+        except UnicodeEncodeError:
+            raise ValueError('按键包含无效的 Unicode 代理项') from None
+        vk = self.native.vk_key_scan(key.char) if len(encoded) == 2 else -1
+        if vk == -1:
+            events = tuple(InputEvent('keyboard', int.from_bytes(encoded[i:i + 2], 'little'), 0x0004)
+                           for i in range(0, len(encoded), 2))
+        else:
+            events = tuple(self._vk_event(code) for mask, code in ((1, 0xA0), (2, 0xA2), (4, 0xA4))
+                           if (vk >> 8) & mask) + (self._vk_event(vk & 0xFF),)
+        return ('char', key.char), events
+
+    def poll_foreground(self):
+        """已开始会话即使暂未持有，也要锁存失焦，阻止沿用旧识别。"""
+        with self._lock:
+            foreign = {holder.owner for holder in self._held.values()
+                       if self._active is None or holder is not self._active}
+            for owner in foreign:
+                try:
+                    self.release_all(owner)
+                except ForegroundInputError as error:
+                    if self.clock() - self._last_cleanup_warning >= 1:
+                        logger.warning('交接后输入仍待释放：%s', error)
+                        self._last_cleanup_warning = self.clock()
+            session = self._active
+            if session is not None and (self._held or session._expected is not None and not session._interrupted):
+                try:
+                    self._guard(session, session._expected, pending=False)
+                except BaseException as cause:
+                    if isinstance(cause, ForegroundInputInterrupted):
+                        session._interrupted = str(cause)
+                    try:
+                        self.release_all(session.owner)
+                    except ForegroundInputError as error:
+                        if self.clock() - self._last_cleanup_warning >= 1:
+                            logger.warning('重试输入清理失败：%s', error)
+                            self._last_cleanup_warning = self.clock()
+
+    def _observe(self):
+        while not self._closed.wait(0.02):
+            self.poll_foreground()
+
+    def stop(self):
+        self._closed.set()
+        self.release_all()
+
+
+_shared_lock = threading.Lock()
+_shared_input = None
+
+
+def get_shared_foreground_input():
+    global _shared_input
+    with _shared_lock:
+        if _shared_input is None or _shared_input._closed.is_set():
+            if _shared_input is not None:
+                # 关闭可能留下释放失败的修饰键；清理成功前保留旧台账，禁止新核心绕过它。
+                _shared_input.release_all()
+            _shared_input = ForegroundInput()
+        return _shared_input
+
+
+def release_shared_foreground_input():
+    """生命周期清理不得为了释放而新建输入核心或操作目标。"""
+    core = _shared_input
+    if core is not None:
+        core.release_all()
+
+
+def stop_shared_foreground_input():
+    core = _shared_input
+    if core is not None:
+        core.stop()

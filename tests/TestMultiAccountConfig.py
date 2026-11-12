@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from copy import deepcopy
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -11,8 +12,9 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QTableWidgetItem, QWidget
-from ok import BaseTask, Box, PostMessageInteraction, og
+from ok import BaseTask, og
 from ok.task.exceptions import TaskDisabledException, WaitFailedException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from ok.ui.qt.tasks.config_form import ConfigForm
 from ok.util.config import Config
 
@@ -60,6 +62,7 @@ def account(key='1231234', task=None, values=None):
 def executor_for(tasks, folder='configs'):
     return SimpleNamespace(
         config_folder=folder, get_all_tasks=lambda: tasks,
+        task_context=lambda task: nullcontext(), business_time=time.monotonic,
         onetime_tasks=[task for task in tasks if not isinstance(task, ExampleTrigger)],
         get_task_by_class=lambda cls: next((task for task in tasks if isinstance(task, cls)), None),
     )
@@ -137,65 +140,10 @@ class TestMultiAccountMode(unittest.TestCase):
 
 
 class TestMultiAccountConfig(unittest.TestCase):
-    def test_login_click_moves_real_cursor_before_background_button_message(self):
-        import win32con
-
-        capture = SimpleNamespace(get_abs_cords=lambda x, y: (x + 300, y + 100))
-        interaction = PostMessageInteraction(capture, SimpleNamespace())
-        interaction.update_mouse_pos = Mock(return_value=0)
-        cursor = [0, 0]
-        delivered = []
-
-        def post(message, *args):
-            if message == win32con.WM_LBUTTONDOWN:
-                delivered.append(tuple(cursor))
-
-        interaction.post = post
-        runner = object.__new__(MultiAccountConfigTask)
-        runner.tr = str
-        runner._executor = SimpleNamespace(interaction=interaction, reset_scene=Mock())
-        runner._login_cursor_active = True
-        runner.sleep = Mock()
-        runner.logger = Mock()
-        # Exercise real Box -> task.click -> PostMessage.click, mocking only OS I/O.
-        with patch('win32api.SetCursorPos', side_effect=lambda pos: cursor.__setitem__(slice(None), pos)), \
-                patch('ok.device.interaction_methods.post_message.time.sleep'):
-            runner.click([Box(1259, 782, 40, 20, name='登录')])
-        self.assertEqual(delivered, [(1579, 892)])
-        runner.sleep.assert_any_call(0.2)
-
-    def test_background_click_outside_login_does_not_move_real_cursor(self):
-        interaction = PostMessageInteraction(SimpleNamespace(), SimpleNamespace())
-        interaction.click = Mock()
-        runner = object.__new__(MultiAccountConfigTask)
-        runner.tr = str
-        runner._executor = SimpleNamespace(interaction=interaction, reset_scene=Mock())
-        with patch('win32api.SetCursorPos') as move:
-            runner.click(1279, 792)
-        move.assert_not_called()
-        interaction.click.assert_called_once()
-
-    def test_login_relative_fallback_uses_converted_desktop_coordinates(self):
-        capture = SimpleNamespace(get_abs_cords=lambda x, y: (x + 300, y + 100))
-        interaction = PostMessageInteraction(capture, SimpleNamespace())
-        interaction.click = Mock()
-        runner = object.__new__(MultiAccountConfigTask)
-        runner.tr = str
-        runner._executor = SimpleNamespace(interaction=interaction, reset_scene=Mock(),
-                                           method=SimpleNamespace(width=2560, height=1440))
-        runner._login_cursor_active = True
-        runner.out_of_ratio = lambda: False
-        runner.sleep = Mock()
-        with patch('win32api.SetCursorPos') as move:
-            runner.click_relative(0.5, 0.568, hcenter=True, vcenter=True)
-        move.assert_called_once_with((1580, 917))
-
-    def test_login_cursor_mode_restores_after_cancellation_during_wait_main(self):
-        mouse = SimpleNamespace(enabled=True, disable=Mock(), enable=Mock())
+    def test_login_cancellation_during_wait_main_is_propagated(self):
         runner = SimpleNamespace(tr=str,
-            executor=SimpleNamespace(get_task_by_class=lambda cls: mouse),
             _login_combo=lambda: None,
-            sleep=Mock(), click=Mock(), find_account_drop_down=lambda: 'dropdown',
+            sleep=Mock(), next_frame=Mock(), click=Mock(), find_account_drop_down=lambda: 'dropdown',
             do_find_account_drop_down=lambda: None,
             _find_target_account=lambda key: True,
             wait_until=lambda callback, **kwargs: callback(),
@@ -204,15 +152,11 @@ class TestMultiAccountConfig(unittest.TestCase):
             box_of_screen=Mock(),
         )
 
-        def wait_main(**kwargs):
-            self.assertTrue(runner._login_cursor_active)
-            raise TaskDisabledException()
-
-        runner.ensure_main = wait_main
+        runner.ensure_main = Mock(side_effect=TaskDisabledException())
         with self.assertRaises(TaskDisabledException):
             MultiAccountConfigTask._login_target_account(runner, '1231234')
-        self.assertFalse(runner._login_cursor_active)
-        mouse.enable.assert_called_once()
+        runner.next_frame.assert_called()
+        runner.click.assert_called_with(['login'], after_sleep=3)
 
     def test_account_keys(self):
         self.assertEqual(account_key_from_ocr('123****1234'), '1231234')
@@ -226,31 +170,30 @@ class TestMultiAccountConfig(unittest.TestCase):
             validate_accounts([account(key)])
         self.assertNotEqual(account_key_from_ocr('A0****12'), account_key_from_ocr('ao****12'))
 
-    def test_combo_selects_configured_email_or_name_without_ocr_clicks(self):
+    def test_combo_selects_configured_email_or_name_through_shared_selection(self):
         module = 'src.task.MultiAccountConfigTask.'
         for target, displayed in [('Ab12@outlook.com', 'Ab****12@outlook.com'),
                                   ('Some Name', 'Some Name'), ('1231234', '123**1234')]:
             with self.subTest(target=target):
-                runner = SimpleNamespace(tr=str, _login_combo=lambda: 42, sleep=Mock(),
-                                         ocr=Mock(side_effect=AssertionError('unexpected OCR')),
-                                         click=Mock(side_effect=AssertionError('unexpected click')))
+                runner = SimpleNamespace(tr=str, _login_combo=lambda: 42, sleep=Mock(), next_frame=Mock(),
+                                         ocr=Mock(side_effect=AssertionError('不应回退到 OCR')),
+                                         click=Mock(side_effect=AssertionError('应委托共享选号方法')))
                 with patch(module + 'combo_items', return_value=['Other', displayed, displayed]), \
                         patch(module + 'select_combo_item', return_value=True) as select, \
                         patch(module + 'combo_selected_item', return_value=displayed):
                     MultiAccountConfigTask._select_target_account(runner, target)
-                select.assert_called_once_with(42, 2)
+                select.assert_called_once_with(runner, 42, 2, displayed)
                 runner.ocr.assert_not_called()
                 runner.click.assert_not_called()
 
-    def test_combo_and_ocr_failure_never_logs_in_and_restores_mouse(self):
+    def test_native_selection_or_confirmation_failure_never_logs_in(self):
         module = 'src.task.MultiAccountConfigTask.'
         for items, selected, current in [(['Other'], True, 'Other'),
                                          (['Ab**12@outlook.com'], False, 'Ab**12@outlook.com'),
                                          (['Ab**12@outlook.com'], True, 'Other')]:
             with self.subTest(items=items, selected=selected, current=current):
-                mouse = SimpleNamespace(enabled=True, disable=Mock(), enable=Mock())
-                runner = SimpleNamespace(tr=str, executor=SimpleNamespace(get_task_by_class=lambda cls: mouse),
-                                         _login_combo=lambda: 42, sleep=Mock(), ocr=Mock(), click=Mock(),
+                runner = SimpleNamespace(tr=str,
+                                         _login_combo=lambda: 42, sleep=Mock(), next_frame=Mock(), ocr=Mock(), click=Mock(),
                                          find_account_drop_down=Mock(side_effect=WaitFailedException()),
                                          log_warning=Mock(), ensure_main=Mock())
                 with patch(module + 'combo_items', return_value=items), \
@@ -260,14 +203,13 @@ class TestMultiAccountConfig(unittest.TestCase):
                     MultiAccountConfigTask._login_target_account(runner, 'Ab12@outlook.com')
                 runner.ocr.assert_not_called()
                 runner.click.assert_not_called()
-                runner.find_account_drop_down.assert_called_once()
+                runner.find_account_drop_down.assert_not_called()
                 runner.ensure_main.assert_not_called()
-                mouse.enable.assert_called_once()
 
     def test_combo_error_falls_back_to_ocr_and_confirms_without_combo(self):
         for error in (OSError('invalid window'), WaitFailedException()):
             runner = SimpleNamespace(tr=str,
-                _login_combo=Mock(side_effect=error), sleep=Mock(), log_warning=Mock(),
+                _login_combo=Mock(side_effect=error), sleep=Mock(), next_frame=Mock(), log_warning=Mock(),
                 click=Mock(), find_account_drop_down=Mock(return_value='dropdown'),
                 do_find_account_drop_down=Mock(side_effect=[None, SimpleNamespace(name='Ab**12@outlook.com')]),
                 _find_target_account=Mock(return_value=True),
@@ -280,11 +222,54 @@ class TestMultiAccountConfig(unittest.TestCase):
             self.assertFalse(runner._ocr_account_selection)
 
     def test_combo_cancellation_does_not_start_ocr_fallback(self):
-        runner = SimpleNamespace(tr=str, sleep=Mock(), _login_combo=Mock(side_effect=TaskDisabledException()),
+        runner = SimpleNamespace(tr=str, sleep=Mock(), next_frame=Mock(), _login_combo=Mock(side_effect=TaskDisabledException()),
                                  find_account_drop_down=Mock())
         with self.assertRaises(TaskDisabledException):
             MultiAccountConfigTask._select_target_account(runner, '1231234')
         runner.find_account_drop_down.assert_not_called()
+
+    def test_combo_focus_interruption_requeries_new_dialog_and_item_order(self):
+        module = 'src.task.MultiAccountConfigTask.'
+        runner = SimpleNamespace(
+            tr=str, sleep=Mock(), next_frame=Mock(), wait_foreground_frame=Mock(),
+            _login_combo=Mock(side_effect=[42, 43]), ocr=Mock(), click=Mock(),
+        )
+        with patch(module + 'combo_items', side_effect=[['其它', '目标账号'], ['目标账号', '其它']]), \
+                patch(module + 'combo_selected_item', return_value='目标账号'), \
+                patch(module + 'select_combo_item', side_effect=[ForegroundInputInterrupted(), True]) as select:
+            MultiAccountConfigTask._select_target_account(runner, '目标账号')
+        self.assertEqual([(call.args[1], call.args[2]) for call in select.call_args_list], [(42, 1), (43, 0)])
+        runner.wait_foreground_frame.assert_called_once()
+        runner.ocr.assert_not_called()
+
+    def test_repeated_focus_interruptions_do_not_consume_account_retry_budget(self):
+        module = 'src.task.MultiAccountConfigTask.'
+        runner = SimpleNamespace(
+            tr=str, sleep=Mock(), next_frame=Mock(), wait_foreground_frame=Mock(),
+            _login_combo=lambda: 42, ocr=Mock(),
+        )
+        with patch(module + 'combo_items', return_value=['目标账号']), \
+                patch(module + 'combo_selected_item', return_value='目标账号'), \
+                patch(module + 'select_combo_item', side_effect=[ForegroundInputInterrupted()] * 6 + [True]) as select:
+            MultiAccountConfigTask._select_target_account(runner, '目标账号')
+        self.assertEqual(select.call_count, 7)
+        self.assertEqual(runner.wait_foreground_frame.call_count, 6)
+
+    def test_system_input_error_in_native_selection_is_not_retried_or_used_for_ocr(self):
+        module = 'src.task.MultiAccountConfigTask.'
+        runner = SimpleNamespace(
+            tr=str, sleep=Mock(), next_frame=Mock(), wait_foreground_frame=Mock(),
+            _login_combo=lambda: 42, ocr=Mock(), click=Mock(), ensure_main=Mock(),
+        )
+        with patch(module + 'combo_items', return_value=['目标账号']), \
+                patch(module + 'select_combo_item', side_effect=ForegroundInputError()) as select:
+            with self.assertRaises(ForegroundInputError):
+                MultiAccountConfigTask._login_target_account(runner, '目标账号')
+        select.assert_called_once()
+        runner.wait_foreground_frame.assert_not_called()
+        runner.ocr.assert_not_called()
+        runner.click.assert_not_called()
+        runner.ensure_main.assert_not_called()
 
     def test_ocr_matches_email_and_name_after_removing_every_star(self):
         for text, target in [('Ab*1**2@outlook.com', 'Ab12@outlook.com'), ('Some Name', 'Some Name')]:
@@ -437,6 +422,7 @@ class TestMultiAccountConfig(unittest.TestCase):
                 runner.logger = Mock()
                 runner.info = {}
                 runner.sleep = Mock()
+                runner.next_frame = Mock()
                 runner.log_info = Mock()
                 runner.log_debug = Mock()
                 runner.log_warning = Mock()
@@ -447,7 +433,7 @@ class TestMultiAccountConfig(unittest.TestCase):
                 runner.find_one = Mock(return_value=None)
                 runner.ocr = lambda **kwargs: ['Log In'] if state.screen == 'login' else []
                 runner.box_of_screen = Mock()
-                runner.find_boxes = lambda texts, match=None, **kwargs: texts if match == LOGIN_TEXTS else None
+                runner.find_boxes = lambda texts, match=None, **kwargs: texts if match == LOGIN_TEXTS else []
                 runner.back = Mock()
                 runner.send_key = Mock()
                 runner.wait_feature = Mock()
@@ -559,29 +545,23 @@ class TestMultiAccountConfig(unittest.TestCase):
         self.assertTrue(MultiAccountConfigTask._find_target_account(runner, '3453456'))
         runner.click.assert_called_with(lowest, after_sleep=2)
 
-    def test_failed_dropdown_never_attempts_login_and_restores_mouse(self):
-        mouse = SimpleNamespace(enabled=True, disable=Mock(), enable=Mock())
+    def test_failed_dropdown_never_attempts_login(self):
         runner = SimpleNamespace(tr=str,
-            executor=SimpleNamespace(get_task_by_class=lambda cls: mouse),
             _login_combo=lambda: None,
-            sleep=Mock(), click=Mock(), find_account_drop_down=Mock(return_value='dropdown'),
+            sleep=Mock(), next_frame=Mock(), log_info=Mock(), click=Mock(), find_account_drop_down=Mock(return_value='dropdown'),
             do_find_account_drop_down=Mock(return_value=True), ocr=Mock(),
         )
         with self.assertRaises(WaitFailedException):
             MultiAccountConfigTask._login_target_account(runner, '1231234')
         runner.ocr.assert_not_called()
         self.assertEqual(runner.click.call_count, 5)
-        mouse.disable.assert_called_once()
-        mouse.enable.assert_called_once()
 
     def test_login_confirms_target_before_clicking_login(self):
         for displayed in ('123****1234', '234****2345'):
             with self.subTest(displayed=displayed):
-                mouse = SimpleNamespace(enabled=True, disable=Mock(), enable=Mock())
                 runner = SimpleNamespace(tr=str,
-                    executor=SimpleNamespace(get_task_by_class=lambda cls: mouse),
                     _login_combo=lambda: None,
-                    sleep=Mock(), click=Mock(), find_account_drop_down=Mock(return_value='dropdown'),
+                    sleep=Mock(), next_frame=Mock(), click=Mock(), find_account_drop_down=Mock(return_value='dropdown'),
                     do_find_account_drop_down=Mock(return_value=None),
                     _find_target_account=Mock(return_value=True),
                     wait_until=lambda callback, **kwargs: callback(),
@@ -595,34 +575,27 @@ class TestMultiAccountConfig(unittest.TestCase):
                     runner.click.assert_any_call(['login'], after_sleep=3)
                     runner.ensure_main.assert_called_once_with(time_out=180)
                     self.assertFalse(runner.logged_in)
-                    self.assertFalse(runner._login_cursor_active)
                 else:
                     with self.assertRaises(WaitFailedException):
                         MultiAccountConfigTask._login_target_account(runner, '1231234')
                     runner.find_boxes.assert_not_called()
                     runner.ensure_main.assert_not_called()
-                mouse.enable.assert_called_once()
 
-    def test_mouse_config_never_writes_during_account_selection(self):
-        with tempfile.TemporaryDirectory() as folder:
-            mouse = ExampleTrigger()
-            mouse.default_config = {'_enabled': True}
-            mouse.config = Config('MouseResetTask', mouse.default_config, folder=folder)
-            mouse.enabled = True
-            original = mouse.config
-            path = Path(original.config_file)
-            before = path.read_bytes()
-            mouse.disable = lambda: mouse.config.__setitem__('_enabled', False)
-            mouse.enable = lambda: mouse.config.__setitem__('_enabled', True)
-            runner = SimpleNamespace(tr=str,
-                executor=SimpleNamespace(get_task_by_class=lambda cls: mouse),
-                _login_combo=lambda: None,
-                sleep=Mock(side_effect=TaskDisabledException()),
-            )
-            with self.assertRaises(TaskDisabledException), isolated_task_configs([mouse]):
-                MultiAccountConfigTask._login_target_account(runner, '1231234')
-            self.assertIs(mouse.config, original)
-            self.assertEqual(path.read_bytes(), before)
+    def test_account_changed_while_waiting_prevents_login(self):
+        runner = SimpleNamespace(tr=str, _login_combo=lambda: None,
+            sleep=Mock(), next_frame=Mock(), click=Mock(),
+            find_account_drop_down=Mock(return_value='dropdown'),
+            do_find_account_drop_down=Mock(return_value=None),
+            _find_target_account=Mock(return_value=True),
+            wait_until=lambda callback, **kwargs: callback(),
+            _detect_current_account_from_login=Mock(side_effect=['123****1234', '234****2345']),
+            ocr=Mock(), find_boxes=Mock(), box_of_screen=Mock(), ensure_main=Mock(),
+        )
+        with self.assertRaisesRegex(WaitFailedException, '登录前账号确认失败'):
+            MultiAccountConfigTask._login_target_account(runner, '1231234')
+        runner.next_frame.assert_called()
+        runner.click.assert_called_once_with('dropdown', after_sleep=2)
+        runner.ensure_main.assert_not_called()
 
 
 class TestMultiAccountConfigUI(unittest.TestCase):

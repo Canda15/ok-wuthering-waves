@@ -1,6 +1,7 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.task.BaseCombatTask import BaseCombatTask, CharRevivedException
 from src.task.DomainTask import DomainTask
 from src.task.FarmEchoTask import FarmEchoTask
@@ -42,7 +43,7 @@ class TestTacetDeathReentry(unittest.TestCase):
         noop = lambda *args, **kwargs: None
         for name in ('info_incr', 'sleep', 'openF2Book', 'click_relative', 'open_boss_book',
                      'click_team_challenge', 'wait_in_team_and_world', 'walk_to_treasure', 'pick_f',
-                     'wait_click_skip_dialog_confirm'):
+                     'wait_click_skip_dialog_confirm', 'finish_challenge_result'):
             setattr(task, name, noop)
         task.get_stamina = lambda: (120, 0, 120)
         task.teleport_to_tacet = lambda index: task.teleports.append(index)
@@ -77,6 +78,17 @@ class TestTacetDeathReentry(unittest.TestCase):
         task.farm_tacet(config={'Which Tacet Suppression to Farm': 1})
 
         self.assertEqual([False, True, True], flags)
+
+    def test_result_focus_interruptions_preserve_daily_allowance_and_claim_count(self):
+        task = self.make_task(deaths=0)
+        task.use_stamina = Mock(side_effect=[(True, 60), (False, 60)])
+        task.finish_challenge_result = Mock(side_effect=[ForegroundInputInterrupted() for _ in range(5)]
+                                                     + [None, None])
+        task.wait_foreground_frame = Mock()
+        task.farm_tacet(daily=True, used_stamina=0, config={})
+        self.assertEqual([call.kwargs['must_use'] for call in task.use_stamina.call_args_list], [180, 120])
+        self.assertEqual(len(task.combat_calls), 2)
+        self.assertEqual(task.wait_foreground_frame.call_count, 5)
 
 
 class TestFarmEchoDeathReentry(unittest.TestCase):
@@ -200,6 +212,7 @@ class TestReviveAtHealPoint(unittest.TestCase):
         for name in ('close_revive_popup', 'send_key', 'sleep', 'wait_click_feature', 'wait_in_team_and_world'):
             setattr(task, name, noop)
         task.in_realm = lambda: in_realm
+        task.find_one = lambda *args, **kwargs: None
         task.ensure_main = lambda *args, **kwargs: task.exits.append(True)
         task.revive_at_tower_and_heal = lambda: task.teleports.append(True)
         return task

@@ -10,7 +10,10 @@ from ok.core.events import communicate
 from ok.core.notifications import alert_info
 from ok.util.GlobalConfig import basic_options
 from ok.util.logger import Logger
-from ok.util.window import show_title_bar, get_window_bounds, resize_window, is_foreground_window, find_hwnd
+from ok.util.window import (
+    show_title_bar, get_window_bounds, resize_window, find_hwnd,
+    filter_hwnd_group, get_hwnd_identity,
+)
 
 from ok.device.capture_methods.base import BaseWindowsCaptureMethod
 from ok.device.capture_methods.bitblt_utils import get_crop_point
@@ -91,7 +94,9 @@ class HwndWindow:
             logger.error(f'hwnd window close failed: {error}')
 
     def _front_hwnd_candidates(self):
-        return list(dict.fromkeys(hwnd for hwnd in (self.top_hwnd, self.hwnd) if hwnd))
+        hwnds = self.hwnds
+        top = self._top_hwnd_info(hwnds)
+        return list(dict.fromkeys((top[0], self.hwnd))) if top is not None else []
 
     def _top_hwnd_info(self, hwnds):
         if not hwnds:
@@ -102,39 +107,46 @@ class HwndWindow:
                 return hwnd_info
         return hwnds[0]
 
-    def bring_to_front(self):
+    def bring_to_front(self, timeout=3, cancel_check=None):
+        """显式启动请求一次真实置前，并在有限期限内核对结果。"""
+        if cancel_check is not None and cancel_check():
+            return False
+        if self.is_foreground():
+            return True
         errors = []
-        for refreshed in (False, True):
-            hwnds = self._front_hwnd_candidates()
-            if not hwnds:
-                if not refreshed:
-                    self.do_update_window_size()
-                    continue
-                logger.warning('bring_to_front failed: no hwnd found')
+        hwnd = next((candidate for candidate in self._front_hwnd_candidates()
+                     if win32gui.IsWindow(candidate)), None)
+        if hwnd is None:
+            self.do_update_window_size()
+            hwnd = next((candidate for candidate in self._front_hwnd_candidates()
+                         if win32gui.IsWindow(candidate)), None)
+        if hwnd is None:
+            logger.warning('无法置前：未找到有效窗口')
+            return False
+        # 通知恢复使用布尔取消回调；窗口查找后再核对，避免用户已切走时抢回前台。
+        if cancel_check is not None and cancel_check():
+            return False
+        if hwnd not in self._front_hwnd_candidates():
+            return False
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception as error:
+            errors.append(str(error))
+        deadline = time.monotonic() + max(0, timeout)
+        while not self.app_exit_event.is_set() and not self.stop_event.is_set():
+            if cancel_check is not None and cancel_check():
                 return False
-
-            invalid_hwnds = []
-            for hwnd in hwnds:
-                try:
-                    if not win32gui.IsWindow(hwnd):
-                        invalid_hwnds.append(hwnd)
-                        continue
-                    if win32gui.IsIconic(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    win32gui.BringWindowToTop(hwnd)
-                    win32gui.SetForegroundWindow(hwnd)
-                    return True
-                except Exception as e:
-                    errors.append(f'{hwnd}: {e}')
-
-            if invalid_hwnds and len(invalid_hwnds) == len(hwnds) and not refreshed:
+            if self.is_foreground():
                 self.do_update_window_size()
-                continue
-            if invalid_hwnds:
-                errors.append(f'invalid hwnds: {invalid_hwnds}')
-            break
-
-        logger.warning(f'bring_to_front failed: {", ".join(errors)}')
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.app_exit_event.wait(min(0.05, remaining))
+        logger.warning(f'真实前台确认失败：{", ".join(errors)}')
         return False
 
     def try_resize_to(self, resize_to):
@@ -165,28 +177,27 @@ class HwndWindow:
                 else:
                     logger.error(f'resize hwnd failed: {self.width}x{self.height}')
 
-    def update_window(self, title, exe_name, frame_width, frame_height, player_id=-1, hwnd_class=None,
+    def update_window(self, title, exe_name, frame_width=0, frame_height=0, player_id=-1, hwnd_class=None,
                       top_hwnd_class=None):
+        exe_names = [exe_name] if isinstance(exe_name, str) else exe_name
+        changed = (self.title != title or self.exe_names != exe_names or self.player_id != player_id
+                   or self.hwnd_class != hwnd_class or self.top_hwnd_class != top_hwnd_class)
         self.player_id = player_id
         self.title = title
-        if isinstance(exe_name, str):
-            self.exe_names = [exe_name]
-        else:
-            self.exe_names = exe_name
-        self.update_frame_size(frame_width, frame_height)
+        self.exe_names = exe_names
         self.hwnd_class = hwnd_class
         self.top_hwnd_class = top_hwnd_class
+        self.update_frame_size(frame_width, frame_height)
+        if changed or not self.hwnd:
+            self.hwnd = 0
+            self.do_update_window_size()
 
     def update_frame_size(self, width, height):
-        logger.debug(f"update_frame_size:{self.frame_width}x{self.frame_height} to {width}x{height}")
         if width != self.frame_width or height != self.frame_height:
-            self.frame_width = width
-            self.frame_height = height
-            if width > 0 and height > 0:
-                self.frame_aspect_ratio = width / height
-                logger.debug(f"HwndWindow: frame ratio: width: {width}, height: {height}")
-        self.hwnd = 0
-        self.do_update_window_size()
+            self.frame_width, self.frame_height = width, height
+            self.frame_aspect_ratio = width / height if width > 0 and height > 0 else 0
+            self.hwnd = 0
+            self.do_update_window_size()
 
     def update_window_size(self):
         try:
@@ -194,16 +205,17 @@ class HwndWindow:
                 self.do_update_window_size()
                 time.sleep(0.2)
             if self.hwnd and self.mute_option.get('Mute Game while in Background'):
-                logger.info(f'exit reset mute state to 0')
+                logger.info('exit reset mute state to 0')
                 set_mute_state(self.hwnd, 0)
         except Exception as error:
             logger.error(f'update_window_size exception: {error}')
 
     def get_abs_cords(self, x, y):
-        return self.x + x, self.y + y
+        origin_x, origin_y = self.get_capture_origin()
+        return origin_x + x, origin_y + y
 
     def get_capture_origin(self):
-        """Return the screen origin of the cropped game content."""
+        """裁剪内容的屏幕原点，DPI 与多屏坐标由窗口边界查询统一转换。"""
         if self.real_x_offset != 0 or self.real_y_offset != 0:
             offset_x = self.real_x_offset
             offset_y = self.real_y_offset
@@ -215,22 +227,46 @@ class HwndWindow:
     def get_top_window_cords(self, x, y):
         return x - self.top_offset_x, y - self.top_offset_y
 
+    def _live_hwnd_group(self):
+        hwnds, identities = getattr(self, '_hwnd_group', ((), {}))
+        return filter_hwnd_group(self.hwnd, hwnds, self.top_hwnd_class, identities), identities
+
+    @property
+    def hwnds(self):
+        # 合成捕获也使用即时许可，不能继续读取已销毁或被其他实例重用的缓存句柄。
+        return self._live_hwnd_group()[0]
+
+    @hwnds.setter
+    def hwnds(self, hwnds):
+        hwnds = tuple(hwnds)
+        identities = {info[0]: get_hwnd_identity(info[0]) for info in hwnds if len(info) >= 9}
+        # 同一次绑定的列表和身份作为一份快照替换，避免观察线程读到混合状态。
+        self._hwnd_group = hwnds, identities
+
+    def _capture_signature(self, hwnds, identities):
+        top = self._top_hwnd_info(hwnds)
+        geometry = tuple((info[0], identities.get(info[0]), info[2:6], info[8]) for info in hwnds)
+        return (
+            self.hwnd, top[0] if top is not None else 0, self.x, self.y, self.scaling,
+            self.width, self.height, self.client_width, self.client_height,
+            self.real_x_offset, self.real_y_offset, self.real_width, self.real_height, geometry,
+        )
+
     @property
     def capture_target_signature(self):
-        hwnds = tuple(hwnd_info[0] for hwnd_info in (self.hwnds or []))
-        return (
-            self.hwnd,
-            self.top_hwnd,
-            self.width,
-            self.height,
-            self.client_width,
-            self.client_height,
-            self.real_x_offset,
-            self.real_y_offset,
-            self.real_width,
-            self.real_height,
-            hwnds,
-        )
+        hwnds, identities = self._live_hwnd_group()
+        return self._capture_signature(hwnds, identities)
+
+    @property
+    def foreground_target(self):
+        from ok.device.interaction_methods.foreground_input import ForegroundTarget
+        hwnds, identities = self._live_hwnd_group()
+        allowed = tuple(info[0] for info in hwnds)
+        hwnd = self.hwnd if self.hwnd in allowed else 0
+        process_id = identities[hwnd][0] if hwnd else None
+        # 每个允许子窗的即时客户区几何参与代次，主窗未移动也不能沿用旧合成图坐标。
+        signature = self._capture_signature(hwnds, identities)
+        return ForegroundTarget(hwnd, (id(self), signature), process_id, allowed)
 
     def do_update_window_size(self):
         if self.device_manager and getattr(self.device_manager, 'capture_method', None):
@@ -290,13 +326,10 @@ class HwndWindow:
                             cropped_window_height = int(width / self.frame_aspect_ratio)
                             height = cropped_window_height
                     pos_valid = check_pos(x, y, width, height, self.monitors_bounds)
-                    if isinstance(self.device_manager.capture_method,
-                                  BaseWindowsCaptureMethod) and not pos_valid and pos_valid != self.pos_valid and self.device_manager.executor is not None:
-                        if self.device_manager.executor.pause():
-                            logger.error(f'og.executor.pause pos_invalid: {x, y, width, height}')
-                            communicate.notification.emit('Paused because game window is minimized or out of screen!',
-                                                          None,
-                                                          True, True, "start", None, None)
+                    if (isinstance(self.device_manager.capture_method, BaseWindowsCaptureMethod)
+                            and not pos_valid and self.device_manager.executor is not None):
+                        # 最小化或移动期间只清理并等真实前台，不改变用户的任务暂停状态。
+                        self.device_manager.release_input()
                     if pos_valid != self.pos_valid:
                         self.pos_valid = pos_valid
                 else:
@@ -320,8 +353,7 @@ class HwndWindow:
 
                 if (window_width != self.window_width or window_height != self.window_height or
                     client_width != self.client_width or client_height != self.client_height or
-                    x != self.x or y != self.y or width != self.width or height != self.height or scaling != self.scaling) and (
-                        (x >= -1 and y >= -1) or self.visible):
+                    x != self.x or y != self.y or width != self.width or height != self.height or scaling != self.scaling):
                     self.x, self.y = x, y
                     self.window_width, self.window_height = window_width, window_height
                     self.client_width, self.client_height = client_width, client_height
@@ -347,15 +379,15 @@ class HwndWindow:
                                             self.width,
                                             self.height, self.scaling)
         except Exception as e:
-            logger.error(f"do_update_window_size exception", e)
+            logger.error("do_update_window_size exception", e)
 
     def is_foreground(self):
-        if is_foreground_window(self.hwnd):
-            return True
-        for w in self.hwnds:
-            if is_foreground_window(w[0]):
-                return True
-        return False
+        if self.app_exit_event.is_set() or self.stop_event.is_set():
+            return False
+        from ok.device.interaction_methods.foreground_input import get_shared_foreground_input
+        core = get_shared_foreground_input()
+        target = self.foreground_target
+        return core._valid(target) and core._allowed(target, core.native.foreground_window())
 
     def handle_mute(self, mute=None):
         if mute is None:

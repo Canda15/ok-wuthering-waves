@@ -1,0 +1,13 @@
+--- a/core/mcp_server.py
++++ b/core/mcp_server.py
+@@ -276,6 +276,10 @@
+             if not controller.start_device(initial_refresh_done=True):
+                 raise RuntimeError('Target device could not be started; inspect the application log')
+         else:
++            # 首次选中设备只排队绑定，须等捕获回退结束后再诊断，不能误判为不支持。
++            manager.wait_for_binding(
++                time_out=controller.start_timeout,
++                cancel_check=lambda: executor.check_enabled(check_pause=False))
+             error = controller.check_device_error()
+             if error:
+                 raise RuntimeError(error)

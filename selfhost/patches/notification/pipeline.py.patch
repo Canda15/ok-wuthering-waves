@@ -1,0 +1,94 @@
+--- a/notification/pipeline.py
++++ b/notification/pipeline.py
+@@ -16,9 +16,9 @@
+ 
+ 
+ class NotificationPipeline:
+-    """FIFO worker for external notification providers."""
++    """一个固定消费者按顺序处理请求，统一节流与退出排空。"""
+ 
+-    def __init__(self, handler, exit_event=None, interval=5):
++    def __init__(self, handler, exit_event=None, interval=5, worker_name='notifications'):
+         self.handler = handler
+         self.exit_event = exit_event
+         self.interval = interval
+@@ -31,14 +31,19 @@
+             elif hasattr(exit_event, 'bind_queue'):
+                 exit_event.bind_queue(self.queue)
+         self.thread = threading.Thread(
+-            target=self._worker, name='notifications', daemon=True)
++            target=self._worker, name=worker_name, daemon=True)
+         self.thread.start()
+ 
+     def submit(self, title, message, images):
+-        if self.stop_event.is_set():
+-            return False
+-        self.queue.put(NotificationRequest(title, message, images))
++        with self._stop_lock:
++            if self._should_stop():
++                return False
++            self.queue.put(NotificationRequest(title, message, images))
+         return True
++
++    def _should_stop(self):
++        return (self.stop_event.is_set()
++                or (self.exit_event is not None and self.exit_event.is_set()))
+ 
+     def stop(self, wait=False, timeout=5):
+         with self._stop_lock:
+@@ -51,22 +56,36 @@
+ 
+     def _worker(self):
+         last_sent = 0.0
+-        while True:
+-            item = self.queue.get()
+-            if item is None:
+-                self.queue.task_done()
+-                break
+-            if self.stop_event.is_set():
+-                self.queue.task_done()
+-                continue
+-            try:
+-                delay = self.interval - (time.monotonic() - last_sent)
+-                if delay > 0:
+-                    if self.stop_event.wait(delay):
+-                        continue
+-                self.handler(item.title, item.message, item.images)
+-            except Exception as e:
+-                logger.error('Notification provider failed', e)
+-            finally:
+-                last_sent = time.monotonic()
+-                self.queue.task_done()
++        try:
++            while not self._should_stop():
++                try:
++                    item = self.queue.get(timeout=.1)
++                except queue.Empty:
++                    continue
++                try:
++                    if item is None:
++                        break
++                    deadline = last_sent + self.interval
++                    while not self._should_stop():
++                        delay = deadline - time.monotonic()
++                        if delay <= 0:
++                            break
++                        self.stop_event.wait(min(.1, delay))
++                    if self._should_stop():
++                        break
++                    self.handler(item.title, item.message, item.images)
++                except Exception as e:
++                    logger.error('通知处理失败，本条不自动重发', e)
++                finally:
++                    last_sent = time.monotonic()
++                    self.queue.task_done()
++        finally:
++            # 退出与提交共用锁，避免结束后仍留下没有消费者的请求。
++            with self._stop_lock:
++                self.stop_event.set()
++                while True:
++                    try:
++                        self.queue.get_nowait()
++                    except queue.Empty:
++                        break
++                    self.queue.task_done()

@@ -1,10 +1,7 @@
-import win32api
-
-from ok import PostMessageInteraction
 from ok.task.exceptions import TaskDisabledException, WaitFailedException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 
 from src.task.BaseWWTask import LOGIN_TEXTS
-from src.task.MouseResetTask import MouseResetTask
 from src.task.MultiAccountDailyTask import (
     MultiAccountDailyTask, combo_items, combo_selected_item, select_combo_item,
 )
@@ -18,10 +15,7 @@ from src.task.task_icons import task_icon
 
 
 class MultiAccountConfigTask(MultiAccountDailyTask):
-    """Read account data from local configs/MultiAccountConfig.json only.
-
-    Account identifiers and per-account task settings must not be embedded here.
-    """
+    """账号及任务设置只从本地配置读取，不能在代码中嵌入账号数据。"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -33,20 +27,6 @@ class MultiAccountConfigTask(MultiAccountDailyTask):
         self.config_description = {}
         self.config_type = {}
         self.visible = False
-
-    def click(self, x=-1, y=-1, *args, **kwargs):
-        # Box and relative clicks are resolved by the framework and re-enter
-        # this method with capture-pixel coordinates. Keep both coordinates
-        # identical so the native login dialog receives a real hover before
-        # its background button messages (WM_MOUSEMOVE alone is insufficient).
-        if (getattr(self, '_login_cursor_active', False)
-                and isinstance(x, (int, float)) and isinstance(y, (int, float))
-                and x >= 1 and y >= 1
-                and isinstance(self.executor.interaction, PostMessageInteraction)):
-            position = self.executor.interaction.capture.get_abs_cords(x, y)
-            win32api.SetCursorPos((int(position[0]), int(position[1])))
-            self.sleep(0.2)
-        return super().click(x, y, *args, **kwargs)
 
     def run(self):
         store = MultiAccountConfigStore(self.executor.config_folder)
@@ -136,70 +116,62 @@ class MultiAccountConfigTask(MultiAccountDailyTask):
         box = self.do_find_account_drop_down()
         return box.name if box else None
 
-    def _select_target_account(self, account_key):
-        self._target_account_key = account_key
+    def _select_target_account_once(self, account_key):
         self.sleep(1)
+        self.next_frame()
         try:
-            if combo := self._login_combo():
-                matches = [index for index, text in enumerate(combo_items(combo))
-                           if account_key_from_ocr(text) == account_key]
-                if not matches:
-                    raise WaitFailedException(self.tr('Account {account} not found in the login list').format(account=display_account(account_key)))
-                # Consistent with OCR: prefer the lower entry for duplicate labels.
-                if not select_combo_item(combo, matches[-1]):
-                    raise WaitFailedException(self.tr('ComboBox account selection had no effect.'))
-                self.sleep(1)
-                if account_key_from_ocr(combo_selected_item(combo)) != account_key:
-                    raise WaitFailedException(self.tr('Current ComboBox account does not match the target.'))
-                return
-        except TaskDisabledException:
+            combo = self._login_combo()
+        except (TaskDisabledException, ForegroundInputError, ForegroundInputInterrupted):
             raise
         except Exception as error:
-            self.log_warning(self.tr('ComboBox account switch failed; falling back to OCR: {error_type}').format(error_type=type(error).__name__))
+            # 只在只读发现原生控件失败时改用 OCR；真实输入失败必须上抛，不能重放选号。
+            self.log_warning(f'无法查询原生账号列表，改用画面识别：{type(error).__name__}')
+            combo = None
+        if combo:
+            items = combo_items(combo)
+            matches = [index for index, text in enumerate(items)
+                       if account_key_from_ocr(text) == account_key]
+            if not matches:
+                raise WaitFailedException(self.tr('Account {account} not found in the login list').format(account=display_account(account_key)))
+            # 与 OCR 路径一致，重复标签优先选择靠下的列表项。
+            index = matches[-1]
+            if not select_combo_item(self, combo, index, items[index]):
+                raise WaitFailedException(self.tr('ComboBox account selection had no effect.'))
+            self.sleep(1)
+            if account_key_from_ocr(combo_selected_item(combo)) != account_key:
+                raise WaitFailedException(self.tr('Current ComboBox account does not match the target.'))
+            return True
         previous_ocr_mode = getattr(self, '_ocr_account_selection', False)
         try:
             self._ocr_account_selection = True
-            for attempt in range(5):
-                self.sleep(1)
-                self.click(self.find_account_drop_down(), after_sleep=2)
-                if self.do_find_account_drop_down():
-                    continue
-                if not self.wait_until(lambda: self._find_target_account(account_key),
-                                       time_out=10, raise_if_not_found=False):
-                    raise WaitFailedException(self.tr('Account {account} not found in the login list').format(account=display_account(account_key)))
-                self.sleep(1)
-                current = self._detect_current_account_from_login()
-                if account_key_from_ocr(current) == account_key:
-                    break
-                self.log_info(self.tr('Account confirmation mismatch; retrying {attempt}/5').format(attempt=attempt + 1))
-            else:
-                raise WaitFailedException(self.tr('Cannot confirm target account {account}; stopping login.').format(account=display_account(account_key)))
+            self.sleep(1)
+            self.click(self.find_account_drop_down(), after_sleep=2)
+            if self.do_find_account_drop_down():
+                return False
+            if not self.wait_until(lambda: self._find_target_account(account_key),
+                                   time_out=10, raise_if_not_found=False):
+                raise WaitFailedException(self.tr('Account {account} not found in the login list').format(account=display_account(account_key)))
+            self.sleep(1)
+            return account_key_from_ocr(self._detect_current_account_from_login()) == account_key
         finally:
             self._ocr_account_selection = previous_ocr_mode
 
+    def _select_target_account(self, account_key):
+        self._target_account_key = account_key
+        attempt = 0
+        while attempt < 5:
+            try:
+                if MultiAccountConfigTask._select_target_account_once(self, account_key):
+                    return
+                attempt += 1
+                self.log_info(self.tr('Account confirmation mismatch; retrying {attempt}/5').format(attempt=attempt))
+            except ForegroundInputInterrupted:
+                # 输入中断先等新帧，再重新查询目标账号；不能续接旧列表上的按键步骤。
+                self.wait_foreground_frame()
+        raise WaitFailedException(self.tr('Cannot confirm target account {account}; stopping login.').format(account=display_account(account_key)))
 
     def _login_target_account(self, account_key):
-        mouse_reset = self.executor.get_task_by_class(MouseResetTask)
-        was_enabled = mouse_reset.enabled if mouse_reset else False
-        try:
-            if was_enabled:
-                mouse_reset.disable()
-            MultiAccountConfigTask._select_target_account(self, account_key)
-            previous_cursor_mode = getattr(self, '_login_cursor_active', False)
-            try:
-                self._login_cursor_active = True
-                self.sleep(4)
-                login = self.find_boxes(self.ocr(), boundary=self.box_of_screen(0.3, 0.3, 0.7, 0.8),
-                                        match=LOGIN_TEXTS)
-                if login:
-                    self.click(login, after_sleep=3)
-                else:
-                    self.click_relative(0.5, 0.568, hcenter=True, vcenter=True, after_sleep=3)
-                self.logged_in = False
-                self.ensure_main(time_out=180)
-                self.log_info(self.tr('{account} logged in successfully').format(account=display_account(account_key)))
-            finally:
-                self._login_cursor_active = previous_cursor_mode
-        finally:
-            if was_enabled:
-                mouse_reset.enable()
+        MultiAccountConfigTask._select_target_account(self, account_key)
+        MultiAccountDailyTask._login_selected_account(
+            self, account_key, lambda expected, displayed: account_key_from_ocr(displayed) == expected)
+        self.log_info(self.tr('{account} logged in successfully').format(account=display_account(account_key)))

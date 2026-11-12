@@ -84,6 +84,10 @@ jobs:
       - name: Install dependencies
         run: python .github/scripts/install_dependencies.py
 
+      - name: 核对内联框架与逻辑差异
+        shell: pwsh
+        run: python scripts/sync_ok.py --check
+
       - name: Prepare release requirements
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -190,6 +194,10 @@ jobs:
       # 注意:上一步的 inline_ok_requirements 已经把 config.py 的 version 改成本次
       # tag、并从 requirements.txt 摘掉 ok-script,所以镜像仓库里就是可发布的树。
       # 业务宿主也必须在同步之前编译，selfhost/ 白名单会把 EXE 一起推入部署树。
+      - name: 同步镜像前核对内联框架
+        shell: pwsh
+        run: python scripts/sync_ok.py --check
+
       - name: 编译并验证业务 EXE
         shell: pwsh
         run: .\scripts\build_runtime.ps1
@@ -230,6 +238,11 @@ jobs:
           lfs: true
           fetch-depth: 0
           persist-credentials: false
+
+      - name: 准备部署树校验用 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       # 便携版不需要 NSIS:启动器的路径全部相对自身所在目录
       # (utils/path.rs 用 current_dir,lib.rs 启动时强制 set_current_dir(exe_dir)),
@@ -298,6 +311,10 @@ jobs:
           if (-not (Test-Path (Join-Path $repo 'selfhost\NoNo.exe'))) {
             throw "部署树缺少业务宿主 $repo\selfhost\NoNo.exe，不能回退到 Python 进程运行"
           }
+
+          # 对 setup 实际克隆的部署树复用源码算法，避免镜像遗漏逻辑差异或生成资源。
+          python scripts/sync_ok.py --check --root $repo
+          if ($LASTEXITCODE -ne 0) { throw '便携包部署树与框架来源不一致' }
 
           # 使用 setup 装好的真实运行时验证进程身份，不能只证明 CI 的 Python 能启动宿主。
           $working = Join-Path $bundle 'data\apps\NoNo\working'

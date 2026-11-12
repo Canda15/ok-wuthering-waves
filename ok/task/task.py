@@ -65,16 +65,21 @@ class ExecutorOperation:
         self.scene = executor.scene
 
     def validate_key(self, key):
+        from pynput.keyboard import Key, KeyCode
+        from pynput.mouse import Button
+        if isinstance(key, (Key, KeyCode, Button)):
+            return key
         if isinstance(key, int):
             key = str(key)
         if not isinstance(key, str):
-            raise HotkeyConfigException(str(key))
+            raise HotkeyConfigException('未知按键')
         k = key.lower()
         if len(k) == 1:
             if not (k.isalnum() or k in ' `~!@#$%^&*()-_=+[{]}\\|;:\'",<.>/?'):
                 raise HotkeyConfigException(key)
         elif k not in VALID_NAMED_KEYS:
-            raise HotkeyConfigException(key)
+            # 多字符错误值可能误填为密码或文本，错误界面不能回显正文。
+            raise HotkeyConfigException('未知按键')
         return key
 
     def exit_is_set(self):
@@ -220,11 +225,12 @@ class ExecutorOperation:
         self.executor.interaction.mouse_down(x, y, name=name, key=key)
 
     def mouse_up(self, name=None, key="left"):
-        communicate.emit_draw_box("mouse_up",
-                                  self.box_of_screen(0.5, 0.5, width=0.01, height=0.01, name="mouse_up", confidence=-1),
-                                  "green")
-        self.executor.interaction.mouse_up(key=key)
-        self.executor.reset_scene()
+        try:
+            # 释放先于绘制与场景检查，取消或失焦不能跳过真实松键。
+            self.executor.interaction.mouse_up(key=key)
+        finally:
+            self.executor.reset_scene(check_enabled=False)
+        communicate.emit_draw_box("mouse_up", [Box(0, 0, 20, 20, name="mouse_up", confidence=-1)], "green")
 
     def swipe_relative(self, from_x, from_y, to_x, to_y, duration=0.5, settle_time=0):
         """
@@ -243,7 +249,7 @@ class ExecutorOperation:
                    int(self.height * to_y), duration, settle_time=settle_time)
 
     def input_text(self, text):
-        name = f"input_text_{text}"
+        name = '文本输入'
         communicate.emit_draw_box(name, self.box_of_screen(0.5, 0.5, width=0.01, height=0.01, name=name, confidence=-1),
                                   "blue")
         self.executor.interaction.input_text(text)
@@ -283,7 +289,7 @@ class ExecutorOperation:
         communicate.emit_draw_box("swipe", [
             Box(min(from_x, to_x), min(from_y, to_y), max(abs(from_x - to_x), 10), max(abs(from_y - to_y), 10),
                 name="swipe")], "green", frame)
-        ms = int(duration * 1000)
+        ms = duration * 1000
         self.executor.reset_scene()
         self.executor.interaction.swipe(from_x, from_y, to_x, to_y, ms, settle_time=settle_time)
         self.sleep(after_sleep)
@@ -434,9 +440,9 @@ class ExecutorOperation:
             box = self.get_box_by_name(box)
 
         if not box:
-            self.logger.error(f"click_box box is None")
+            self.logger.error("click_box box is None")
             if raise_if_not_found:
-                raise Exception(f"click_box box is None")
+                raise Exception("click_box box is None")
             return
         x, y = box.relative_with_variance(relative_x, relative_y)
         return self.click(x, y, name=box.name, move_back=move_back, move=move, down_time=down_time,
@@ -508,8 +514,10 @@ class ExecutorOperation:
 
     def send_key_up(self, key, after_sleep=0):
         key = self.validate_key(key)
-        self.executor.reset_scene()
-        self.executor.interaction.send_key_up(key)
+        try:
+            self.executor.interaction.send_key_up(key)
+        finally:
+            self.executor.reset_scene(check_enabled=False)
         if after_sleep > 0:
             self.sleep(after_sleep)
 
@@ -995,7 +1003,7 @@ class OCR(FindFeature):
             time_out=time_out, post_action=post_action,
             raise_if_not_found=raise_if_not_found, settle_time=settle_time)
         if not boxes and raise_if_not_found:
-            logger.error(f'wait_ocr failed, ocr again and log')
+            logger.error('wait_ocr failed, ocr again and log')
             boxes = self.ocr(x, y, to_x=to_x, to_y=to_y, width=width, height=height, box=box, name=name,
                              threshold=threshold, frame=frame, target_height=target_height, log=True, screenshot=True,
                              lib=lib)
@@ -1044,11 +1052,24 @@ class BaseTask(OCR):
         self.support_schedule_task = False
 
     def run_task_by_class(self, cls):
+        from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
         task = self.get_task_by_class(cls)
         old_info = task.info
         task.info = self.info
         try:
-            task.run()
+            with self.executor.task_context(task):
+                resuming = False
+                while True:
+                    try:
+                        if resuming:
+                            self.executor.wait_foreground_frame()
+                            task.resume_after_foreground()
+                        else:
+                            task.run()
+                        break
+                    except ForegroundInputInterrupted:
+                        # 阶段仍归内层任务，保留配置与共享 info，禁止重跑已执行的 run。
+                        resuming = True
         except Exception as e:
             self.log_error(f'run_task_by_class {cls}', e)
             raise
@@ -1072,7 +1093,7 @@ class BaseTask(OCR):
         index = self.executor.onetime_tasks.index(self) + 1
         path = create_shortcut(None, f' {self.name}', arguments=f"-t {index}")
         if path:
-            path2 = create_shortcut(None, f' {self.name} exit_after', arguments=f"-t {index} -e")
+            create_shortcut(None, f' {self.name} exit_after', arguments=f"-t {index} -e")
             reveal_in_explorer(path)
 
     def sleep_check(self):
@@ -1115,7 +1136,23 @@ class BaseTask(OCR):
         if config is None:
             config = self.capture_config
         if config:
-            return self.executor.device_manager.ensure_capture(config)
+            result = self.executor.device_manager.ensure_capture(config)
+            self.executor.device_manager.wait_for_binding(
+                cancel_check=lambda: self.executor.check_input_cancelled(allow_pause=True))
+            return result
+
+    def wait_foreground_frame(self, time_out=None, deadline=None):
+        """输入中断后的安全检查点取得新帧，不恢复旧动作。"""
+        return self.executor.wait_foreground_frame(time_out=time_out, deadline=deadline)
+
+    def on_foreground_resume(self):
+        """新帧到达后清除业务缓存；覆盖实现只能清状态，不能执行输入。"""
+        pass
+
+    def resume_after_foreground(self):
+        """仅明确声明的任务级检查点可覆盖，禁止默认重跑整段 run。"""
+        from ok.device.interaction_methods.foreground_input import ForegroundInputError
+        raise ForegroundInputError('输入步骤已中断，该任务尚未声明安全恢复检查点')
 
     def update_capture(self, config):
         return self.executor.device_manager.update_capture(config)
@@ -1130,9 +1167,9 @@ class BaseTask(OCR):
                 communicate.task.emit(self)
                 return
             self._enabled = True
+            self._foreground_resume_pending = False
             self.info_clear()
             self.ensure_capture()
-            self.executor.interaction.on_run()
             self.executor.enqueue_onetime_task(self)
             logger.info(f'enabled task {self}')
         communicate.task.emit(self)
@@ -1281,6 +1318,8 @@ class BaseTask(OCR):
         pass
 
     def disable(self):
+        if self.executor.current_task is self:
+            self.executor.release_inputs()
         self._enabled = False
         self.executor.remove_onetime_task(self)
         self.executor._wake_executor()

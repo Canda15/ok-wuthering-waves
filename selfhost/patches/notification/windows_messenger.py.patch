@@ -1,0 +1,546 @@
+--- a/notification/windows_messenger.py
++++ b/notification/windows_messenger.py
+@@ -5,25 +5,29 @@
+ import cv2
+ import numpy as np
+ import psutil
+-import win32api
+ import win32clipboard
+ import win32con
+ import win32gui
+ import win32process
+ import win32ui
+ from PIL import Image
+-
++from pynput.keyboard import KeyCode
++
++from ok.device.interaction_methods.foreground_input import (
++    ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget,
++    get_shared_foreground_input,
++)
+ from ok.util.logger import Logger
+ 
+ logger = Logger.get_logger(__name__)
+ 
+ 
+ class MessengerAutomation:
+-    """Short-lived BitBlt/OCR/PostMessage automation for a local messenger."""
++    """在共享输入会话内识别并操作本地通知窗口。"""
+ 
+     def __init__(self, process_names, ocr, exit_event=None, window_titles=None,
+                  search_point_96dpi=(180, 60), left_panel_width_96dpi=340,
+-                 search_first_word=False, post_activate=True,
++                 search_first_word=False, cancel_check=None, switch_from_hwnd=None,
+                  image_method='clipboard_hotkey', paste_match_end=False,
+                  dismiss_search_after_contact=False):
+         self.process_names = {name.lower() for name in process_names}
+@@ -31,33 +35,58 @@
+         self.search_point_96dpi = search_point_96dpi
+         self.left_panel_width_96dpi = left_panel_width_96dpi
+         self.search_first_word = search_first_word
+-        self.post_activate = post_activate
++        self.cancel_check = cancel_check
++        self.switch_from_hwnd = switch_from_hwnd
+         self.image_method = image_method
+         self.paste_match_end = paste_match_end
+         self.dismiss_search_after_contact = dismiss_search_after_contact
+         self.ocr_engine = ocr
+         self.exit_event = exit_event
+         self._last_frame = None
++        self._input = None
++        self._input_target = None
++        self._lost_focus = False
++        self.restore_allowed = False
++        self.switched_foreground = False
+ 
+     def send(self, nickname, title, message, images):
+         self._last_frame = None
+-        try:
+-            return self._send(nickname, title, message, images)
+-        except Exception:
+-            self._save_error_screenshot()
+-            raise
+-
+-    def _send(self, nickname, title, message, images):
++        self._lost_focus = False
++        self.restore_allowed = False
++        self.switched_foreground = False
++        self._input_target = None
+         nickname = (nickname or '').strip()
+         if not nickname:
+-            logger.warning('Messenger notification is enabled but its nickname is empty')
++            logger.warning('桌面通知已启用，但尚未填写联系人昵称')
++            return False
++        if self._should_stop():
+             return False
+         hwnd = self._find_hwnd()
+         if not hwnd:
+-            logger.warning(f'Messenger process not found: {sorted(self.process_names)}')
++            logger.warning('未找到已打开的桌面通知客户端窗口')
+             return False
+-        if not self._wait_until_background(hwnd):
+-            return False
++        _, process_id = win32process.GetWindowThreadProcessId(hwnd)
++        self._input_target = ForegroundTarget(
++            hwnd, generation=time.monotonic_ns(), process_id=process_id)
++        self._input = get_shared_foreground_input().session(
++            self, self._input_target, cancel_check=self._should_stop)
++        try:
++            # 先交接所有权，置前失败时仍由会话退出清理旧手势和本次持有。
++            with self._input:
++                try:
++                    self._request_foreground(hwnd)
++                    return self._send(hwnd, nickname, title, message, images)
++                finally:
++                    # 释放失败时保留错误和台账，不能带着遗留修饰键恢复游戏。
++                    self._input.release_all()
++                    self._update_restore_allowed()
++        except Exception:
++            self._save_error_screenshot()
++            raise
++        finally:
++            self._input = None
++
++    def _send(self, hwnd, nickname, title, message, images):
+         search_region, contact_region, send_region = self._layout_regions(hwnd)
+ 
+         # Fast path 1: the contact is already visible in the left chat list.
+@@ -83,33 +112,32 @@
+                 input_point = (
+                     max(20, send_box[0] - 80), max(20, send_box[1] - 45))
+                 input_target = self._click(hwnd, input_point)
+-                self._send_content(
++                return self._send_content(
+                     hwnd, send_box, input_point, title, message, images,
+                     focus_input=False, input_target=input_target)
+-                return True
+ 
+             search = self._wait_text(
+                 hwnd, {'Search', '搜索'}, region=search_region, timeout=1.5)
+             if search is None:
+                 search = self._search_field_point(hwnd)
+             search_target = self._click(hwnd, search)
+-            time.sleep(1)
++            self._wait(1)
+             self._clear_text(search_target)
+-            time.sleep(1)
++            self._wait(1)
+             self._type_text(search_target, self._search_query(nickname))
+-            time.sleep(1)
++            self._wait(1)
+ 
+             contact_hwnd, contact = self._wait_contact(
+                 hwnd, nickname, contact_region, timeout=8)
+             if contact is None:
+-                raise RuntimeError(f'Could not find messenger contact: {nickname}')
+-            self._click(contact_hwnd, contact, focus=contact_hwnd == hwnd)
++                raise RuntimeError('无法确认桌面通知联系人')
++            self._click(contact_hwnd, contact)
+             if self.dismiss_search_after_contact:
+                 # QQ can leave its recent/comprehensive-search overlay open even
+                 # after a result click. Only dismiss it while the clicked popup is
+                 # still visible; an unconditional Escape can close/minimize the
+                 # main QQ window when the result click already closed the overlay.
+-                time.sleep(1)
++                self._wait(1)
+                 try:
+                     overlay_open = (
+                         contact_hwnd != hwnd
+@@ -119,17 +147,16 @@
+                     overlay_open = False
+                 if overlay_open:
+                     self._send_key(hwnd, win32con.VK_ESCAPE)
+-                    time.sleep(1)
++                    self._wait(1)
+             else:
+-                time.sleep(1)
++                self._wait(1)
+ 
+         send_box = self._wait_text(
+             hwnd, {'Send', '发送'}, region=send_region, timeout=8)
+         if send_box is None:
+-            raise RuntimeError('Could not find Send/发送 in the messenger window')
++            raise RuntimeError('无法在桌面通知窗口中确认发送按钮')
+         input_point = (max(20, send_box[0] - 80), max(20, send_box[1] - 45))
+-        self._send_content(hwnd, send_box, input_point, title, message, images)
+-        return True
++        return self._send_content(hwnd, send_box, input_point, title, message, images)
+ 
+     def _send_content(self, hwnd, send_box, input_point, title, message, images,
+                       focus_input=True, input_target=None):
+@@ -139,16 +166,16 @@
+             input_target = self._click(hwnd, input_point)
+         elif input_target is None:
+             input_target, _ = self._target(hwnd, input_point)
+-        time.sleep(1)
++        self._wait(1)
+         self._clear_unsent_text(input_target)
+-        time.sleep(1)
++        self._wait(1)
+ 
+         text = f'{title}\n{message}' if title else message
+         if text:
+             self._type_text(input_target, text)
+-            time.sleep(1)
++            self._wait(1)
+             self._click(hwnd, send_box)
+-            time.sleep(1)
++            self._wait(1)
+ 
+         uses_clipboard = bool(images)
+         clipboard_text = self._get_clipboard_text() if uses_clipboard else None
+@@ -158,14 +185,15 @@
+                     return False
+                 from ok.notification.messenger_images import insert_messenger_image
+                 input_target = self._click(hwnd, input_point)
+-                time.sleep(1)
++                self._wait(1)
+                 insert_messenger_image(
+                     self, self.image_method, hwnd, input_target, input_point, image)
+                 self._click(hwnd, send_box)
+-                time.sleep(1)
++                self._wait(1)
+         finally:
+             if uses_clipboard:
+                 self._restore_clipboard_text(clipboard_text)
++        return True
+ 
+     def _search_query(self, nickname):
+         if self.search_first_word:
+@@ -177,8 +205,7 @@
+         deadline = time.monotonic() + timeout
+         wanted = nickname.strip().casefold()
+         while time.monotonic() < deadline:
+-            if self._should_stop():
+-                return hwnd, None
++            self._check()
+             for candidate in self._contact_windows(hwnd):
+                 frame = self._capture(candidate)
+                 self._last_frame = frame
+@@ -188,7 +215,7 @@
+                     boxes, wanted, contacts_section=candidate != hwnd)
+                 if point is not None:
+                     return candidate, point
+-            time.sleep(.3)
++            self._wait(.3)
+         return hwnd, None
+ 
+     @staticmethod
+@@ -240,7 +267,8 @@
+                 return True
+             _, pid = win32process.GetWindowThreadProcessId(candidate)
+             class_name = win32gui.GetClassName(candidate)
+-            if pid == root_pid and 'QWindowToolSaveBits' in class_name:
++            if (pid == root_pid and 'QWindowToolSaveBits' in class_name
++                    and MessengerAutomation.window_belongs_to(hwnd, candidate)):
+                 left, top, right, bottom = win32gui.GetWindowRect(candidate)
+                 area = max(0, right - left) * max(0, bottom - top)
+                 if area:
+@@ -275,25 +303,119 @@
+         win32gui.EnumWindows(callback, None)
+         return max(candidates, default=(0, 0, 0))[2]
+ 
+-    def _wait_until_background(self, hwnd):
+-        while win32gui.GetForegroundWindow() == hwnd:
++    @staticmethod
++    def window_belongs_to(hwnd, candidate):
++        """同进程的根、子窗或拥有窗口才属于本次通知目标。"""
++        if not hwnd or not candidate:
++            return False
++        try:
++            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindow(candidate):
++                return False
++            if hwnd == candidate:
++                return True
++            if (win32process.GetWindowThreadProcessId(hwnd)[1]
++                    != win32process.GetWindowThreadProcessId(candidate)[1]):
++                return False
++            return (win32gui.IsChild(hwnd, candidate)
++                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
++                    == win32gui.GetAncestor(candidate, win32con.GA_ROOT)
++                    or win32gui.GetAncestor(hwnd, win32con.GA_ROOTOWNER)
++                    == win32gui.GetAncestor(candidate, win32con.GA_ROOTOWNER))
++        except Exception:
++            return False
++
++    def owns_foreground(self):
++        target = self._input_target
++        try:
++            return (target is not None
++                    and win32process.GetWindowThreadProcessId(target.hwnd)[1] == target.process_id
++                    and self.window_belongs_to(target.hwnd, win32gui.GetForegroundWindow()))
++        except Exception:
++            return False
++
++    def _request_foreground(self, hwnd, timeout=5):
++        if (not win32gui.IsWindow(hwnd)
++                or win32process.GetWindowThreadProcessId(hwnd)[1] != self._input_target.process_id):
++            # 取得会话前窗口可能已销毁或句柄已复用，不得置前其它应用。
++            raise ForegroundInputInterrupted('桌面通知窗口身份已变更')
++        before = win32gui.GetForegroundWindow()
++        if self.window_belongs_to(hwnd, before):
++            self._check()
++            return
++        if (self.switch_from_hwnd is not None
++                and self.switch_from_hwnd != before
++                and not self.window_belongs_to(self.switch_from_hwnd, before)):
++            self._lost_focus = True
++            raise ForegroundInputInterrupted('通知交接前用户已切走，不请求前台')
++        if self._should_stop():
++            raise ForegroundInputError('桌面通知已取消')
++        if win32gui.IsIconic(hwnd):
++            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
++        try:
++            # Windows 可能拒绝置前；只请求一次，随后核对真实前台。
++            win32gui.SetForegroundWindow(hwnd)
++        except Exception:
++            logger.warning('系统尚未允许桌面通知窗口取得前台')
++        deadline = time.monotonic() + timeout
++        while True:
+             if self._should_stop():
+-                return False
+-            time.sleep(.25)
++                raise ForegroundInputError('桌面通知已取消')
++            current = win32gui.GetForegroundWindow()
++            if self.window_belongs_to(hwnd, current):
++                self.switched_foreground = True
++                self._check()
++                return
++            if current != before and not self.window_belongs_to(before, current):
++                self._lost_focus = True
++                raise ForegroundInputInterrupted('等待通知前台时用户已切走')
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise ForegroundInputError('无法取得桌面通知窗口的真实前台')
++            self._wait_cancel(min(.05, remaining))
++
++    def _update_restore_allowed(self):
++        try:
++            # 也检查核心观察到的中断，用户切走后再回来不能触发自动恢复。
++            self._check()
++            self.restore_allowed = not self._lost_focus and self.owns_foreground()
++        except Exception:
++            self.restore_allowed = False
++
++    def _check(self):
++        if self._should_stop():
++            raise ForegroundInputError('桌面通知已取消')
++        if self._input is None:
++            raise ForegroundInputError('桌面通知尚未取得共享输入会话')
++        try:
++            self._input.check()
++        except ForegroundInputInterrupted:
++            self._lost_focus = True
++            raise
++
++    def _wait_cancel(self, seconds):
+         if self.exit_event is not None:
+-            return not self.exit_event.wait(5)
+-        time.sleep(5)
+-        return True
++            self.exit_event.wait(seconds)
++        else:
++            time.sleep(seconds)
++
++    def _wait(self, seconds):
++        deadline = time.monotonic() + seconds
++        while True:
++            self._check()
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                return
++            self._wait_cancel(min(.05, remaining))
+ 
+     def _should_stop(self):
+-        return self.exit_event is not None and self.exit_event.is_set()
++        return ((self.exit_event is not None and self.exit_event.is_set())
++                or (self.cancel_check is not None and bool(self.cancel_check())))
+ 
+     def _wait_text(self, hwnd, names, region=None, full_match=False, timeout=5):
+         deadline = time.monotonic() + timeout
+         wanted = {name.strip().casefold() for name in names}
+         while time.monotonic() < deadline:
+-            if self._should_stop():
+-                return None
++            self._check()
+             frame = self._capture(hwnd)
+             self._last_frame = frame
+             boxes = self._ocr(frame, region=region)
+@@ -304,7 +426,7 @@
+                 center = (x + box_width // 2, y + box_height // 2)
+                 if matched and self._in_region(center, width, height, region):
+                     return center
+-            time.sleep(.3)
++            self._wait(.3)
+         return None
+ 
+     def _ocr(self, frame, region=None):
+@@ -318,7 +440,7 @@
+             to_y = max(y_offset, min(height, round(region[3])))
+             ocr_frame = frame[y_offset:to_y, x_offset:to_x]
+         if self.ocr_engine is None:
+-            raise RuntimeError('PP-OCR is required for QQ and WeChat notifications')
++            raise RuntimeError('QQ／微信桌面通知需要 PP-OCR')
+         boxes = self.ocr_engine.recognize(ocr_frame, threshold=.1)
+         return [
+             (text, x + x_offset, y + y_offset, width, height)
+@@ -335,7 +457,7 @@
+             communicate.screenshot.emit(
+                 self._last_frame.copy(), f'notification/{suffix}', False, None)
+         except Exception as e:
+-            logger.error('Failed to save messenger notification error screenshot', e)
++            logger.error('保存桌面通知错误截图失败', e)
+ 
+     def _search_field_point(self, hwnd):
+         frame = self._capture(hwnd)
+@@ -389,7 +511,7 @@
+         left, top, right, bottom = win32gui.GetClientRect(hwnd)
+         width, height = right - left, bottom - top
+         if width <= 0 or height <= 0:
+-            raise RuntimeError('Messenger window is minimized or has no client area')
++            raise RuntimeError('桌面通知窗口已最小化或没有有效客户区')
+         window_dc = win32gui.GetDC(hwnd)
+         source_dc = win32ui.CreateDCFromHandle(window_dc)
+         memory_dc = source_dc.CreateCompatibleDC()
+@@ -397,13 +519,11 @@
+         try:
+             bitmap.CreateCompatibleBitmap(source_dc, width, height)
+             memory_dc.SelectObject(bitmap)
+-            # Render the complete background client directly into the temporary
+-            # compatible bitmap. This is the BitBlt RenderFull path and keeps
+-            # coordinates client-relative for PostMessage interaction.
++            # 保留完整客户区截图，识别结果在实际输入前按该 HWND 转成屏幕坐标。
+             rendered = ctypes.windll.user32.PrintWindow(
+                 hwnd, memory_dc.GetSafeHdc(), 0x00000003)
+             if not rendered:
+-                raise RuntimeError('RenderFull capture failed for messenger window')
++                raise RuntimeError('桌面通知窗口完整截图失败')
+             return MessengerAutomation._bitmap_frame(bitmap, width, height)
+         finally:
+             memory_dc.DeleteDC()
+@@ -417,91 +537,42 @@
+         frame = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 4))
+         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+ 
+-    @staticmethod
+-    def _target(hwnd, point):
+-        # Chromium and Qt render their search controls inside the top-level
+-        # surface rather than native edit child windows. Keep coordinates in
+-        # the captured client space and post directly to the app root HWND.
+-        return hwnd, (int(point[0]), int(point[1]))
+-
+-    def _click(self, hwnd, point, focus=True):
+-        target, local = self._target(hwnd, point)
+-        if self.post_activate:
+-            win32gui.PostMessage(hwnd, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+-            if target != hwnd:
+-                win32gui.PostMessage(target, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+-        if focus:
+-            win32gui.PostMessage(target, win32con.WM_SETFOCUS, 0, 0)
+-        lparam = win32api.MAKELONG(local[0], local[1])
+-        win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, 0, lparam)
+-        win32gui.PostMessage(target, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
+-        win32gui.PostMessage(target, win32con.WM_LBUTTONUP, 0, lparam)
++    def _target(self, hwnd, point):
++        if self._input_target is None or not self.window_belongs_to(self._input_target.hwnd, hwnd):
++            raise ForegroundInputInterrupted('通知控件不属于当前输入目标')
++        # 菜单和渲染子窗的原点可能不同，必须使用实际截图 HWND 转换。
++        return hwnd, win32gui.ClientToScreen(hwnd, (int(point[0]), int(point[1])))
++
++    def _click(self, hwnd, point, key='left'):
++        self._check()
++        target, screen = self._target(hwnd, point)
++        self._input.click(*screen, key=key)
+         return target
+ 
+-    @staticmethod
+-    def _type_text(hwnd, text):
+-        for char in str(text):
+-            win32gui.PostMessage(hwnd, win32con.WM_CHAR, ord(char), 1)
+-
+-    @staticmethod
+-    def _key_lparam(key, key_up=False):
+-        scan_code = win32api.MapVirtualKey(key, 0)
+-        lparam = (scan_code << 16) | 1
+-        if key_up:
+-            lparam |= (1 << 30) | (1 << 31)
+-        return lparam
+-
+-    @classmethod
+-    def _send_key(cls, hwnd, key):
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYDOWN, key, cls._key_lparam(key))
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYUP, key, cls._key_lparam(key, key_up=True))
+-
+-    @classmethod
+-    def _send_key_sync(cls, hwnd, key):
+-        win32gui.SendMessage(
+-            hwnd, win32con.WM_KEYDOWN, key, cls._key_lparam(key))
+-        win32gui.SendMessage(
+-            hwnd, win32con.WM_KEYUP, key, cls._key_lparam(key, key_up=True))
+-
+-    @classmethod
+-    def _hotkey(cls, hwnd, modifier, key):
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYDOWN, modifier, cls._key_lparam(modifier))
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYDOWN, key, cls._key_lparam(key))
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYUP, key, cls._key_lparam(key, key_up=True))
+-        win32gui.PostMessage(
+-            hwnd, win32con.WM_KEYUP, modifier, cls._key_lparam(modifier, key_up=True))
+-
+-    @classmethod
+-    def _hotkey_sync(cls, hwnd, modifier, key):
+-        win32gui.SendMessage(hwnd, win32con.WM_KEYDOWN, modifier, cls._key_lparam(modifier))
+-        win32gui.SendMessage(hwnd, win32con.WM_KEYDOWN, key, cls._key_lparam(key))
+-        win32gui.SendMessage(hwnd, win32con.WM_KEYUP, key, cls._key_lparam(key, key_up=True))
+-        win32gui.SendMessage(
+-            hwnd, win32con.WM_KEYUP, modifier, cls._key_lparam(modifier, key_up=True))
+-
+-    @classmethod
+-    def _clear_text(cls, hwnd):
+-        # Search fields are rendered by Qt/Chromium. Hundreds of queued
+-        # Delete/Backspace messages can be processed after typing starts and
+-        # make QQ appear to click/reopen the search UI repeatedly.
+-        cls._hotkey_sync(hwnd, win32con.VK_CONTROL, ord('A'))
+-        cls._send_key_sync(hwnd, win32con.VK_BACK)
+-        cls._send_key_sync(hwnd, win32con.VK_DELETE)
+-
+-    @classmethod
+-    def _clear_unsent_text(cls, hwnd):
+-        """Clear stale composer content without relying on Ctrl modifier state."""
+-        cls._send_key_sync(hwnd, win32con.VK_END)
+-        for _ in range(256):
+-            cls._send_key_sync(hwnd, win32con.VK_BACK)
+-        cls._send_key_sync(hwnd, win32con.VK_HOME)
+-        for _ in range(256):
+-            cls._send_key_sync(hwnd, win32con.VK_DELETE)
++    def _type_text(self, hwnd, text):
++        self._target(hwnd, (0, 0))
++        self._check()
++        self._input.input_text(str(text))
++
++    def _send_key(self, hwnd, key):
++        self._target(hwnd, (0, 0))
++        self._check()
++        self._input.send_key(KeyCode.from_vk(key) if isinstance(key, int) else key)
++
++    def _hotkey(self, hwnd, modifier, key):
++        self._target(hwnd, (0, 0))
++        self._check()
++        keys = tuple(KeyCode.from_vk(value) if isinstance(value, int) else value
++                     for value in (modifier, key))
++        self._input.hotkey(*keys)
++
++    def _clear_text(self, hwnd):
++        self._hotkey(hwnd, win32con.VK_CONTROL, ord('A'))
++        self._send_key(hwnd, win32con.VK_BACK)
++
++    def _clear_unsent_text(self, hwnd):
++        # 真实组合键可可靠选中已有内容，不再排队数百次删键干扰新文本。
++        self._clear_text(hwnd)
+ 
+     @staticmethod
+     def _set_clipboard_image(frame):

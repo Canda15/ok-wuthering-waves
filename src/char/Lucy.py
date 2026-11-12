@@ -1,3 +1,6 @@
+from ok import TaskDisabledException
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
+
 import time
 from src.char.BaseChar import BaseChar, SwitchPriority
 
@@ -17,6 +20,8 @@ class Lucy(BaseChar):
                 self.task.f_break()
             elif getattr(self.task, 'can_break', False):
                 self.task.f_break()
+        except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+            raise
         except Exception:
             pass
         if not self.is_forte_full():
@@ -64,6 +69,8 @@ class Lucy(BaseChar):
                 if hasattr(self.task, 'next_frame'):
                     try:
                         self.task.next_frame()
+                    except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+                        raise
                     except Exception:
                         pass
 
@@ -75,6 +82,8 @@ class Lucy(BaseChar):
                 if hasattr(self.task, 'next_frame'):
                     try:
                         self.task.next_frame()
+                    except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+                        raise
                     except Exception:
                         pass
             self.task.mouse_up()
@@ -88,6 +97,8 @@ class Lucy(BaseChar):
                 if hasattr(self.task, 'next_frame'):
                     try:
                         self.task.next_frame()
+                    except (ForegroundInputError, ForegroundInputInterrupted, TaskDisabledException):
+                        raise
                     except Exception:
                         pass
             if self.echo_available():

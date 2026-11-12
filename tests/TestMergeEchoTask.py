@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, call
 
+from ok import ForegroundInputError, ForegroundInputInterrupted
 from config import key_config_option
 from src.Labels import Labels
 from src.task.DailyTask import (
@@ -53,6 +54,10 @@ class TestMergeEchoTask(unittest.TestCase):
         self.task.wait_click_feature = Mock(return_value=True)
         self.task.click_relative = Mock()
         self.task.ocr = Mock(return_value=[])
+        self.task.wait_ocr = Mock(return_value=[object()])
+        self.task.wait_foreground_frame = Mock()
+        self.task.screenshot = Mock()
+        self.task.find_one = Mock(return_value=None)
         self.task.log_info = Mock()
         self.task.log_error = Mock()
         self.task.notify_if_not_enough = True
@@ -168,6 +173,68 @@ class TestMergeEchoTask(unittest.TestCase):
         self.assertEqual(self.task.ensure_main.call_count, 2)
         self.task.click_relative.assert_not_called()
         self.task.ocr.assert_not_called()
+
+    def test_focus_loss_after_merge_click_confirms_result_without_repeating_batch(self):
+        self.task.ocr.side_effect = [[object()], []]
+
+        def interrupt_submission(x, y, **kwargs):
+            if (x, y) == (.782, .910):
+                raise ForegroundInputInterrupted('切换到其它窗口')
+
+        self.task.click_relative.side_effect = interrupt_submission
+        self.task.run()
+
+        self.assertEqual(1, sum(args.args == (.782, .910) for args in self.task.click_relative.call_args_list))
+        self.task.wait_foreground_frame.assert_called_once()
+        self.task.wait_click_skip_dialog_confirm.assert_not_called()
+        self.assertEqual('completed', self.task._merge_phase)
+
+    def test_focus_loss_while_closing_known_result_does_not_close_again_on_merge_page(self):
+        self.task.ocr.side_effect = [[object()], []]
+        self.task.wait_ocr.side_effect = [[object()], []]
+        self.task.find_one.side_effect = lambda feature: feature == Labels.echo_merge
+
+        def interrupt_close(x, y, **kwargs):
+            if (x, y) == (.496, .972):
+                raise ForegroundInputInterrupted('返回时失焦')
+
+        self.task.click_relative.side_effect = interrupt_close
+        self.task.run()
+
+        self.assertEqual(1, sum(args.args == (.496, .972) for args in self.task.click_relative.call_args_list))
+        self.assertEqual(1, sum(args.args == (.782, .910) for args in self.task.click_relative.call_args_list))
+        self.task.wait_foreground_frame.assert_called_once()
+
+    def test_1000_echo_eligibility_survives_focus_loss_after_dismissing_prompt(self):
+        self.task.has_discard_merge_dialog.side_effect = [True, False]
+        self.task.click_dialog_left_button.side_effect = ForegroundInputInterrupted('提示已关闭后失焦')
+
+        self.task.run()
+
+        self.task.log_error.assert_not_called()
+        self.task.click_dialog_left_button.assert_called_once()
+        self.task.wait_foreground_frame.assert_called_once()
+        self.task.ocr.assert_called_once()
+
+    def test_unknown_merge_result_stops_before_another_resource_click(self):
+        self.task.ocr.return_value = [object()]
+        self.task.wait_ocr.return_value = []
+
+        with self.assertRaisesRegex(ForegroundInputError, '避免重复消耗'):
+            self.task.run()
+
+        self.assertEqual(1, sum(args.args == (.782, .910) for args in self.task.click_relative.call_args_list))
+        self.task.screenshot.assert_called_once_with('merge_echo_result_unknown')
+        self.task.wait_foreground_frame.assert_not_called()
+
+    def test_native_input_failure_is_not_treated_as_focus_retry(self):
+        self.task.send_key.side_effect = ForegroundInputError('SendInput 失败')
+
+        with self.assertRaises(ForegroundInputError):
+            self.task.run()
+
+        self.task.send_key.assert_called_once()
+        self.task.wait_foreground_frame.assert_not_called()
 
 
 class TestDailyMergeEchoTask(unittest.TestCase):

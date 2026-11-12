@@ -1,4 +1,5 @@
 from ok import Logger
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
 from src.task.BaseCombatTask import BaseCombatTask, CharRevivedException
 from src.task.WWOneTimeTask import WWOneTimeTask
 from src.task.task_icons import task_icon
@@ -45,8 +46,13 @@ class TacetTask(WWOneTimeTask, BaseCombatTask):
 
     def run(self):
         super().run()
-        self.ensure_main(time_out=180)
-        self.wait_in_team_and_world(esc=True)
+        while True:
+            try:
+                self.ensure_main(time_out=180)
+                self.wait_in_team_and_world(esc=True)
+                break
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
         self.farm_tacet()
 
     def farm_tacet(self, daily=False, used_stamina=0, config=None, max_recovery_retries=3):
@@ -59,51 +65,65 @@ class TacetTask(WWOneTimeTask, BaseCombatTask):
         self.info_incr('used stamina', 0)
         recovery_retries = 0
         self.realm_entry_at_heal_point = False
+        phase = 'prepare'
         while True:
-            self.sleep(1)
-            self.openF2Book("gray_book_boss")
-            current, back_up, total = self.get_stamina()
-            if current == -1:
-                self.click_relative(0.04, 0.4, after_sleep=1)
-                current, back_up, total = self.get_stamina()
-            if total < self.stamina_once:
-                return self.not_enough_stamina()
-
-            self.open_boss_book('wuyin')
-            index = config.get('Which Tacet Suppression to Farm', 1) - 1
-            self.teleport_to_tacet(index)
-            self.click_team_challenge()
-            while True:
-                self.wait_in_team_and_world(time_out=120)
-                try:
-                    self.combat_once(target=True)
-                except CharRevivedException:
-                    recovery_retries += 1
-                    if recovery_retries >= max_recovery_retries:
-                        self.log_info(self.tr('farm_tacet: exceeded recovery retries ({max_recovery_retries}), stop farming').format(max_recovery_retries=max_recovery_retries),
-                                      notify=True)
-                        return None
-                    self.log_info(self.tr('farm_tacet: death recovered, re-enter from F2 book'))
-                    self.realm_entry_at_heal_point = True  # 恢复后站在信标上, 从 F2 直接进本
-                    break
-                self.walk_to_treasure()
-                self.pick_f(handle_claim=False)
-                self.sleep(2)
-                if not self.has_claim_stamina():
-                    self.esc_cancel()
-                    self.log_info(self.tr('is not claim treasure, restart challenge'))
-                    continue
-                can_continue, used = self.use_stamina(once=self.stamina_once, must_use=must_use)
-                self.info_incr('used stamina', used)
-                self.sleep(4)
-                if not can_continue:
-                    self.click_relative(0.365, 0.853, hcenter=True)
+            try:
+                if phase == 'prepare':
+                    self.sleep(1)
+                    self.openF2Book("gray_book_boss")
+                    current, back_up, total = self.get_stamina()
+                    if current == -1:
+                        self.click_relative(.04, .4, after_sleep=1)
+                        current, back_up, total = self.get_stamina()
+                    if total < self.stamina_once:
+                        return self.not_enough_stamina()
+                    self.open_boss_book('wuyin')
+                    phase = 'enter'
+                if phase == 'enter':
+                    index = config.get('Which Tacet Suppression to Farm', 1) - 1
+                    self.teleport_to_tacet(index)
+                    phase = 'team'
+                if phase == 'team':
+                    self.click_team_challenge()
+                    phase = 'fight'
+                if phase == 'fight':
                     self.wait_in_team_and_world(time_out=120)
+                    self.combat_once(target=True)
+                    phase = 'treasure'
+                if phase == 'treasure':
+                    if not self.has_claim_stamina():
+                        self.walk_to_treasure()
+                        self.pick_f(handle_claim=False)
+                    phase = 'claim'
+                    self.sleep(2)
+                if phase == 'claim':
+                    if not self.has_claim_stamina():
+                        self.esc_cancel()
+                        self.log_info(self.tr('is not claim treasure, restart challenge'))
+                        phase = 'fight'
+                        continue
+                    can_continue, used = self.use_stamina(once=self.stamina_once, must_use=must_use)
+                    # 额度与领取成功同时提交；继续按钮中断也不会重复领取或丢失已用额度。
+                    must_use -= used
+                    phase = 'result'
+                    self.info_incr('used stamina', used)
+                    self.sleep(4)
+                self.finish_challenge_result(can_continue, repeat_point=(.640, .851),
+                                             exit_point=(.365, .853), team_timeout=120, hcenter=True)
+                if not can_continue:
                     return None
-                else:
-                    self.click_relative(0.640, 0.851, hcenter=True, after_sleep=0.2)
-                    self.wait_click_skip_dialog_confirm()
-                must_use -= used
+                phase = 'fight'
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+            except CharRevivedException:
+                recovery_retries += 1
+                if recovery_retries >= max_recovery_retries:
+                    self.log_info(self.tr('farm_tacet: exceeded recovery retries ({max_recovery_retries}), stop farming').format(max_recovery_retries=max_recovery_retries),
+                                  notify=True)
+                    return None
+                self.log_info(self.tr('farm_tacet: death recovered, re-enter from F2 book'))
+                self.realm_entry_at_heal_point = True  # 恢复后站在信标上，从 F2 重新进入。
+                phase = 'prepare'
 
     def not_enough_stamina(self, back=True):
         self.log_info(self.tr('used all stamina'))

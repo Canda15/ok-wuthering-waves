@@ -110,19 +110,12 @@ jobs:
           git add -- $conflicts
           git commit --no-edit
 
-      - name: Install dependencies
-        if: steps.check.outputs.needed == 'true'
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
       - name: Re-vendor ok-script
         if: steps.check.outputs.needed == 'true'
         shell: pwsh
         run: |
-          # --reapply 先把合并带回来的 pin 重新删掉,再从 wheel 重建 ./ok
-          # 并重写 pyproject 的依赖生成块。
+          # 先在隔离树重放品牌与逻辑差异；验证成功后才移除依赖 pin 并整体替换。
+          # 这一步只用标准库，先做重放再安装依赖，避免重新装入上游 ok-script。
           python scripts/sync_ok.py --reapply
           # 必须显式判负:脚本崩了但后面的 git 命令成功时,pwsh 步骤仍会判绿,
           # 结果是"合并干净、ok/ 没更新、测试全绿"——最坏的一种假成功。
@@ -133,15 +126,20 @@ jobs:
             Write-Host '框架源码无变化'
           } else {
             $version = (Get-Content selfhost/ok_pin.json -Raw | ConvertFrom-Json).version
-            git commit -m "Vendor ok-script $version from the PyPI wheel"
+            git commit -m "other: 同步内联框架 $version"
           }
 
-      - name: Smoke test
+      - name: 安装现有依赖
+        if: steps.check.outputs.needed == 'true'
+        shell: pwsh
+        run: python .github/scripts/install_dependencies.py
+
+      - name: 验证前台输入与自维护核心
         if: steps.check.outputs.needed == 'true'
         env:
           QT_QPA_PLATFORM: offscreen
         shell: pwsh
-        run: python -u run_test.py tests/TestSelfhostSmoke.py
+        run: .\scripts\check_foreground.ps1
 
       - name: Push and tag
         if: steps.check.outputs.needed == 'true'

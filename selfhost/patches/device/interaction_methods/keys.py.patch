@@ -1,0 +1,44 @@
+--- a/device/interaction_methods/keys.py
++++ b/device/interaction_methods/keys.py
+@@ -1,41 +1,4 @@
+ import win32con
+-
+-PYDIRECT_KEY_MAP = {
+-    'alt_l': 'altleft',
+-    'alt_r': 'altright',
+-    'lalt': 'altleft',
+-    'ralt': 'altright',
+-    'ctrl_l': 'ctrlleft',
+-    'ctrl_r': 'ctrlright',
+-    'lctrl': 'ctrlleft',
+-    'rctrl': 'ctrlright',
+-    'lcontrol': 'ctrlleft',
+-    'rcontrol': 'ctrlright',
+-    'shift_l': 'shiftleft',
+-    'shift_r': 'shiftright',
+-    'lshift': 'shiftleft',
+-    'rshift': 'shiftright',
+-    'page_up': 'pageup',
+-    'page_down': 'pagedown',
+-    'caps_lock': 'capslock',
+-    'num_lock': 'numlock',
+-    'scroll_lock': 'scrolllock',
+-    'print_screen': 'printscreen',
+-    'cmd': 'win',
+-    'cmd_l': 'win',
+-    'cmd_r': 'win',
+-    'command': 'win',
+-    'meta': 'win',
+-    'windows': 'win',
+-}
+-
+-
+-
+-def normalize_pydirect_key(key):
+-    key = str(key)
+-    return PYDIRECT_KEY_MAP.get(key.lower(), key)
+-
+-
+ 
+ vk_key_dict = {
+     'F1': win32con.VK_F1,

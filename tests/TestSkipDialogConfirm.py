@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, call
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src.task.BaseWWTask import BaseWWTask
 
 
@@ -11,6 +12,31 @@ class TestSkipDialogConfirm(unittest.TestCase):
         self.task.find_one = Mock()
         self.task.click = Mock()
         self.task.sleep = Mock()
+        self.task.wait_foreground_frame = Mock()
+
+    def test_focus_after_checkbox_does_not_click_checkbox_again(self):
+        confirm, checkbox, fresh_confirm = object(), object(), object()
+        self.task.find_one.side_effect = [confirm, checkbox, fresh_confirm]
+        self.task.click.side_effect = [ForegroundInputInterrupted(), None]
+        self.assertTrue(self.task.click_skip_dialog_confirm())
+        self.assertEqual(self.task.click.call_args_list, [call(checkbox), call(fresh_confirm, after_sleep=.2)])
+        self.task.wait_foreground_frame.assert_called_once()
+
+    def test_new_frame_during_settle_discards_old_checkbox_and_confirm_boxes(self):
+        confirm, checkbox, fresh_confirm = object(), object(), object()
+        self.task.find_one.side_effect = [confirm, checkbox, fresh_confirm]
+        self.task._foreground_epoch = 0
+        self.task.sleep.side_effect = lambda seconds: setattr(self.task, '_foreground_epoch', 1)
+        self.assertTrue(self.task.click_skip_dialog_confirm())
+        self.task.click.assert_called_once_with(fresh_confirm, after_sleep=.2)
+
+    def test_system_input_failure_never_retries_checkbox_or_confirm(self):
+        self.task.find_one.side_effect = [object(), object()]
+        self.task.click.side_effect = ForegroundInputError()
+        with self.assertRaises(ForegroundInputError):
+            self.task.click_skip_dialog_confirm()
+        self.task.wait_foreground_frame.assert_not_called()
+        self.task.click.assert_called_once()
 
     def test_clicks_checkbox_then_confirm(self):
         confirm = object()

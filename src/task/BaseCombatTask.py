@@ -2,13 +2,15 @@ import re
 import time
 import unicodedata
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
 
-from ok import Logger, Config
+from ok import Logger, Config, TaskDisabledException
 from ok import color_range_to_bound
 from ok import safe_get
+from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from src import text_white_color
 from src.char import BaseChar
 from src.char.BaseChar import SwitchPriority, dot_color  # noqa
@@ -92,6 +94,27 @@ class BaseCombatTask(CombatCheck):
         self.chars = [None, None, None]
         self.freeze_durations = []
 
+    def on_foreground_resume(self):
+        active_rotation = getattr(self, '_active_char_rotation', None)
+        abyss_active = getattr(self, '_abyss_combat_active', False)
+        super().on_foreground_resume()
+        self.reset_combat_state('前台恢复，重新识别战斗')
+        # 已开始的挑战仍由新帧倒计时验证，不能因清理旧轮转而丢失正在进行的挑战。
+        self._abyss_combat_active = abyss_active
+        self.in_sleep_check = False
+        if active_rotation is not None and not getattr(self, '_foreground_revive_recovery', False):
+            raise ForegroundInputInterrupted('前台已恢复，旧角色轮转需要重新识别')
+
+    @contextmanager
+    def _foreground_revive_context(self):
+        """死亡恢复结束必定退出旧战斗栈，期间只允许恢复可重入的离场／回血导航。"""
+        previous = getattr(self, '_foreground_revive_recovery', False)
+        self._foreground_revive_recovery = True
+        try:
+            yield
+        finally:
+            self._foreground_revive_recovery = previous
+
     def add_freeze_duration(self, start, duration=-1.0, freeze_time=0.1):
         """添加冻结持续时间。用于精确计算技能冷却等。
 
@@ -147,11 +170,11 @@ class BaseCombatTask(CombatCheck):
             if check_function():
                 if animation_start > 0:
                     self._in_liberation = False
-                    logger.debug(f'animation ended')
+                    logger.debug('animation ended')
                     return
                 else:
                     if time.time() - start > enter_animation_wait:
-                        logger.info(f'send_key_and_wait_animation failed to enter animation')
+                        logger.info('send_key_and_wait_animation failed to enter animation')
                         return
                     logger.debug(f'animation not started send key {key}')
                     self.send_key(key, after_sleep=0.1)
@@ -230,24 +253,32 @@ class BaseCombatTask(CombatCheck):
         if btn_dialog_close:
             self.click(btn_dialog_close, move_back=True)
             return True
+        if self.in_team_and_world():
+            return False
         self.send_key('esc', after_sleep=2)
         self.sleep(1)
         return False
 
     def revive_action(self):
         """角色死亡恢复：关闭弹窗 → 传最近传送点回血。"""
-        try:
-            self.close_revive_popup()  # ① 关闭复活弹窗 (点按钮优先, esc 兜底)
-            if self.realm_entry_at_heal_point and self.in_realm():
-                self.ensure_main(time_out=120)  # 退本回到信标, 游戏自动回血
-                logger.info('revive_action: left realm at heal point, skip teleport')
-                return True
-            self.revive_at_tower_and_heal()
-            logger.info(f'revive_action success')
-            return True
-        except Exception as e:
-            logger.error(f'revive_action failed', e)
-            return False
+        with self._foreground_revive_context():
+            while True:
+                try:
+                    self.close_revive_popup()
+                    if self.realm_entry_at_heal_point and self.in_realm():
+                        self.ensure_main(time_out=120)
+                        logger.info('revive_action: left realm at heal point, skip teleport')
+                        return True
+                    self.revive_at_tower_and_heal()
+                    logger.info('revive_action success')
+                    return True
+                except ForegroundInputInterrupted:
+                    self.wait_foreground_frame()
+                except (ForegroundInputError, TaskDisabledException):
+                    raise
+                except Exception as e:
+                    logger.error('revive_action failed', e)
+                    return False
 
     def get_revive_search_boss_name(self):
         revive_search_names = {
@@ -268,13 +299,7 @@ class BaseCombatTask(CombatCheck):
         # 退本后可能仍在加载黑屏, 给足超时等待真正回到大世界 (原 go_to_tower 用 80s)
         self.ensure_main(time_out=120)
         # ① F2 图鉴 → 全部怪物 → 搜索对应语言的无冠者
-        gray_book = self.openF2Book("gray_book_all_monsters")
-        self.click_box(gray_book, after_sleep=1)
-        self.click(0.13, 0.14, after_sleep=0.5)  # 搜索图标
-        self.input_text(self.get_revive_search_boss_name())
-        self.sleep(0.3)
-        self.click(0.20, 0.14, after_sleep=0.3)  # 点搜索框确保焦点
-        self.send_key('enter', after_sleep=0.5)  # 回车确认搜索, 刷新结果列表
+        self.search_monsters(self.get_revive_search_boss_name())
         self.click(0.13, 0.24, after_sleep=0.5)  # 选中第一条结果
         # ② 点"探测"打开地图并定位到目标 boss (只点一次, 避免地图打开后误触传送点)
         self.click(0.89, 0.92, after_sleep=1)
@@ -292,30 +317,51 @@ class BaseCombatTask(CombatCheck):
         """按 M 开图, 就近找传送点回血 (供 FarmEchoTask 在 boss 点使用)。"""
         self.ensure_main(time_out=10)
         self.log_info(self.tr('click m to open the map'))
-        start = time.time()
-        while self.in_team_and_world() and time.time() - start < 20:
-            self.send_key('m', after_sleep=2)
+        start = self.business_time()
+        while self.in_team_and_world() and self.business_time() - start < 20:
+            try:
+                self.send_key('m', after_sleep=2)
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
         self._travel_to_nearest_waypoint()
 
     def _travel_to_nearest_waypoint(self):
         """在已打开的地图界面上, 找最近传送点并传送, 等回到大世界。"""
-        self.sleep(2)
-        teleport = self.find_best_match_in_box(self.box_of_screen(0.1, 0.1, 0.9, 0.9),
-                                               ['map_way_point', 'map_way_point_big'], 0.6)
-        if not teleport:
-            raise RuntimeError(self.tr('Can not find a teleport to heal'))
-        self.click(teleport, after_sleep=1)
-        travel = self.wait_feature('gray_teleport', raise_if_not_found=True, time_out=3)
-        if not travel:
-            pop_up = self.find_feature('map_way_point', box='map_way_point_pop_up_box')
-            if pop_up:
-                self.click(pop_up, after_sleep=1)
-                travel = self.wait_feature('gray_teleport', raise_if_not_found=True, time_out=3)
-        if not travel:
-            raise RuntimeError(self.tr('Can not find the travel button'))
-        self.click_box(travel, relative_x=1.5)
-        self.wait_in_team_and_world(time_out=20)
-        self.sleep(2)
+        phase = 'select'
+        recovering = False
+        while True:
+            try:
+                if recovering and self.in_team_and_world():
+                    if phase == 'wait':
+                        return
+                    # 尚未确认传送请求完成时，可重做免费导航，不能直接宣称已经回血。
+                    self.send_key('m', after_sleep=2)
+                    phase = 'select'
+                if phase == 'select':
+                    self.sleep(2)
+                    teleport = self.find_best_match_in_box(self.box_of_screen(.1, .1, .9, .9),
+                                                           ['map_way_point', 'map_way_point_big'], .6)
+                    if not teleport:
+                        raise RuntimeError(self.tr('Can not find a teleport to heal'))
+                    self.click(teleport, after_sleep=1)
+                    phase = 'travel'
+                if phase == 'travel':
+                    travel = self.wait_feature('gray_teleport', raise_if_not_found=True, time_out=3)
+                    if not travel:
+                        pop_up = self.find_feature('map_way_point', box='map_way_point_pop_up_box')
+                        if pop_up:
+                            self.click(pop_up, after_sleep=1)
+                            travel = self.wait_feature('gray_teleport', raise_if_not_found=True, time_out=3)
+                    if not travel:
+                        raise RuntimeError(self.tr('Can not find the travel button'))
+                    self.click_box(travel, relative_x=1.5)
+                    phase = 'wait'
+                self.wait_in_team_and_world(time_out=20)
+                self.sleep(2)
+                return
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+                recovering = True
 
     def raise_not_in_combat(self, message):
         """抛出未在战斗状态的异常。
@@ -500,14 +546,18 @@ class BaseCombatTask(CombatCheck):
             self.skip_combat_check = previous_skip
 
     def wait_combat(self, target=True, time_out=10, raise_if_not_found=True):
-        start = time.time()
+        start = self.business_time()
         result = None
-        while time.time() - start < time_out:
-            if result := self.in_combat():
-                break
-            if target:
-                self.middle_click(interval=0.5)
-            self.sleep(0.02)
+        while self.business_time() - start < time_out:
+            try:
+                if result := self.in_combat():
+                    break
+                if target:
+                    self.middle_click(interval=0.5)
+                self.sleep(0.02)
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                self.on_foreground_resume()
 
         if raise_if_not_found and not result:
             raise Exception(self.tr('wait condition failed while walking'))
@@ -552,9 +602,23 @@ class BaseCombatTask(CombatCheck):
             self.switch_healer()
         self.info['Combat Count'] = self.info.get('Combat Count', 0) + 1
         try:
-            while self.in_combat():
-                logger.debug(f'combat_once loop {self.chars}')
-                self.get_current_char().perform()
+            while True:
+                try:
+                    if not self.in_combat():
+                        break
+                    current_char = self.get_current_char()
+                    if current_char is None:
+                        self.load_chars()
+                        current_char = self.get_current_char()
+                    if current_char is None:
+                        self.next_frame()
+                        continue
+                    logger.debug(f'combat_once loop {self.chars}')
+                    current_char.perform()
+                except ForegroundInputInterrupted:
+                    # 新帧只能开启新的轮转，不能沿用失焦时已释放的长按和旧角色引用。
+                    self.wait_foreground_frame()
+                    self.on_foreground_resume()
         except CharDeadException as e:
             raise e
         except NotInCombatException as e:
@@ -934,17 +998,33 @@ class BaseCombatTask(CombatCheck):
         """战斗结束时调用的清理方法。"""
         current_char = self.get_current_char(raise_exception=False)
         if current_char:
-            current_char.on_combat_end(self.chars)
+            previous = getattr(self, '_active_char_rotation', None)
+            self._active_char_rotation = current_char
+            try:
+                current_char.on_combat_end(self.chars)
+            except ForegroundInputInterrupted:
+                # 结束动作也属于旧角色栈；恢复后仅清理新队伍，不重放旧角色的结束技能。
+                self._active_char_rotation = previous
+                self.wait_foreground_frame()
+            finally:
+                self._active_char_rotation = previous
         for char in self.chars:
             if char:
                 char.reset_state()
 
     def switch_healer(self):
-        if self.switch_healer_enabled():
-            current_char = self.get_current_char()
-            has_healer = any(char and char.is_healer for char in self.chars)
-            if current_char and not current_char.is_healer and has_healer:
-                current_char.switch_other_char(allow_auto_combat=True)
+        while True:
+            try:
+                if self.switch_healer_enabled():
+                    current_char = self.get_current_char()
+                    has_healer = any(char and char.is_healer for char in self.chars)
+                    if current_char and not current_char.is_healer and has_healer:
+                        current_char.switch_other_char(allow_auto_combat=True)
+                return
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+                self.on_foreground_resume()
+                self.load_chars()
 
     def switch_healer_enabled(self):
         config_task = self
@@ -1034,7 +1114,7 @@ class BaseCombatTask(CombatCheck):
         else:
             if len(self.chars) == 3:
                 self.chars = self.chars[:2]
-                logger.info(f'team size changed to 2')
+                logger.info('team size changed to 2')
 
         apply_team_char_classes(self, self.chars)
 

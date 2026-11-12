@@ -4,8 +4,9 @@ import re
 import cv2
 import numpy as np
 
+from ok.device.interaction_methods.foreground_input import ForegroundInputInterrupted
+
 from src.task.BaseWWTask import BaseWWTask
-from src.task.MouseResetTask import MouseResetTask
 from src.task.WWOneTimeTask import WWOneTimeTask
 from src.task.task_icons import task_icon
 
@@ -136,79 +137,56 @@ class TacetEliminationTask(WWOneTimeTask, BaseWWTask):
         previous = None
         stagnant = 0
         step = 0
-        # Hourglasses can extend the final stage beyond any fixed move limit.
-        # Capture/sleep calls remain cancellation points; stalls still fail below.
+        # 沙漏可延长回合，故保留无固定步数限制的循环；真正停滞仍使用下面的失败边界。
         while True:
-            self.next_frame()
-            if self.dismiss_event_help():
-                self.wait_board_settled()
-                continue
-            if not self.is_board():
-                return
-            board = read_board(self.frame)
-            signature = tuple(map(tuple, board))
-            if signature != previous:
-                failed.clear()
-                stagnant = 0
-            else:
-                stagnant += 1
-            if stagnant > 8:
-                self.screenshot('tacet_unrecognized_board')
-                raise RuntimeError(self.tr('Board unchanged or unrecognized; check the event screen'))
-            if sum(line.count('?') for line in board) > 4:
-                # The board slides in after its turn counter becomes visible.
+            try:
+                self.next_frame()
+                if self.dismiss_event_help():
+                    self.wait_board_settled()
+                    continue
+                if not self.is_board():
+                    return
+                board = read_board(self.frame)
+                signature = tuple(map(tuple, board))
+                if signature != previous:
+                    failed.clear()
+                    stagnant = 0
+                else:
+                    stagnant += 1
+                if stagnant > 8:
+                    self.screenshot('tacet_unrecognized_board')
+                    raise RuntimeError(self.tr('Board unchanged or unrecognized; check the event screen'))
+                if sum(line.count('?') for line in board) > 4:
+                    # 回合计数可能先于棋盘入场，等待完整棋盘后再决定交换。
+                    previous = signature
+                    self.sleep(.5)
+                    continue
+                move = choose_move(board, failed)
+                if move is None:
+                    raise RuntimeError(self.tr('No legal move recognized: {board}').format(board=board))
+                score, start, end = move
+                self.log_info(self.tr('Elimination move {start} -> {end}, score={score}; board={signature}').format(start=start, end=end, score=score, signature=signature))
+                self.swap(start, end)
+                step += 1
+                self.info_set('Move', step)
+                self.sleep(.8)
+                failed.add((start, end))
                 previous = signature
-                self.sleep(.5)
-                continue
-            move = choose_move(board, failed)
-            if move is None:
-                raise RuntimeError(self.tr('No legal move recognized: {board}').format(board=board))
-            score, start, end = move
-            step += 1
-            self.info_set('Move', step)
-            self.log_info(self.tr('Elimination move {start} -> {end}, score={score}; board={signature}').format(start=start, end=end, score=score, signature=signature))
-            self.swap(start, end)
-            self.sleep(.8)
-            failed.add((start, end))
-            previous = signature
-            self.wait_board_settled()
+                self.wait_board_settled()
+            except ForegroundInputInterrupted:
+                # 拖拽可能已部分生效；清掉旧棋盘和无效动作集合，从新画面重算，不续接手势。
+                failed.clear()
+                previous = None
+                stagnant = 0
+                self.wait_foreground_frame()
 
     def swap(self, start, end):
         self.drag_relative(cell_position(*start), cell_position(*end))
 
     def drag_relative(self, first, last, smooth=False):
-        from ok.device.interaction_methods.pynput import PynputInteraction
-
-        # The event's drag control reads the real cursor during a drag.
-        # Normal event buttons continue to use the configured interaction.
-        interaction = self.executor.interaction
-        if hasattr(interaction, 'hwnd_window'):
-            interaction.hwnd_window.bring_to_front()
-            if not self.wait_until(interaction.hwnd_window.is_foreground, time_out=2):
-                raise RuntimeError(self.tr('Cannot focus the game window; board dragging stopped'))
-            drag = PynputInteraction(interaction.capture, interaction.hwnd_window)
-            if not smooth:
-                drag.swipe(int(first[0] * self.width), int(first[1] * self.height),
-                           int(last[0] * self.width), int(last[1] * self.height), 600)
-                self.reset_scene()
-                return
-            x, y = first[0] * self.width, first[1] * self.height
-            drag.mouse_down(int(x), int(y))
-            try:
-                for step in range(1, 31):
-                    if not interaction.hwnd_window.is_foreground():
-                        raise RuntimeError(self.tr('Game window lost focus; dragging stopped'))
-                    drag.move(int(x + (last[0] * self.width - x) * step / 30),
-                              int(y + (last[1] * self.height - y) * step / 30))
-                    self.sleep(.02)
-            finally:
-                # Always release our own real mouse press, even on cancellation
-                # or focus loss. Only this release bypasses the focus guard.
-                drag.check_clickable = False
-                drag.mouse_up()
-            self.reset_scene()
-        else:
-            self.swipe_relative(*first, *last, duration=.6)
+        # 棋盘和关卡列表共用前台后端，时长由任务接口以秒传递。
+        # 平滑移动、失焦中断和无门禁释放由同一输入核心负责。
+        self.swipe_relative(*first, *last, duration=.6)
 
     def wait_board_settled(self):
         previous = None
@@ -223,22 +201,15 @@ class TacetEliminationTask(WWOneTimeTask, BaseWWTask):
             previous = current
 
     def run(self):
-        self.prepare_event()
-        WWOneTimeTask.run(self)
-        mouse_reset = self.get_task_by_class(MouseResetTask)
-        was_enabled = mouse_reset.enabled
-        # Its asynchronous mouse_up interrupts both list drags and board swaps.
-        # Suspend only runtime state, preserving the user's persisted setting.
-        mouse_reset._enabled = False
-        try:
-            self.sleep(.1)
-            self.run_event()
-        finally:
-            # Respect a user change made while this long-running task was active.
-            restore_enabled = mouse_reset.config.get('_enabled', was_enabled)
-            mouse_reset._enabled = restore_enabled
-            if restore_enabled:
-                mouse_reset.post_mouse_reset(.01)
+        while True:
+            try:
+                self.prepare_event()
+                WWOneTimeTask.run(self)
+                self.sleep(.1)
+                break
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+        self.run_event()
 
     def run_event(self):
         self.completed_stages = 0
@@ -250,84 +221,97 @@ class TacetEliminationTask(WWOneTimeTask, BaseWWTask):
         self.info_set('Retries', 0)
         after_result = False
         unknown_frames = 0
-        # Detail pages must also pass the prerequisite sweep before starting.
-        if not self.is_board() and self.ocr(.6, .8, 1, .96, match=re.compile(
-                r'开始挑战|Start Challenge', re.I)):
-            self.return_to_stage_list()
-        for _ in range(100):
-            self.next_frame()
-            if self.is_board():
-                unknown_frames = 0
-                played_board = True
-                self.play_board()
-                self.sleep(1)
-                continue
-            boxes = self.event_text()
-            text = self.text(boxes)
-            self.log_info(self.tr('Event screen: {text}').format(text=text))
-            if re.search(r'挑战成功|Challenge (?:Complete|Success)', text, re.I):
-                self.screenshot('tacet_stage_success')
-                if not self.wait_until(lambda: self.click_text(
-                        self.event_text(), r'退出关卡|Exit|Leave'), time_out=8):
-                    raise RuntimeError(self.tr('Result screen exit button not found'))
-                self.completed_stages += 1
-                self.info_set('Completed stages', self.completed_stages)
-                final_finished |= self.final_stage
-                after_result = True
-                continue
-            if self.click_text(boxes, r'再试一次|再次挑战|重新挑战|重新开始|Retry|Try Again'):
-                self.info_set('Retries', self.info.get('Retries', 0) + 1)
-                if self.info.get('Retries', 0) > 3:
-                    raise RuntimeError(self.tr('Stage retry limit exceeded'))
-                continue
-            if after_result and re.search(r'开始挑战|Start Challenge', text, re.I):
-                # Resuming in the middle of a board may miss its record label.
-                # Its resulting detail page still identifies the finished stage.
-                if played_board and re.search(r'终局消除|Final Elimination', text, re.I):
-                    self.final_stage = True
-                    final_finished = True
-                self.return_to_stage_list()
-                after_result = False
-                if final_finished:
-                    self.screenshot('tacet_final_score_completed')
-                    self.log_info(self.tr('Final Elimination finished naturally; restart the task to continue scoring'), notify=True)
-                    return
-                continue
-            if self.click_text(boxes, r'开始挑战|Start Challenge'):
-                if not self.wait_until(self.is_board, time_out=3):
-                    # The foreground event sometimes ignores a posted button
-                    # click after a real drag. Retry only the still-visible Start.
-                    start = self.ocr(.6, .8, 1, .96, match=re.compile(r'开始挑战|Start Challenge', re.I))
-                    if not start:
-                        raise RuntimeError(self.tr('No board or Start button detected after starting the challenge'))
-                    self.foreground_click(start[0])
-                    if not self.wait_until(self.is_board, time_out=10):
-                        raise RuntimeError(self.tr('No board detected after starting the challenge'))
-                self.wait_board_settled()
-                continue
-            if self.click_text(boxes, r'^领取$|一键领取|全部领取|^Claim(?: All)?$'):
-                self.claimed_rewards += 1
-                self.info_set('Claimed rewards', self.claimed_rewards)
-                continue
-            if re.search(r'获得奖励|Rewards Obtained|获得物品', text, re.I):
-                self.click(.5, .91, after_sleep=.5)
-                continue
-            if re.search(r'已完成|进行中|未开始|未完成|暂无记录|最高[纪记]录|解锁|Completed|In Progress|No Record|Best|[Uu]nlock', text, re.I):
-                after_result = False
-                if final_finished:
-                    self.screenshot('tacet_final_score_completed')
-                    self.log_info(self.tr('Final Elimination finished naturally; restart the task to continue scoring'), notify=True)
-                    return
-                if self.open_unfinished_stage():
+        # 初始详情页也需扫描前置关卡；返回中断后从新画面决定是否仍需返回。
+        while True:
+            try:
+                if not self.is_board() and self.ocr(.6, .8, 1, .96, match=re.compile(
+                        r'开始挑战|Start Challenge', re.I)):
+                    self.return_to_stage_list()
+                break
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+        action_count = 0
+        while action_count < 100:
+            counted = False
+            try:
+                self.next_frame()
+                action_count += 1
+                counted = True
+                if self.is_board():
+                    unknown_frames = 0
+                    played_board = True
+                    self.play_board()
+                    self.sleep(1)
                     continue
-                raise RuntimeError(self.tr('No unlocked Final Elimination stage found'))
-            # Cascades and victory banners briefly obscure OCR text.
-            unknown_frames += 1
-            if unknown_frames < 12:
-                self.sleep(.5)
-                continue
-            self.screenshot('tacet_unknown_screen')
-            raise RuntimeError(self.tr('Cannot recognize Tacet Elimination screen: {text}').format(text=text))
+                boxes = self.event_text()
+                text = self.text(boxes)
+                self.log_info(self.tr('Event screen: {text}').format(text=text))
+                if re.search(r'挑战成功|Challenge (?:Complete|Success)', text, re.I):
+                    self.screenshot('tacet_stage_success')
+                    # 成功页本身已确认通关；先保存状态，退出点击中断后不能重复计数或重开终局。
+                    if not after_result:
+                        self.completed_stages += 1
+                        self.info_set('Completed stages', self.completed_stages)
+                    final_finished |= self.final_stage
+                    after_result = True
+                    if not self.wait_until(lambda: self.click_text(
+                            self.event_text(), r'退出关卡|Exit|Leave'), time_out=8):
+                        raise RuntimeError(self.tr('Result screen exit button not found'))
+                    continue
+                if self.click_text(boxes, r'再试一次|再次挑战|重新挑战|重新开始|Retry|Try Again'):
+                    self.info_set('Retries', self.info.get('Retries', 0) + 1)
+                    if self.info.get('Retries', 0) > 3:
+                        raise RuntimeError(self.tr('Stage retry limit exceeded'))
+                    continue
+                if after_result and re.search(r'开始挑战|Start Challenge', text, re.I):
+                    # 中途恢复棋盘可能没读到记录标签，结果详情页仍可确认已完成的终局。
+                    if played_board and re.search(r'终局消除|Final Elimination', text, re.I):
+                        self.final_stage = True
+                        final_finished = True
+                    self.return_to_stage_list()
+                    after_result = False
+                    if final_finished:
+                        self.screenshot('tacet_final_score_completed')
+                        self.log_info(self.tr('Final Elimination finished naturally; restart the task to continue scoring'), notify=True)
+                        return
+                    continue
+                if self.click_text(boxes, r'开始挑战|Start Challenge'):
+                    if not self.wait_until(self.is_board, time_out=3):
+                        start = self.ocr(.6, .8, 1, .96, match=re.compile(r'开始挑战|Start Challenge', re.I))
+                        if not start:
+                            raise RuntimeError(self.tr('No board or Start button detected after starting the challenge'))
+                        self.click(start[0], after_sleep=.7)
+                        if not self.wait_until(self.is_board, time_out=10):
+                            raise RuntimeError(self.tr('No board detected after starting the challenge'))
+                    self.wait_board_settled()
+                    continue
+                if self.click_text(boxes, r'^领取$|一键领取|全部领取|^Claim(?: All)?$'):
+                    self.claimed_rewards += 1
+                    self.info_set('Claimed rewards', self.claimed_rewards)
+                    continue
+                if re.search(r'获得奖励|Rewards Obtained|获得物品', text, re.I):
+                    self.click(.5, .91, after_sleep=.5)
+                    continue
+                if re.search(r'已完成|进行中|未开始|未完成|暂无记录|最高[纪记]录|解锁|Completed|In Progress|No Record|Best|[Uu]nlock', text, re.I):
+                    after_result = False
+                    if final_finished:
+                        self.screenshot('tacet_final_score_completed')
+                        self.log_info(self.tr('Final Elimination finished naturally; restart the task to continue scoring'), notify=True)
+                        return
+                    if self.open_unfinished_stage():
+                        continue
+                    raise RuntimeError(self.tr('No unlocked Final Elimination stage found'))
+                unknown_frames += 1
+                if unknown_frames < 12:
+                    self.sleep(.5)
+                    continue
+                self.screenshot('tacet_unknown_screen')
+                raise RuntimeError(self.tr('Cannot recognize Tacet Elimination screen: {text}').format(text=text))
+            except ForegroundInputInterrupted:
+                if counted:
+                    action_count -= 1
+                unknown_frames = 0
+                self.wait_foreground_frame()
         raise RuntimeError(self.tr('Event screen action limit exceeded'))
 
     def click_text(self, boxes, pattern):
@@ -337,33 +321,14 @@ class TacetEliminationTask(WWOneTimeTask, BaseWWTask):
                 return True
         return False
 
-    def foreground_click(self, box):
-        from ok.device.interaction_methods.pynput import PynputInteraction
-
-        interaction = self.executor.interaction
-        window = interaction.hwnd_window
-        window.bring_to_front()
-        if not self.wait_until(window.is_foreground, time_out=2):
-            raise RuntimeError(self.tr('Cannot focus the game window; clicking stopped'))
-        click = PynputInteraction(interaction.capture, window)
-        click.click(int(box.x + box.width / 2), int(box.y + box.height / 2), down_time=.1)
-        self.reset_scene()
-
     def return_to_stage_list(self):
         self.send_key('esc', after_sleep=.7)
         on_details = lambda: bool(self.ocr(.6, .8, 1, .96, match=re.compile(
             r'开始挑战|Start Challenge', re.I)))
         if self.wait_until(lambda: not on_details(), time_out=2):
             return
-        from ok.device.interaction_methods.pynput import PynputInteraction
-
-        interaction = self.executor.interaction
-        window = interaction.hwnd_window
-        window.bring_to_front()
-        if not self.wait_until(window.is_foreground, time_out=2):
-            raise RuntimeError(self.tr('Cannot focus the game window to return to the stage list'))
-        PynputInteraction(interaction.capture, window).send_key('esc', down_time=.1)
-        self.reset_scene()
+        # 第一次返回无效时只重试仍显示详情页的 Esc，输入继续走统一后端。
+        self.send_key('esc', down_time=.1, after_sleep=.7)
         if not self.wait_until(lambda: not on_details(), time_out=5):
             raise RuntimeError(self.tr('Failed to return to the stage list'))
 

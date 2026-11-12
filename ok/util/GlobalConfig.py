@@ -187,7 +187,7 @@ def create_notification_options():
         SMTP_USE_TLS: True,
         SMTP_DEFAULT_SENDER: '',
         SMTP_DEFAULT_RECIPIENT: '',
-        # Desktop automation is intentionally last and marked unreliable.
+        # 桌面通知仍依赖客户端识别，置于列表末尾并保留不可靠标记。
         QQ_NOTIFICATION_ENABLED: False,
         QQ_NICKNAME: '',
         WECHAT_NOTIFICATION_ENABLED: False,
@@ -224,10 +224,10 @@ def create_notification_options():
         DISCORD_NOTIFICATION_ENABLED: 'Send notifications to a Discord webhook',
         DISCORD_WEBHOOK: 'Discord channel webhook URL',
         QQ_NOTIFICATION_ENABLED: (
-            'Requires the local QQ client window to be open and running'),
+            '需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
         QQ_NICKNAME: 'Exact QQ contact nickname',
         WECHAT_NOTIFICATION_ENABLED: (
-            'Requires the local WeChat client window to be open and running'),
+            '需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
         WECHAT_NICKNAME: 'Exact WeChat contact nickname',
         TELEGRAM_NOTIFICATION_ENABLED: 'Send notifications through the Telegram Bot API',
         TELEGRAM_BOT_TOKEN: 'Telegram bot token from BotFather',

@@ -103,6 +103,16 @@ class StartController:
             return True
         return False
 
+    def _check_prepare_cancelled(self):
+        if self.exit_event.is_set() or self._cancel_requested.is_set():
+            from ok.task.exceptions import TaskDisabledException
+            raise TaskDisabledException()
+
+    def _prepare_explicit_foreground(self):
+        if not og.executor.prepare_foreground(
+                request_focus=True, time_out=min(5, self.start_timeout), cancel_check=self._check_prepare_cancelled):
+            raise RuntimeError('目标尚未获得真实前台，请将游戏切回前台后重试启动')
+
     def tr(self, message):
         app = getattr(og, "app", None)
         return app.tr(message) if app is not None else message
@@ -111,6 +121,7 @@ class StartController:
     def _mark_task_enabled(task):
         if not task.enabled:
             task._enabled = True
+            task._foreground_resume_pending = False
             task.info_clear()
             task.executor.enqueue_onetime_task(task)
             logger.info(f"enabled task {task}")
@@ -160,6 +171,7 @@ class StartController:
 
             if task and task.enabled and task.paused:
                 logger.info(f"resume paused task {task}")
+                self._prepare_explicit_foreground()
                 if exit_after:
                     task.exit_after_task = True
                     communicate.task.emit(task)
@@ -173,6 +185,7 @@ class StartController:
                     task.exit_after_task = True
                 self._mark_task_enabled(task)
                 if og.executor.paused:
+                    self._prepare_explicit_foreground()
                     og.executor.start()
                 communicate.starting_emulator.emit(True, None, 0)
                 return True
@@ -223,6 +236,8 @@ class StartController:
             for waiting_task in waiting:
                 add_task_to_enable(waiting_task)
 
+            # 总启动即使只有触发任务，也须先等新绑定并核对一次真实前台。
+            self._prepare_explicit_foreground()
             for task in tasks_to_enable:
                 self._mark_task_enabled(task)
 
@@ -441,7 +456,7 @@ class StartController:
                 return self.tr("Emulator is not connected, start the emulator first!")
             if isinstance(og.device_manager.capture_method,
                           BrowserCaptureMethod) and not og.device_manager.capture_method.connected():
-                logger.info(f"start browser")
+                logger.info("start browser")
                 og.device_manager.capture_method.start_browser()
             if not og.device_manager.capture_method.connected():
                 logger.error(f'Game window is not connected {og.device_manager.capture_method}')
@@ -461,19 +476,19 @@ class StartController:
                             'Window is minimized or out of screen, and don\'t use full-screen exclusive mode!')
             frame = self.try_capture_a_frame()
             if frame is None:
-                logger.error(f'check_device_error: try_capture_a_frame returned None')
+                logger.error('check_device_error: try_capture_a_frame returned None')
                 return self.tr('Capture failed, please check game window')
             logger.info(f'check_device_error: capturing frame {frame.shape[1], frame.shape[0]}')
             if og.executor.feature_set is not None:
-                logger.info(f'check_device_error: checking feature_set size')
+                logger.info('check_device_error: checking feature_set size')
                 if not og.executor.feature_set.check_size(frame):
-                    logger.error(f'check_device_error: feature_set check_size failed')
+                    logger.error('check_device_error: feature_set check_size failed')
                     return self.tr(
                         'Image resource load failed, please try install again.(Don\'t put the app in Downloads folder)')
             else:
-                logger.info(f'check_device_error: feature_set is None')
+                logger.info('check_device_error: feature_set is None')
 
-            logger.info(f'check_device_error: checking resolution')
+            logger.info('check_device_error: checking resolution')
             resolution_error = self.check_resolution()
             if resolution_error:
                 logger.error(f'check_device_error: resolution_error: {resolution_error}')
@@ -498,8 +513,8 @@ class StartController:
             frame = og.device_manager.capture_method.get_frame(busy_wait=1)
             if frame is not None:
                 return frame
-            logger.info(f'try_capture_a_frame: frame is None, retrying...')
+            logger.info('try_capture_a_frame: frame is None, retrying...')
             if time.time() - start > 5:
-                logger.error(f'time out try_capture_a_frame')
+                logger.error('time out try_capture_a_frame')
                 return None
             time.sleep(0.1)

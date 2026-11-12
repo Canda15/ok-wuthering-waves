@@ -52,7 +52,7 @@ Read `references/character-patterns.md` for the detailed API, templates, and val
 
 - Answer in the user's language. For mixed English/Chinese requests, include both key game terms when it helps.
 - Keep Python method names and local variables in English unless the surrounding code already uses another style.
-- Use Chinese comments only when they explain a game mechanic more clearly than English; keep comments sparse.
+- 本项目关键逻辑和输入恢复决策使用简体中文注释，解释业务背景和原因。
 - Preserve exact `Labels` enum names used by assets and annotations.
 
 ## Character Description Pages
@@ -69,6 +69,9 @@ Always verify the implementation against this repo's helpers and available label
 
 ## Essential Rules
 
+- 输入通过 `self.task` 的公共键鼠方法进入同一个前台核心，遵循 [前台系统键鼠契约](../ok-script-develop/SKILL.md#本项目的-windows-输入契约)；禁止局部 Controller、窗口消息键鼠或直接 SetCursorPos。
+- 失焦会释放已持有输入，回到前台后刷新画面自动继续；重新识别角色状态后决定后续动作，不能把已释放的长按或拖拽当作仍在进行。
+- 角色识别或技能兜底的宽泛异常处理必须继续抛出 `ForegroundInputInterrupted`、`ForegroundInputError` 和取消异常，让公共战斗循环退出旧轮转并从新队伍判断；不能在角色兜底内吞错或重放技能。
 - Do not add a character class without registering it in `CharFactory.py`.
 - Do not invent `Labels` feature names silently. Create and verify new features through the library's template workflow when evidence is available; otherwise document the required label and missing source image.
 - Use `self.time_elapsed_accounting_for_freeze(...)` for rotation timing when liberation or intro animation can freeze time.

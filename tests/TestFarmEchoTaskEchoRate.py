@@ -1,6 +1,9 @@
 import unittest
-from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from ok.task.exceptions import TaskDisabledException
 from ok.task.task import BaseTask
 from src.task.BaseWWTask import BaseWWTask
 from src.task.FarmEchoTask import FarmEchoTask
@@ -41,6 +44,7 @@ class FakeDailyTask:
     def __init__(self, farm_echo_task):
         self.info = {}
         self.farm_echo_task = farm_echo_task
+        self.executor = SimpleNamespace(task_context=lambda task: nullcontext())
 
     def get_task_by_class(self, cls):
         assert cls is FarmEchoTask
@@ -69,6 +73,26 @@ class TestFarmEchoTaskEchoRate(unittest.TestCase):
         # would report 7200
         self.assertEqual(2, task.info['Echo Count'])
         self.assertEqual(2, task.info['Echo per Hour'])
+
+    def test_已完成轮次后取消仍上抛且不进入弹窗恢复(self, _):
+        task = FakeFarmEchoTask()
+
+        def cancel_after_pickup():
+            task.incr_drop(True)
+            raise TaskDisabledException()
+
+        task.do_run = Mock(side_effect=cancel_after_pickup)
+        task.handle_claim_button = Mock()
+        task.handle_monthly_card = Mock()
+
+        with self.assertRaises(TaskDisabledException):
+            task.run()
+
+        # 已确认的拾取计数保留，取消不能成为正常完成或重新进入领奖／月卡恢复。
+        self.assertEqual(1, task.info['Echo Count'])
+        task.do_run.assert_called_once()
+        task.handle_claim_button.assert_not_called()
+        task.handle_monthly_card.assert_not_called()
 
 
 if __name__ == '__main__':
