@@ -1,0 +1,14 @@
+--- a/util/shortcut.py
++++ b/util/shortcut.py
+@@ -49,8 +49,9 @@
+         logger.info('skip creating shortcut because pyappify has no create_shortcut')
+         return None
+     basic_config = basic_config if basic_config is not None else {}
+-    start_menu = bool(basic_config.get(CREATE_START_MENU_SHORTCUT, True))
+-    desktop = bool(basic_config.get(CREATE_DESKTOP_SHORTCUT, True))
++    # 默认不改写系统入口，仅在用户明确开启对应选项时创建快捷方式。
++    start_menu = bool(basic_config.get(CREATE_START_MENU_SHORTCUT, False))
++    desktop = bool(basic_config.get(CREATE_DESKTOP_SHORTCUT, False))
+     if not start_menu and not desktop:
+         logger.info('skip creating shortcut because both shortcut options are disabled')
+         return None

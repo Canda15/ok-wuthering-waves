@@ -76,8 +76,8 @@ _basic_options_default = {
     'Trigger Interval': 1,
     'Minimize Window to System Tray when Closing': False,
     KILL_LAUNCHER_AFTER_START: True,
-    CREATE_START_MENU_SHORTCUT: True,
-    CREATE_DESKTOP_SHORTCUT: True,
+    CREATE_START_MENU_SHORTCUT: False,
+    CREATE_DESKTOP_SHORTCUT: False,
     ENABLE_MCP_SERVER: False,
 }
 _basic_options_group = {
@@ -98,8 +98,8 @@ _basic_options_group = {
     'Blur Interval': BASIC_GROUP_BLUR,
 }
 _shortcut_options_default = {
-    CREATE_START_MENU_SHORTCUT: True,
-    CREATE_DESKTOP_SHORTCUT: True,
+    CREATE_START_MENU_SHORTCUT: False,
+    CREATE_DESKTOP_SHORTCUT: False,
 }
 _shortcut_options_description = {
     CREATE_START_MENU_SHORTCUT: 'Create or update the Start Menu shortcut when the app starts',

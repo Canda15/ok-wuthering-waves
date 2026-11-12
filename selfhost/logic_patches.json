@@ -313,7 +313,15 @@
       "format": "unified_diff",
       "payload": "patches/util/GlobalConfig.py.patch",
       "before_sha256": "fca4bff1c0cb9c7fe8c9c61fd4ffb54500e0371af9ced765638c8d85b4b5e529",
-      "after_sha256": "8bbc89dbb3ae05954dd8d4dc5f714dde80d0c26e4f441b55144a6135c9f20622"
+      "after_sha256": "a42494af6a245956196db943f1beb1e666a7df994a556b72b401df8eafbd0f19"
+    },
+    {
+      "path": "util/shortcut.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/util/shortcut.py.patch",
+      "before_sha256": "e172c962b72d1516f8c8b172a2748090a356dbe073999b60fd4fd11f6296109c",
+      "after_sha256": "6d086c0369a6e277ba7ef999dfb23c41350898c47bb038d73572075868ecd28a"
     },
     {
       "path": "util/window.py",
