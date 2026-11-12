@@ -247,7 +247,7 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | --- | --- | --- |
 | 现在就要跟上上游最新 release | **Sync upstream release** | 自己取上游 `releases/latest`，合并、重建 `ok/`、跑冒烟、推 master、改 tag、派发打包，一条龙。该 tag 已合并时直接退出，勾 `force` 才会重来一遍 |
 | 只是重新打一次已有的版本 | **Windows Release** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
-| 检查普通源码提交能否编译 | **Windows 编译检查** | master 推送自动运行，也可手动派发；只验证和生成原生业务 EXE，不要求发布 tag |
+| 编译普通源码提交并下载便携包 | **Windows 编译检查** | master 推送自动运行，也可手动派发；生成完整 NoNo-win32-portable.zip，不要求发布 tag |
 | 重新编启动器 | **Build launcher** | 约 12 分钟，全在 Tauri 冷编译；只有改名字/图标/UAC 才需要 |
 
 `Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
@@ -277,7 +277,8 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 ### master 编译与前台核心门禁
 
 `.github/workflows/windows-compile.yml` 对每次 master 推送运行，不使用分支名生成发布版本，也不写入
-更新镜像。顺序为安装现有依赖 → `scripts/check_foreground.ps1` → `scripts/build_runtime.ps1` → 上传产物。
+更新镜像。顺序为安装现有依赖 → `scripts/check_foreground.ps1` → `scripts/build_runtime.ps1` →
+`python -m selfhost.portable --source-sha <本次 SHA>` → 上传完整便携包。
 仓库权限仅为 `contents: read`，检出固定到本次 SHA，测试进程不继承 CI 凭据。
 
 `check_foreground.ps1` 默认先运行 `sync_ok.py --check`，再通过既有 `run_test.py` 执行集中输入、桌面通知、
@@ -285,17 +286,36 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 避免加载开发机账号和通知设置。开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 调用默认完整门禁，
 只有最终差异收集后框架检查通过才能继续编译。
 
-`build_runtime.ps1` 继续负责唯一宿主编译入口和六项原生进程验证。编译成功后 Actions 保留
-`NoNo-native-windows-<本次完整 SHA>`，内含 `NoNo.exe`、EXE 校验文件及框架 pin，保留 14 天；运行摘要提供
-下载链接。业务宿主仍使用同一 `main.py`、`config` 和 `ok/`，完整便携目录继续由版本标签发布流程提供。
+`build_runtime.ps1` 继续负责唯一宿主编译入口和原生进程验证。之后共享打包器生成
+`build/portable-dist/NoNo-win32-portable.zip` 与 `NoNo-win32-sha256.txt`，Actions 工件名为
+`NoNo-portable-windows-<本次完整 SHA>`，保留 14 天；运行摘要提供完整便携包的下载链接。
+ZIP 内是 `NoNo/` 目录，包含根启动器、Python 运行环境、依赖、部署代码以及
+`data/apps/NoNo/working/selfhost/NoNo.exe` 业务宿主，解压后双击 `NoNo/NoNo.exe`。
+GitHub Actions 的工件下载容器内含上述 ZIP 和校验文件；正式 Release 的资产仍直接叫
+`NoNo-win32-portable.zip`。业务宿主仍在自己的进程执行原有 `main.py` 和内联框架。
+
+普通编译采用当前提交的部署文件快照。打包器先通过固定启动器的正式 setup 准备运行环境和有效的
+更新版本锚点，再按已跟踪文件与 `deploy.txt` 白名单，把本次源码部署到便携目录的 `repo` 和
+`working` 物理树；新增的业务宿主、内联 pyappify 和部署忽略规则有明确生成来源。
+两棵实际部署树都校验完整内容和框架 pin，并用便携 Python 安装本次依赖、验证实际原生宿主。
+`tests/`、`ok_templates/`、未跟踪的账号配置、缓存和运行日志不会成为部署快照。
+
+便携包中的 `build-info.json` 分开记录本次 `source_sha`、正式更新底座的 `base_update_version` 和
+`base_update_commit`、部署文件摘要及框架 pin。普通快照保留 setup 的正式 Git HEAD、版本标签、
+更新地址和应用状态，实际运行文件使用本次快照；Git 锚点不能冒充源码提交。
+这是为了兼容固定启动器 v1.2.4 的
+[当前版本检查](https://github.com/ok-oldking/pyappify/blob/v1.2.4/src-tauri/src/app_service.rs)：
+临时本地版本标签在连接正式镜像后会消失，启动器随后可能强制回退，因此普通构建不创建临时远端版本、
+不改镜像标签。正式版本更新仍由原有标签发布流程提供。
 
 提交后的验收按本次推送 SHA 查找这个工作流，确认核心检查、编译和上传均成功，不能用旧 SHA 的成功
 代替本次结果。`GITHUB_TOKEN` 产生的推送不会递归触发 push 工作流，既有上游同步仍通过显式派发标签
 发布完成编译交付。[GitHub 的触发规则](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow)
 
-Windows Release 保留全仓库测试与镜像发布链路，增加源码框架检查；便携包 setup 实际克隆部署树后，
-使用 `sync_ok.py --check --root` 再核对 pin、逻辑载荷、完整框架及生成资源，然后验证真实运行时中的原生进程。
-镜像遗漏或字节漂移会在发布前失败。
+Windows Release 保留全仓库测试与镜像发布链路，打包步骤调用同一
+`python -m selfhost.portable --release-tag <tag>`。正式模式按该 tag setup 镜像部署树，不覆盖为普通快照；
+两种模式都使用 `sync_ok.py --check --root` 核对 pin、逻辑载荷、完整框架和生成资源，再验证真实运行时中的
+原生进程。缺少运行环境、错误的部署内容或字节漂移都会在上传便携包前失败。
 
 ### 更新仓库：部署树镜像 `Canda15/nono-update`
 
@@ -341,13 +361,14 @@ exe 的 PE 版本信息里写着 `ok-ww`，而这是 config 改不到的地方�
 自己编一次。工作流里有一条硬检查：编出来的 exe 只要 `ProductName`/`FileDescription`/
 `CompanyName` 还匹配 `ok-ww|ok-script` 就直接失败。
 
-便携版由 `package` job 自己拼，不再经过 `ok-oldking/pyappify-action`：
+便携版由共享 `selfhost/portable.py` 生成，不再经过 `ok-oldking/pyappify-action`：
 下载启动器 → 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
-`NoNo.exe -c setup -p China --setup-version <tag>` → 删掉 `cache/` 与 `data/logs/` → 打包成 zip。
+`NoNo.exe -c setup -p China --setup-version <tag>` → 校验部署树和真实运行环境 →
+删掉 `cache/` 与 `data/logs/` → 打包成 zip。普通 master 模式在运行环境安装后增加当前部署快照步骤。
 `data/apps/<name>` 那个目录名来自 `pyappify.yml`，与 exe 文件名无关。
 
-`BASE_EXE_URL` 钉死在 `launcher-1`（并且校验启动器的 `ProductName`）：用 `latest` 会解析到
-应用发布页，那里没有启动器。重建启动器、换 tag 时要同步改这一行；**`launcher-1` 这个 release
+`selfhost/portable.py` 的 `LAUNCHER_URL` 钉死在 `launcher-1`，并核对发布的摘要和启动器的品牌：
+用 `latest` 会解析到应用发布页，那里没有启动器。重建启动器、换 tag 时要同步改这一常量；**`launcher-1` 这个 release
 不能删**，删了发版会在下载启动器这一步 404。
 
 之所以成立：启动器的路径全部相对自身所在目录（`utils/path.rs` 用 `current_dir`，

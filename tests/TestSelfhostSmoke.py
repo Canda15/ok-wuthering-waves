@@ -6,6 +6,7 @@
 框架冒烟由 .github/workflows/sync-upstream.yml 在每次自动合并后执行，
 红了就不许推送。原生宿主用同一测试文件验证实际进程和参数，发布时编译后执行。
 严格逻辑差异用隔离树验证来源、重放与部署，不初始化游戏设备或发送通知。
+便携交付用小型部署仓库验证当前快照、更新锚点和归档，不在开发机执行启动器 setup。
 """
 
 import inspect
@@ -485,6 +486,312 @@ class TestLogicPatchReplay(unittest.TestCase):
         self.assertFalse((project / '.sync-ok-stage').exists())
 
 
+class TestPortableBundle(unittest.TestCase):
+    """普通编译必须交付当前物理部署树，并保留启动器认可的正式更新锚点。"""
+
+    def setUp(self):
+        from selfhost import portable
+        self.portable = portable
+        self.build_root = Path(__file__).resolve().parents[1] / 'build'
+        self.build_root.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix='便携交付验证-', dir=self.build_root)
+        self.root = portable.require_path(self.build_root, Path(self.temporary.name))
+        self.source = self.root / 'source'
+        self.source.mkdir()
+        self.version = 'v3.7.21'
+        self.configuration = (
+            'name: "NoNo"\nprofiles:\n  - name: "China"\n'
+            '    git_url: "https://github.com/Canda15/nono-update.git"\n'
+            '    main_script: "selfhost/NoNo.exe"\n    requires_python: "3.12"\n'
+            '    requirements: "requirements.txt"\n    pip_args: "--no-deps"\n'
+        )
+        self.files = {
+            'main.py': 'TOKEN = "原始提交"\n'.encode(),
+            'config.py': b'version = "dev"\n',
+            'requirements.txt': b'pyappify[standalone]==1.0.19\nexample==1.0.0\n',
+            'pyappify.yml': self.configuration.encode(),
+            'src/task.py': '业务值 = "当前源码"\n'.encode(),
+            'ok/__init__.py': b'FRAMEWORK = "current"\n',
+            'ok/core/foreground_fixture.py': b'FRAMEWORK_STATE = "current"\n',
+            'selfhost/__init__.py': b'\n',
+            'selfhost/ok_pin.json': b'{"package": "ok-script", "version": "test"}\n',
+            'pyappify/__init__.py': b'\n',
+            'assets/current.bin': b'current asset',
+            '.update_repo_gitignore': b'__pycache__/\n*.pyc\nlogs/\n',
+            'deploy.txt': b'src\nok\nselfhost\npyappify\nmain.py\nconfig.py\nrequirements.txt\npyappify.yml\nassets\n',
+        }
+        for relative, content in self.files.items():
+            path = self.source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        self.initialize_repository(self.source)
+        # 宿主是编译期产物，不受源码仓库跟踪，但必须显式随当前部署树交付。
+        (self.source / 'selfhost' / 'NoNo.exe').write_bytes(b'MZ-current-native-host')
+        (self.source / 'selfhost' / 'local-account.json').write_bytes(b'private account')
+        (self.source / 'assets' / '__pycache__').mkdir()
+        (self.source / 'assets' / '__pycache__' / 'private.pyc').write_bytes(b'cache')
+        (self.source / 'tests').mkdir()
+        (self.source / 'tests' / 'private.bin').write_bytes(b'large developer fixture')
+        (self.source / 'ok_templates').mkdir()
+        (self.source / 'ok_templates' / 'private.bin').write_bytes(b'large developer template')
+
+    def tearDown(self):
+        self.portable.require_path(self.build_root, self.root)
+        self.temporary.cleanup()
+
+    def initialize_repository(self, root):
+        self.portable.git(root, 'init', '--initial-branch=master')
+        self.portable.git(root, 'add', '.')
+        self.portable.git(root, '-c', 'user.name=便携交付测试', '-c',
+                          'user.email=portable-test@example.invalid', 'commit', '-m', '准备隔离部署树')
+        self.portable.git(root, 'tag', self.version)
+
+    def prepare_snapshot(self):
+        snapshot = self.root / 'snapshot'
+        digests = self.portable.prepare_snapshot(self.source, snapshot, self.version, self.build_root)
+        return snapshot, digests
+
+    def prepare_bundle(self):
+        snapshot, digests = self.prepare_snapshot()
+        bundle = self.root / 'NoNo'
+        app = bundle / 'data' / 'apps' / 'NoNo'
+        repo, working, runtime = app / 'repo', app / 'working', app / 'python'
+        repo.mkdir(parents=True)
+        (repo / 'main.py').write_bytes(b'old mirror source')
+        (repo / 'removed.py').write_bytes(b'obsolete source')
+        self.initialize_repository(repo)
+        self.portable.git(repo, 'remote', 'add', 'origin', 'https://github.com/Canda15/nono-update.git')
+        working.mkdir()
+        runtime.mkdir()
+        self.portable.replace_deployment(snapshot, repo, self.build_root, preserve_git=True)
+        self.portable.replace_deployment(snapshot, working, self.build_root, preserve_git=False)
+        (bundle / 'NoNo.exe').write_bytes(b'MZ-launcher')
+        (bundle / 'pyappify.yml').write_bytes(self.files['pyappify.yml'])
+        (runtime / 'python.exe').write_bytes(b'MZ-python')
+        (runtime / 'python3.dll').write_bytes(b'portable python library')
+        (app / 'app.json').write_text(json.dumps({
+            'name': 'NoNo', 'installed': True, 'current_profile': 'China',
+            'current_version': self.version,
+            'profiles': [{'name': 'China', 'git_url': 'https://github.com/Canda15/nono-update.git'}],
+        }), encoding='utf-8')
+        manifest = {
+            'source_sha': self.portable.git(self.source, 'rev-parse', 'HEAD'),
+            'base_update_version': self.version,
+            'app_metadata_file': 'data/apps/NoNo/app.json',
+            'deployment_files': digests,
+        }
+        return bundle, manifest
+
+    def test_snapshot_uses_current_checkout_and_explicit_host_without_private_or_developer_files(self):
+        (self.source / 'main.py').write_text('TOKEN = "本次构建"\n', encoding='utf-8')
+        snapshot, digests = self.prepare_snapshot()
+        self.assertEqual((snapshot / 'main.py').read_bytes(), (self.source / 'main.py').read_bytes())
+        self.assertEqual((snapshot / 'selfhost' / 'NoNo.exe').read_bytes(), b'MZ-current-native-host')
+        self.assertEqual((snapshot / 'config.py').read_text(encoding='utf-8'), f'version = "{self.version}"\n')
+        self.assertEqual((self.source / 'config.py').read_bytes(), self.files['config.py'])
+        self.assertEqual((self.source / 'requirements.txt').read_bytes(), self.files['requirements.txt'])
+        self.assertEqual((snapshot / '.gitignore').read_bytes(), self.files['.update_repo_gitignore'])
+        self.assertNotIn('pyappify', (snapshot / 'requirements.txt').read_text(encoding='utf-8'))
+        self.assertFalse(any(
+            'private' in path or path.startswith(('tests/', 'ok_templates/', '.git/'))
+            or '__pycache__' in path or path == 'deploy.txt'
+            for path in digests
+        ))
+
+    def test_overlay_replaces_both_trees_deletes_stale_files_and_preserves_official_git_anchor(self):
+        snapshot, digests = self.prepare_snapshot()
+        repo = self.root / 'bundle' / 'data' / 'apps' / 'NoNo' / 'repo'
+        working = repo.parent / 'working'
+        repo.mkdir(parents=True)
+        (repo / 'main.py').write_bytes(b'old mirror source')
+        (repo / 'removed.py').write_bytes(b'obsolete source')
+        self.initialize_repository(repo)
+        self.portable.git(repo, 'remote', 'add', 'origin', 'https://github.com/Canda15/nono-update.git')
+        anchor = self.portable.git(repo, 'rev-parse', 'HEAD')
+        config_before = (repo / '.git' / 'config').read_bytes()
+        working.mkdir()
+        (working / 'removed.py').write_bytes(b'obsolete working source')
+        self.portable.replace_deployment(snapshot, repo, self.build_root, preserve_git=True)
+        self.portable.replace_deployment(snapshot, working, self.build_root, preserve_git=False)
+        self.assertEqual(self.portable.git(repo, 'rev-parse', 'HEAD'), anchor)
+        self.assertEqual(self.portable.git(repo, 'rev-parse', self.version), anchor)
+        self.assertEqual((repo / '.git' / 'config').read_bytes(), config_before)
+        for root in (repo, working):
+            self.assertEqual(self.portable.deployment_digests(root), digests)
+            self.assertFalse((root / 'removed.py').exists())
+            self.assertEqual((root / 'main.py').read_bytes(), self.files['main.py'])
+
+    def test_missing_compiled_host_and_escaping_deploy_entry_are_rejected_before_copy(self):
+        native = self.source / 'selfhost' / 'NoNo.exe'
+        native.unlink()
+        with self.assertRaisesRegex(RuntimeError, '缺少已编译'):
+            self.prepare_snapshot()
+        self.assertFalse((self.root / 'snapshot').exists())
+        native.write_bytes(b'MZ-current-native-host')
+        (self.source / 'deploy.txt').write_text('../outside\n', encoding='utf-8')
+        with self.assertRaisesRegex(RuntimeError, '越界'):
+            self.prepare_snapshot()
+        self.assertFalse((self.root / 'snapshot').exists())
+
+        from ok.update import inline_ok_requirements
+        source_config = self.source / 'config.py'
+        source_requirements = self.source / 'requirements.txt'
+        source_deploy = self.source / 'deploy.txt'
+        cwd = Path.cwd()
+        original_deploy = self.files['deploy.txt']
+        missing_entries = ('config.py', 'requirements.txt', 'main.py', 'pyappify.yml', 'ok')
+        for index, missing in enumerate((*missing_entries, 'partial_ok', 'untracked_config', 'untracked_ok')):
+            with self.subTest(missing=missing):
+                deploy = original_deploy.decode()
+                untracked = None
+                if missing in missing_entries:
+                    deploy = deploy.replace(f'{missing}\n', '')
+                elif missing == 'partial_ok':
+                    deploy = deploy.replace('ok\n', 'ok/__init__.py\n')
+                else:
+                    untracked = 'config.py' if missing == 'untracked_config' else 'ok/__init__.py'
+                    self.portable.git(self.source, 'rm', '--cached', '--', untracked)
+                source_deploy.write_text(deploy, encoding='utf-8')
+                destination = self.root / f'rejected-snapshot-{index}'
+                try:
+                    with patch.object(inline_ok_requirements, 'remove_ok_requirements',
+                                      wraps=inline_ok_requirements.remove_ok_requirements) as inline, \
+                            patch.object(inline_ok_requirements, 'find_and_copy_site_package',
+                                         return_value=1) as site_package:
+                        try:
+                            # 专门复现旧 helper 向调用者 cwd 回退；这里只进入隔离源码树。
+                            os.chdir(self.source)
+                            with self.assertRaises(RuntimeError):
+                                self.portable.prepare_snapshot(self.source, destination, self.version,
+                                                               self.build_root)
+                        finally:
+                            os.chdir(cwd)
+                        self.assertEqual(source_config.read_bytes(), self.files['config.py'])
+                        self.assertEqual(source_requirements.read_bytes(), self.files['requirements.txt'])
+                        self.assertFalse(destination.exists(), '无效部署集合不能开始复制或内联')
+                        inline.assert_not_called()
+                        site_package.assert_not_called()
+                finally:
+                    os.chdir(cwd)
+                    source_config.write_bytes(self.files['config.py'])
+                    source_requirements.write_bytes(self.files['requirements.txt'])
+                    source_deploy.write_bytes(original_deploy)
+                    if untracked:
+                        self.portable.git(self.source, 'add', '--', untracked)
+
+        child = self.root / 'child'
+        child.mkdir()
+        with patch.object(self.portable.shutil, 'rmtree') as delete:
+            for candidate in (self.build_root.parent, self.root, child / '..'):
+                with self.subTest(candidate=candidate):
+                    with self.assertRaisesRegex(RuntimeError, '预期目录'):
+                        self.portable.remove_tree(self.root, candidate)
+            delete.assert_not_called()
+        self.assertTrue(self.source.exists())
+
+    def test_subprocess_environment_removes_pip_targets_and_host_python_prefixes_without_mutating_parent(self):
+        inherited = {
+            'PIP_TARGET': str(self.root / 'external'), 'PIP_PREFIX': str(self.root / 'prefix'),
+            'PIP_ROOT': str(self.root / 'pip-root'), 'PIP_USER': '1',
+            'PIP_FIND_LINKS': 'file:///fixture', 'PIP_REQUIRE_VIRTUALENV': '1',
+            'VIRTUAL_ENV': str(self.root / 'host-venv'), 'PYTHONHOME': 'fixture-host-home',
+            'PYTHONPATH': 'fixture-host-path', 'HTTP_PROXY': 'http://proxy.example.invalid:3128',
+            'HTTPS_PROXY': 'http://proxy.example.invalid:3128', 'NO_PROXY': 'example.invalid',
+        }
+        with patch.dict(os.environ, inherited):
+            parent = dict(os.environ)
+            environment = self.portable.process_environment()
+            self.assertTrue(dict(os.environ) == parent, '环境隔离不能修改调用者进程')
+            self.assertEqual({key for key in environment if key.upper().startswith('PIP_')},
+                             {'PIP_CONFIG_FILE'})
+            self.assertEqual(environment['PIP_CONFIG_FILE'], os.devnull)
+            for key in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
+                self.assertNotIn(key, environment)
+            for key in ('PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'):
+                self.assertEqual(environment.get(key), parent.get(key))
+            # 真实子进程只读取环境，不执行 pip，也不会向伪造的安装目录写入文件。
+            code = (
+                'import json, os, sys; print(json.dumps({"environment": '
+                '{key: value for key, value in os.environ.items() if key.upper().startswith("PIP_") '
+                'or key.upper() in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}, "prefix": sys.prefix}))'
+            )
+            child = json.loads(self.portable.run([sys.executable, '-c', code], self.root))
+            self.assertEqual(Path(child['prefix']).resolve(), Path(sys.prefix).resolve())
+            self.assertEqual({key for key in child['environment'] if key.upper().startswith('PIP_')},
+                             {'PIP_CONFIG_FILE'})
+            for key in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
+                self.assertNotIn(key, child['environment'])
+            self.assertFalse((self.root / 'external').exists())
+            self.assertTrue(dict(os.environ) == parent, '环境隔离不能修改调用者进程')
+
+    def test_actual_archive_contains_runtime_current_sources_pin_and_update_metadata(self):
+        bundle, manifest = self.prepare_bundle()
+        archive = self.portable.archive_bundle(bundle, self.root / 'artifacts', manifest, self.build_root)
+        with zipfile.ZipFile(archive) as package:
+            for folder in ('repo', 'working'):
+                prefix = f'NoNo/data/apps/NoNo/{folder}/'
+                self.assertEqual(package.read(prefix + 'main.py'), self.files['main.py'])
+                self.assertEqual(package.read(prefix + 'selfhost/NoNo.exe'), b'MZ-current-native-host')
+                self.assertEqual(package.read(prefix + '.gitignore'), self.files['.update_repo_gitignore'])
+                self.assertEqual(package.read(prefix + 'selfhost/ok_pin.json'), self.files['selfhost/ok_pin.json'])
+            self.assertEqual(package.read('NoNo/data/apps/NoNo/python/python.exe'), b'MZ-python')
+            self.assertEqual(package.read('NoNo/data/apps/NoNo/python/python3.dll'), b'portable python library')
+            self.assertEqual(json.loads(package.read('NoNo/build-info.json')), manifest)
+            self.assertEqual(json.loads(package.read('NoNo/data/apps/NoNo/app.json'))['current_version'], self.version)
+            self.assertFalse(any('removed.py' in name or 'private' in name for name in package.namelist()))
+            self.assertIn('NoNo/data/apps/NoNo/repo/.git/HEAD', package.namelist())
+        expected_checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        self.assertEqual((archive.parent / 'NoNo-win32-sha256.txt').read_text(encoding='ascii'),
+                         f'{expected_checksum}  NoNo-win32-portable.zip\n')
+
+    def test_archive_rejects_missing_runtime_host_or_changed_current_deployment(self):
+        bundle, manifest = self.prepare_bundle()
+        output = self.root / 'artifacts'
+        for relative in ('data/apps/NoNo/python/python3.dll', 'data/apps/NoNo/working/selfhost/NoNo.exe'):
+            with self.subTest(relative=relative):
+                missing = bundle / relative
+                content = missing.read_bytes()
+                missing.unlink()
+                with self.assertRaisesRegex(RuntimeError, '缺少必要文件'):
+                    self.portable.archive_bundle(bundle, output, manifest, self.build_root)
+                self.assertFalse(output.exists())
+                missing.write_bytes(content)
+        (bundle / 'data' / 'apps' / 'NoNo' / 'working' / 'main.py').write_bytes(b'stale mirror source')
+        with self.assertRaisesRegex(RuntimeError, '当前部署快照不一致'):
+            self.portable.archive_bundle(bundle, output, manifest, self.build_root)
+        self.assertFalse(output.exists())
+
+    def test_archive_verification_rejects_stale_files_and_local_install_metadata(self):
+        bundle, manifest = self.prepare_bundle()
+        archive = self.portable.archive_bundle(bundle, self.root / 'artifacts', manifest, self.build_root)
+        with zipfile.ZipFile(archive, 'a') as package:
+            package.writestr('NoNo/data/apps/NoNo/working/obsolete.py', b'old mirror source')
+        with self.assertRaisesRegex(RuntimeError, '过时的部署文件'):
+            self.portable.verify_archive(archive, 'NoNo', manifest)
+        metadata = bundle / 'data' / 'apps' / 'NoNo' / 'python' / 'Lib' / 'site-packages' / 'sample.dist-info'
+        metadata.mkdir(parents=True)
+        (metadata / 'direct_url.json').write_text('{"url": "file:///runner/private/source"}', encoding='utf-8')
+        with self.assertRaisesRegex(RuntimeError, '临时来源'):
+            self.portable.verify_portable_metadata(bundle, self.root, 'NoNo')
+
+    def test_same_name_installed_metadata_and_current_version_are_required(self):
+        bundle, _manifest = self.prepare_bundle()
+        state = self.portable.read_app_state(bundle, 'NoNo')
+        repo = bundle / 'data' / 'apps' / 'NoNo' / 'repo'
+        commit = self.portable.git(repo, 'rev-parse', 'HEAD')
+        self.portable.assert_update_anchor(repo, state, self.version, commit)
+        metadata = bundle / 'data' / 'apps' / 'NoNo' / 'app.json'
+        state['name'] = 'other'
+        metadata.write_text(json.dumps(state), encoding='utf-8')
+        with self.assertRaisesRegex(RuntimeError, '名字或安装状态'):
+            self.portable.read_app_state(bundle, 'NoNo')
+        state['name'] = 'NoNo'
+        state['current_version'] = 'dev'
+        metadata.write_text(json.dumps(state), encoding='utf-8')
+        with self.assertRaisesRegex(RuntimeError, '合法稳定更新版本'):
+            self.portable.read_app_state(bundle, 'NoNo')
+
+
 @unittest.skipUnless(sys.platform == 'win32' and
                      (Path(__file__).resolve().parents[1] / 'selfhost' / 'NoNo.exe').is_file(),
                      '需先运行 scripts/build_runtime.ps1 编译原生宿主')
@@ -563,6 +870,13 @@ class TestNativeRuntime(unittest.TestCase):
         for key in ('executable', 'image'):
             self.assertEqual(Path(identity[key]).resolve(), self.executable.resolve())
         self.assertEqual(Path(identity['prefix']).resolve(), self.runtime)
+
+        # 同一真实运行时也覆盖打包探针的等待与参数传递，路径含中文和空格。
+        from selfhost.portable import probe_executable
+        identity = probe_executable(self.executable, self.working, self.runtime, check_deployment=False)
+        self.assertEqual(Path(identity['image']).resolve(), self.executable.resolve())
+        self.assertEqual(Path(identity['prefix']).resolve(), self.runtime)
+        self.assertEqual(identity['sources'], {})
 
     def test_task_arguments_and_resources_survive_different_working_directory(self):
         result = self.run_native('-t', '角色 名称', '-e', '-h', cwd=self.root)

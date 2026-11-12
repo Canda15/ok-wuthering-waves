@@ -22,18 +22,7 @@ env:
   PYTHON_VERSION: '3.12'
   PYTHONIOENCODING: 'UTF-8'
   PYTHONLEGACYWINDOWSSTDIO: 'UTF-8'
-  # 便携产物的底座:一个 pyappify 启动器(4.7 MB,解压后只有一个 exe)。
-  # 我们不再用 ok-oldking/pyappify-action——它每次都先用 cargo 重新编译 Tauri
-  # 启动器(9m17s),再用 makensis 把整棵树压成 NSIS 安装包(两遍,共约 8 分钟)。
-  # 便携版不需要 NSIS:启动器的所有路径都相对自身所在目录,setup 出来的目录
-  # 本身就是便携版(详见 package job 的注释)。
-  #
-  # 启动器由 .github/workflows/build-launcher.yml 自己编译,挂在 launcher-1 这个
-  # 固定 tag 的 release 上:上游那份 exe 的 PE 版本信息里写着 ok-ww,只有自己编
-  # 才能把名字写进去。这里钉死到那个 tag 而不是 /latest/,否则哪天应用发版了,
-  # latest 会解析到应用发布页上(那里没有启动器)。
-  # 重建启动器时如果换了 tag(launcher-2),这里要同步改。
-  BASE_EXE_URL: 'https://github.com/Canda15/ok-wuthering-waves/releases/download/launcher-1/NoNo-win32.zip'
+  # 固定启动器来源、打包和实际便携验证统一由 selfhost/portable.py 维护。
 
 jobs:
   validate:
@@ -244,140 +233,20 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # 便携版不需要 NSIS:启动器的路径全部相对自身所在目录
-      # (utils/path.rs 用 current_dir,lib.rs 启动时强制 set_current_dir(exe_dir)),
-      # 既不写注册表也不写 %APPDATA%——所以 "下载启动器 + 跑一次 setup" 得到的目录
-      # 可以整体搬走,就是一个便携版。安装包只是把这个目录复制到 Program Files。
-      - name: Fetch base launcher
-        shell: pwsh
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'base-launcher.zip'
-          Invoke-WebRequest -Uri $env:BASE_EXE_URL -OutFile $archive
-          # zip 结构是 NoNo/NoNo.exe(build-launcher.yml 打的),解到独立目录,
-          # 与后面要产出的便携目录 pyappify_dist\NoNo 区分开。
-          Expand-Archive -LiteralPath $archive -DestinationPath 'pyappify_dist\launcher' -Force
-          $exe = 'pyappify_dist\launcher\NoNo\NoNo.exe'
-          if (-not (Test-Path $exe)) { throw "启动器包里没有 $exe" }
-          # 防回归:BASE_EXE_URL 一旦指回上游那份 exe,这里立刻红,而不是等到
-          # 用户在文件属性里看到 ok-ww。
-          $info = (Get-Item $exe).VersionInfo
-          "启动器: ProductName=$($info.ProductName) FileVersion=$($info.FileVersion)"
-          if ($info.ProductName -match 'ok-ww|ok-script') {
-            throw "启动器的 PE 元数据仍是上游名字: $($info.ProductName)"
-          }
-          # 外壳的名字是编译期烘进 exe 的,改 pyappify.yml 的 name 不会自动跟进。
-          # 这里直接比对两边的名字:一旦名字改了却没重编外壳,打包会立刻失败并
-          # 告诉你去跑哪个工作流,而不是产出一个属性还是旧名字的安装包。
-          $appName = (Select-String -Path 'pyappify.yml' -Pattern '^name:\s*"([^"]+)"' |
-            Select-Object -First 1).Matches[0].Groups[1].Value
-          if ($info.ProductName -ne $appName) {
-            throw "启动器的名字($($info.ProductName))与 pyappify.yml 的 name($appName)不一致:先在 Actions 里跑一次 Build launcher,再把 BASE_EXE_URL 指向新的 launcher release"
-          }
-
-      - name: Build portable bundle
+      # 正式发布仍由 setup 克隆镜像的本次 tag，复用完整便携验证和归档入口。
+      - name: 生成并验证正式便携包
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $bundle = 'pyappify_dist\NoNo'
-          New-Item -ItemType Directory -Force $bundle | Out-Null
-          # 启动器不自我重命名(pyappify 的 Rust 侧只用 current_exe 重启自己),
-          # 文件名来自 pyappify.yml 的 name;data/apps/<name> 那个目录名也由它决定。
-          Copy-Item 'pyappify_dist\launcher\NoNo\NoNo.exe' (Join-Path $bundle 'NoNo.exe')
-
-          # 启动器在 cwd 读 pyappify.yml(app.rs:198 read_embedded_app),读不到就
-          # 退回 pyappify 自带的默认配置——那样既没有我们的 profile 也没有镜像仓库
-          # 地址,setup 会跑去克隆上游。必须把本仓库这份放在 exe 旁边。
-          Copy-Item 'pyappify.yml' $bundle
-
-          # 把 Python 运行时、依赖、部署树(镜像仓库的 tag)一次性装进 $bundle。
-          # 启动器是 GUI 子系统的 exe:用 & 调用不会等待,$LASTEXITCODE 还是空,
-          # 于是"假装成功了"。必须 Start-Process -Wait 并读 ExitCode。
-          $stdout = Join-Path $env:RUNNER_TEMP 'setup.stdout.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'setup.stderr.log'
-          $launcher = Join-Path $bundle 'NoNo.exe'
-          $setupArgs = @('-c', 'setup', '-p', 'China', '--setup-version', $env:RELEASE_TAG)
-          $process = Start-Process -FilePath $launcher -ArgumentList $setupArgs `
-            -WorkingDirectory $bundle -Wait -PassThru -NoNewWindow `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-          Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-          if ($process.ExitCode -ne 0) { throw "启动器 setup 失败,退出码 $($process.ExitCode)" }
-
-          # data\apps\<name>\repo 就是部署树;没有它说明 setup 没真正跑完。
-          # <name> 来自 pyappify.yml,改名后要与它保持一致。
-          $repo = Join-Path $bundle 'data\apps\NoNo\repo'
-          if (-not (Test-Path (Join-Path $repo 'main.py'))) { throw "setup 结束但 $repo\main.py 不存在" }
-          if (-not (Test-Path (Join-Path $repo 'selfhost\NoNo.exe'))) {
-            throw "部署树缺少业务宿主 $repo\selfhost\NoNo.exe，不能回退到 Python 进程运行"
-          }
-
-          # 对 setup 实际克隆的部署树复用源码算法，避免镜像遗漏逻辑差异或生成资源。
-          python scripts/sync_ok.py --check --root $repo
-          if ($LASTEXITCODE -ne 0) { throw '便携包部署树与框架来源不一致' }
-
-          # 使用 setup 装好的真实运行时验证进程身份，不能只证明 CI 的 Python 能启动宿主。
-          $working = Join-Path $bundle 'data\apps\NoNo\working'
-          $nativeExe = (Get-Item -LiteralPath (Join-Path $working 'selfhost\NoNo.exe')).FullName
-          $probeCode = "import json, os, sys; print(json.dumps({'pid': os.getpid(), 'executable': sys.executable}))"
-          $probeStdout = Join-Path $env:RUNNER_TEMP 'native.stdout.log'
-          $probeStderr = Join-Path $env:RUNNER_TEMP 'native.stderr.log'
-          $nativeProcess = Start-Process -FilePath $nativeExe -ArgumentList '-c', "`"$probeCode`"" `
-            -WorkingDirectory $working -WindowStyle Hidden -Wait -PassThru `
-            -RedirectStandardOutput $probeStdout -RedirectStandardError $probeStderr
-          if ($nativeProcess.ExitCode -ne 0) {
-            Get-Content -LiteralPath $probeStderr -ErrorAction SilentlyContinue
-            throw "便携包业务宿主启动失败，退出码 $($nativeProcess.ExitCode)"
-          }
-          $identity = Get-Content -LiteralPath $probeStdout -Raw | ConvertFrom-Json
-          if ($identity.pid -ne $nativeProcess.Id -or $identity.executable -ne $nativeExe) {
-            throw '便携包业务没有在 NoNo.exe 自身进程中运行'
-          }
-          Write-Host "业务宿主验证成功：$($identity.executable)"
-
-          # pip 缓存和运行日志是运行期产物:pip 缓存动辄上百 MB,不随包分发。
-          foreach ($dir in @('cache', 'data\logs')) {
-            $path = Join-Path $bundle $dir
-            if (Test-Path $path) { Remove-Item $path -Recurse -Force }
-          }
-
-          Get-ChildItem $bundle | Select-Object Name
-          "便携目录体积: {0:N0} MB" -f ((Get-ChildItem $bundle -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
-
-      - name: Pack portable bundle
-        shell: pwsh
-        run: |
-          Push-Location 'pyappify_dist'
-          try {
-            $zip = 'NoNo-win32-portable.zip'
-            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
-            if (Test-Path $sevenZip) {
-              # 7z 比 Compress-Archive 快一个数量级(便携目录有几万个文件),
-              # 压缩率也更好。这里用标准 zip 容器,Windows 资源管理器可直接解压。
-              & $sevenZip a -tzip -mx=5 -bsp1 $zip 'NoNo'
-              if ($LASTEXITCODE -ne 0) { throw "7z 打包失败,退出码 $LASTEXITCODE" }
-            } else {
-              Compress-Archive -Path 'NoNo' -DestinationPath $zip -CompressionLevel Optimal
-            }
-          } finally {
-            Pop-Location
-          }
-
-          # 只留发布要用的两样:便携包与校验文件(启动器不再随发布分发,
-          # 它的来源是 env.BASE_EXE_URL 钉住的那份固定资产)。
-          Remove-Item 'pyappify_dist\NoNo' -Recurse -Force
-          Remove-Item 'pyappify_dist\launcher' -Recurse -Force
-
-          $file = 'NoNo-win32-portable.zip'
-          $hash = (Get-FileHash "pyappify_dist\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $file" | Set-Content 'pyappify_dist\NoNo-win32-sha256.txt' -Encoding ascii
-          Get-ChildItem 'pyappify_dist' | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+        run: python -m selfhost.portable --release-tag "$env:RELEASE_TAG"
 
       - name: Stage release assets
         uses: actions/upload-artifact@v4
         with:
           name: release-assets
-          path: pyappify_dist/*
+          path: |
+            build/portable-dist/NoNo-win32-portable.zip
+            build/portable-dist/NoNo-win32-sha256.txt
           if-no-files-found: error
           retention-days: 7
 

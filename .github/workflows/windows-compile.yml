@@ -22,7 +22,7 @@ env:
 
 jobs:
   compile:
-    name: 前台核心与原生 EXE
+    name: 前台核心、原生 EXE 与便携包
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -32,6 +32,7 @@ jobs:
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
           git config --global core.autocrlf false
           git config --global core.eol lf
+          git config --global core.longpaths true
 
       - name: 检出本次推送源码
         uses: actions/checkout@v7
@@ -63,18 +64,21 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\build_runtime.ps1
-          $hash = (Get-FileHash -LiteralPath 'selfhost/NoNo.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  NoNo.exe" | Set-Content -LiteralPath 'selfhost/NoNo.exe.sha256' -Encoding ascii
 
-      - name: 上传本次 SHA 的业务 EXE
-        id: native_artifact
+      - name: 生成并验证本次 SHA 的完整便携包
+        shell: pwsh
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: python -m selfhost.portable --source-sha "$env:BUILD_SHA"
+
+      - name: 上传本次 SHA 的完整便携包
+        id: portable_artifact
         uses: actions/upload-artifact@v7
         with:
-          name: NoNo-native-windows-${{ github.sha }}
+          name: NoNo-portable-windows-${{ github.sha }}
           path: |
-            selfhost/NoNo.exe
-            selfhost/NoNo.exe.sha256
-            selfhost/ok_pin.json
+            build/portable-dist/NoNo-win32-portable.zip
+            build/portable-dist/NoNo-win32-sha256.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -82,7 +86,7 @@ jobs:
         shell: pwsh
         env:
           BUILD_SHA: ${{ github.sha }}
-          NATIVE_ARTIFACT_URL: ${{ steps.native_artifact.outputs.artifact-url }}
+          PORTABLE_ARTIFACT_URL: ${{ steps.portable_artifact.outputs.artifact-url }}
         run: |
           "源码 SHA：$env:BUILD_SHA" >> $env:GITHUB_STEP_SUMMARY
-          "业务 EXE：[下载构建产物]($env:NATIVE_ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY
+          "完整便携包（含运行环境、依赖和原生入口）：[下载构建产物]($env:PORTABLE_ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY
