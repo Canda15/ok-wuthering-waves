@@ -744,6 +744,129 @@ class TestPortableBundle(unittest.TestCase):
         self.assertEqual((archive.parent / 'NoNo-win32-sha256.txt').read_text(encoding='ascii'),
                          f'{expected_checksum}  NoNo-win32-portable.zip\n')
 
+    def test_build_uses_setup_to_refresh_current_snapshot_and_keeps_release_on_one_tag_setup(self):
+        template, _manifest = self.prepare_bundle()
+        template_repo = template / 'data' / 'apps' / 'NoNo' / 'repo'
+        self.portable.git(template_repo, 'add', '.')
+        self.portable.git(template_repo, '-c', 'user.name=便携交付测试', '-c',
+                          'user.email=portable-test@example.invalid', 'commit', '-m', '准备正式部署底座')
+        self.portable.git(template_repo, 'tag', '-f', self.version)
+        anchor = self.portable.git(template_repo, 'rev-parse', 'HEAD')
+        (self.source / 'main.py').write_text('TOKEN = "本次 CI 源码"\n', encoding='utf-8')
+        (self.source / 'requirements.txt').write_bytes(b'pyappify[standalone]==1.0.19\nexample==2.0.0\n')
+        self.portable.git(self.source, 'add', '--', 'main.py', 'requirements.txt')
+        self.portable.git(self.source, '-c', 'user.name=便携交付测试', '-c',
+                          'user.email=portable-test@example.invalid', 'commit', '-m', '准备本次源码变更')
+        original_run = self.portable.run
+        for release_tag in (None, self.version):
+            with self.subTest(release_tag=release_tag):
+                if release_tag:
+                    self.portable.git(self.source, 'checkout', '--force', release_tag)
+                source_sha = self.portable.git(self.source, 'rev-parse', 'HEAD')
+                setup_calls = []
+                checks = []
+
+                def fetch_launcher(destination, app_name):
+                    (destination / 'launcher.zip').write_bytes(b'fixture launcher archive')
+                    launcher = destination / f'{app_name}.exe'
+                    launcher.write_bytes(b'MZ-fixture-launcher')
+                    return launcher
+
+                def execute(command, cwd, *, timeout=120):
+                    if command[0] == str(cwd / 'NoNo.exe'):
+                        expected = ['-c', 'setup', '-p', 'China']
+                        if release_tag:
+                            expected += ['--setup-version', release_tag]
+                        self.assertEqual(command[1:], expected, '仅使用已经实际成功的 setup 入口')
+                        setup_calls.append(command)
+                        app = cwd / 'data' / 'apps' / 'NoNo'
+                        repo, working, runtime = app / 'repo', app / 'working', app / 'python'
+                        if len(setup_calls) == 1:
+                            shutil.copytree(template, cwd, dirs_exist_ok=True)
+                        else:
+                            self.assertEqual((repo / 'main.py').read_bytes(), (self.source / 'main.py').read_bytes())
+                            self.assertFalse((repo / 'removed.py').exists())
+                            # 模拟真实二次 setup：重建 working，并按当前物理树安装依赖与合并配置。
+                            self.portable.remove_tree(self.build_root, working)
+                            shutil.copytree(repo, working, ignore=shutil.ignore_patterns('.git'))
+                        state = self.portable.read_app_state(cwd, 'NoNo')
+                        state['profiles'][0].update({
+                            'main_script': 'selfhost/NoNo.exe', 'requires_python': '3.12',
+                            'requirements': 'requirements.txt', 'pip_args': '--no-deps',
+                        })
+                        state['auto_start'] = False
+                        state['update_method'] = 'AUTO_UPDATE'
+                        (app / 'app.json').write_text(json.dumps(state), encoding='utf-8')
+                        (runtime / 'installed-requirements.txt').write_bytes((working / 'requirements.txt').read_bytes())
+                        return 'setup 已完成'
+                    if '--check' in command and '--root' in command:
+                        checks.append(Path(command[-1]).name)
+                        return '来源检查已完成'
+                    if command[0] == 'git' or Path(command[0]).name == '7z.exe':
+                        return original_run(command, cwd, timeout=timeout)
+                    self.fail(f'便携编排调用了非必要命令：{Path(command[0]).name}')
+
+                with patch.object(self.portable, 'fetch_launcher', side_effect=fetch_launcher), \
+                        patch.object(self.portable, 'run', side_effect=execute), \
+                        patch.object(self.portable, 'probe_executable', return_value={'python_version': '3.12'}) as probe, \
+                        patch.object(self.portable, 'prepare_snapshot', wraps=self.portable.prepare_snapshot) as snapshot:
+                    archive = self.portable.build_portable(self.source, source_sha=source_sha, release_tag=release_tag)
+                    self.assertEqual(len(setup_calls), 1 if release_tag else 2)
+                    self.assertEqual(snapshot.call_count, 0 if release_tag else 1)
+                    self.assertEqual(checks, ['repo', 'working'])
+                    self.assertEqual(probe.call_count, 2)
+                with zipfile.ZipFile(archive) as package:
+                    info = json.loads(package.read('NoNo/build-info.json'))
+                    self.assertEqual(info['source_sha'], source_sha)
+                    self.assertEqual(info['base_update_commit'], anchor)
+                    self.assertEqual(info['base_update_version'], self.version)
+                    state = json.loads(package.read('NoNo/data/apps/NoNo/app.json'))
+                    self.assertFalse(state['auto_start'])
+                    self.assertEqual(state['update_method'], 'AUTO_UPDATE')
+                    expected_source = self.files['main.py'] if release_tag else (self.source / 'main.py').read_bytes()
+                    expected_requirements = b'example==1.0.0\n' if release_tag else b'example==2.0.0\n'
+                    for folder in ('repo', 'working'):
+                        self.assertEqual(package.read(f'NoNo/data/apps/NoNo/{folder}/main.py'), expected_source)
+                    installed = package.read('NoNo/data/apps/NoNo/python/installed-requirements.txt')
+                    self.assertEqual(installed, package.read('NoNo/data/apps/NoNo/working/requirements.txt'))
+                    self.assertEqual(installed.decode().splitlines(), expected_requirements.decode().splitlines())
+                    self.assertEqual(package.read('NoNo/data/apps/NoNo/repo/.git/HEAD'),
+                                     (template_repo / '.git' / 'HEAD').read_bytes())
+
+    def test_command_timeout_retains_bounded_text_bytes_and_empty_tails_without_credentials(self):
+        stdout = ('不保留的日志头\n' + '中间日志\n' * 100
+                  + '受控输出末尾 fixture-secret-value https://user:password@example.invalid\n')
+        stderr = '受控错误末尾 token=fixture-query-secret\n'
+        for kind in ('text', 'bytes', 'empty'):
+            with self.subTest(kind=kind), patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret-value'}):
+                output = stdout.encode() if kind == 'bytes' else stdout if kind == 'text' else None
+                error = stderr.encode() if kind == 'bytes' else stderr if kind == 'text' else None
+                timeout = subprocess.TimeoutExpired(['fixture-launcher.exe'], 1, output=output, stderr=error)
+                with patch.object(self.portable.subprocess, 'run', side_effect=timeout):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture-launcher.exe 超时') as caught:
+                        self.portable.run(['fixture-launcher.exe'], self.root, timeout=1)
+                message = str(caught.exception)
+                self.assertLess(len(message), 4200)
+                self.assertNotIn('fixture-secret-value', message)
+                self.assertNotIn('user:password', message)
+                self.assertNotIn('fixture-query-secret', message)
+                self.assertNotIn('不保留的日志头', message)
+                if kind != 'empty':
+                    self.assertIn('受控输出末尾', message)
+                    self.assertIn('受控错误末尾', message)
+                else:
+                    self.assertIn('无输出', message)
+
+    def test_real_short_command_timeout_preserves_controlled_stdout_and_stderr(self):
+        code = (
+            'import sys, time; print("受控中文输出", flush=True); '
+            'print("受控中文错误", file=sys.stderr, flush=True); time.sleep(5)'
+        )
+        with self.assertRaisesRegex(RuntimeError, '超时') as caught:
+            self.portable.run([sys.executable, '-u', '-c', code], self.root, timeout=1)
+        self.assertIn('受控中文输出', str(caught.exception))
+        self.assertIn('受控中文错误', str(caught.exception))
+
     def test_archive_rejects_missing_runtime_host_or_changed_current_deployment(self):
         bundle, manifest = self.prepare_bundle()
         output = self.root / 'artifacts'

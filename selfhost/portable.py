@@ -52,12 +52,38 @@ def hidden_process_options() -> dict:
     return options
 
 
+def diagnostic_tail(output: str | bytes | None) -> str:
+    """只保留受控日志尾部；不同 Python 版本的超时输出可能是文本、字节或空值。"""
+    if output is None:
+        return "（无输出）"
+    text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    for key, value in os.environ.items():
+        if value and (key.upper() in PRIVATE_ENVIRONMENT - {"PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"}
+                      or re.search(r"TOKEN|PASSWORD|SECRET|API_KEY", key.upper())):
+            text = text.replace(value, "[已隐藏]")
+    text = re.sub(r"(https?://)[^\s/@]+@", r"\1[已隐藏]@", text)
+    text = re.sub(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)\S+", r"\1[已隐藏]", text)
+    text = re.sub(r"(?i)((?:token|password|secret|api_key)=)[^\s&]+", r"\1[已隐藏]", text)
+    return "\n".join(text.splitlines()[-12:])[-2000:] or "（无输出）"
+
+
 def run(command: list[str], cwd: Path, *, timeout: int = 120) -> str:
-    result = subprocess.run(command, cwd=cwd, env=process_environment(), capture_output=True,
-                            text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                            **hidden_process_options())
+    role = Path(command[0]).name
+    try:
+        result = subprocess.run(command, cwd=cwd, env=process_environment(), capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                **hidden_process_options())
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"{role} 超时（{timeout} 秒）。\n标准输出尾部：\n{diagnostic_tail(error.stdout)}"
+            f"\n标准错误尾部：\n{diagnostic_tail(error.stderr)}"
+        ) from None
     if result.returncode:
-        raise RuntimeError(f"构建命令失败（退出码 {result.returncode}）：{result.stdout}\n{result.stderr}")
+        raise RuntimeError(
+            f"{role} 构建命令失败（退出码 {result.returncode}）。\n标准输出尾部：\n{diagnostic_tail(result.stdout)}"
+            f"\n标准错误尾部：\n{diagnostic_tail(result.stderr)}"
+        )
     return result.stdout
 
 
@@ -441,19 +467,10 @@ def build_portable(source: Path, *, source_sha: str | None = None, release_tag: 
             replace_deployment(snapshot, repo, build_root, preserve_git=True)
             replace_deployment(snapshot, working, build_root, preserve_git=False)
             (bundle / "pyappify.yml").write_bytes(configuration)
-            print("使用便携 Python 安装当前快照依赖。", flush=True)
-            portable_python = runtime / "python.exe"
-            if not portable_python.is_file():
-                raise RuntimeError("正式 setup 没有安装便携 Python 入口。")
-            run([str(portable_python), "-m", "pip", "install", "--no-deps", "--no-cache-dir",
-                 "--disable-pip-version-check", "--index-url", "https://pypi.org/simple",
-                 "-r", str(working / "requirements.txt")], working, timeout=1800)
-            # 由 Rust 从根目录和 working 的当前配置合并完整 App 字段，保留用户更新状态。
-            # 版本列表入口抑制自动启动／自动更新，避免为刷新元数据运行实际游戏业务。
-            run([str(launcher), "-p", PROFILE_NAME, "--number-versions", "1", "--release-only", "true",
-                 "--response-file", str(stage / "versions.json")], bundle, timeout=180)
-            if not (stage / "versions.json").is_file():
-                raise RuntimeError("启动器没有返回安全版本列表响应。")
+            # 已有 repo 的无标签 setup 只 fetch，不 checkout；从当前物理树重建 working，
+            # 按当前 YML 安装依赖并合并完整 App。避免用非必要的版本列表入口刷新安装态。
+            print("按当前部署快照重新安装依赖并刷新启动器元数据。", flush=True)
+            run([str(launcher), "-c", "setup", "-p", PROFILE_NAME], bundle, timeout=1800)
             state = read_app_state(bundle, app_name)
         assert_update_anchor(repo, state, base_version, base_commit)
         selected_profile = next(profile for profile in state["profiles"] if profile["name"] == PROFILE_NAME)
