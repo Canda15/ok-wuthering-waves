@@ -67,7 +67,7 @@ if ($metadata.ProductName -ne 'NoNo' -or $metadata.FileDescription -ne 'NoNo') {
 
 Push-Location -LiteralPath $projectPath
 try {
-    & $pythonPath -m unittest tests.TestSelfhostSmoke.TestNativeRuntime
+    & $pythonPath -B run_test.py tests.TestSelfhostSmoke.TestNativeRuntime
     if ($LASTEXITCODE -ne 0) { throw "宿主运行验证失败，退出码 $LASTEXITCODE。" }
 } finally {
     Pop-Location

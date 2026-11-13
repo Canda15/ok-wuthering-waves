@@ -12,6 +12,7 @@ from types import ModuleType
 
 from ok import og
 from ok.core.events import communicate
+from ok.core.script_packager import get_ok_tasks_folder
 from ok.task.task import BaseTask, TriggerTask
 from ok.util.clazz import init_class_by_name
 from ok.util.logger import Logger
@@ -30,7 +31,7 @@ class TaskManager:
         self.custom_tasks_enabled = og.config.get('custom_tasks', False)
         self.task_folder = None
         if self.custom_tasks_enabled:
-            self.task_folder = os.path.join(os.getcwd(), 'ok_tasks')
+            self.task_folder = get_ok_tasks_folder()
             if not os.path.exists(self.task_folder):
                 os.makedirs(self.task_folder)
         self.has_custom = self.custom_tasks_enabled or (self.task_folder and os.path.exists(self.task_folder))

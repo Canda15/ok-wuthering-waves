@@ -1,10 +1,11 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from ok import TaskDisabledException
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
-from src.char.BaseChar import BaseChar
+from src.char.BaseChar import BaseChar, CharType
+from src.char.Lily import Lily
 from src.scene.WWScene import WWScene
 from src.task.BaseCombatTask import BaseCombatTask
 from src.task.BaseWWTask import BaseWWTask
@@ -155,6 +156,152 @@ class TestBaseCombatTask(unittest.TestCase):
         with self.assertRaises(ForegroundInputInterrupted):
             char.perform()
         self.assertIsNone(char.task._active_char_rotation)
+
+    def test_Lily补能结果通过真实公共切换完成或阻止延奏交接(self):
+        for mode, con, expected_fills, expected_keys, expected_intro in (
+            ('解放不可用且补能超时', 0.7, [(1, False)], [], None),
+            ('解放失败且二次补能超时', 0.9, [(0.8, True), (1, False)], ['r'], None),
+            ('新梦乡协奏未满', 0.9, [(0.8, True)], ['r'], None),
+            ('新梦乡协奏已满', 1.0, [(0.8, True)], ['r', 2], True),
+            ('满协奏正常交接', 1.0, [(1, True)], [2], True),
+            ('原梦乡入口快速交接', 0.7, [], [2], False),
+        ):
+            with self.subTest(mode=mode):
+                clock = SimpleNamespace(now=100.0)
+                state = SimpleNamespace(index=0)
+                outer_rotation = object()
+                task = BaseCombatTask.__new__(BaseCombatTask)
+                task.freeze_durations = []
+                task.skip_combat_check = False
+                task.use_liberation = True
+                task.in_liberation = False
+                task._active_char_rotation = outer_rotation
+                task.switch_char_time_out = 5
+                task.check_combat = Mock()
+                task.check_f_break = Mock(return_value=False)
+                task.update_lib_portrait_icon = Mock()
+                task.log_debug = Mock()
+                task.has_cd = Mock(return_value=True)
+                task.get_current_con = Mock(return_value=con)
+                task.get_liberation_key = lambda: 'r'
+                task.in_team = lambda: (True, state.index, 3)
+                task.wait_until = lambda condition, **kwargs: condition()
+                task.screenshot = Mock()
+                keys, fills = [], []
+
+                def sleep(seconds):
+                    clock.now += max(0.05, seconds)
+
+                def click(*args, **kwargs):
+                    clock.now += 0.1
+
+                def key(value, **kwargs):
+                    keys.append(value)
+                    if isinstance(value, int):
+                        state.index = value - 1
+
+                task.sleep = sleep
+                task.next_frame = lambda: sleep(0.05)
+                task.click = click
+                task.send_key = key
+                current = Lily(task, 0, char_name='char_lily', char_type=CharType.HEALER, buff_time=30)
+                target = BaseChar(task, 1, char_name='main', char_type=CharType.MAIN_DPS)
+                support = BaseChar(task, 2, char_name='support', char_type=CharType.SUB_DPS)
+                support.last_buff_time = clock.now
+                support.set_buff_time(30)
+                current.is_current_char = True
+                task.chars = [current, target, support]
+                current.in_slumberland = Mock(return_value=mode == '原梦乡入口快速交接')
+                if mode.startswith('新梦乡'):
+                    current.in_slumberland.side_effect = [False, True]
+                current.click_echo = Mock()
+                current.build_forte = Mock(return_value=True)
+                current.is_mouse_forte_full = Mock(return_value=True)
+                current.perform_heavy = Mock(return_value=True)
+                current.is_forte_full = Mock(return_value=False)
+                if mode == '解放失败且二次补能超时' or mode.startswith('新梦乡'):
+                    current.liberation_available = Mock(side_effect=[True, True, False, False])
+                else:
+                    current.liberation_available = Mock(return_value=False)
+
+                def fill(target_con=1):
+                    result = Lily.fill_concerto(current, target_con)
+                    fills.append((target_con, result))
+                    return result
+
+                # 保留补能、解放和两层公共切换；仅 HUD、时间推进及实际输入使用替身。
+                current.fill_concerto = fill
+                with patch('src.char.Lily.time.time', side_effect=lambda: clock.now):
+                    if expected_intro is None:
+                        with self.assertRaisesRegex(TimeoutError, '协奏'):
+                            current.perform()
+                        self.assertEqual(state.index, 0)
+                        task.screenshot.assert_called_once()
+                        self.assertEqual(current.last_outro_time, -1)
+                        self.assertEqual(current.last_full_con_switch_time, -1)
+                        self.assertEqual(current.last_buff_time, -1)
+                    else:
+                        current.perform()
+                        self.assertEqual(state.index, 1)
+                        self.assertEqual(target.has_intro, expected_intro)
+                        self.assertTrue(target.is_current_char)
+                        task.screenshot.assert_not_called()
+                        if expected_intro:
+                            self.assertGreater(current.last_outro_time, 0)
+                            self.assertGreater(current.last_full_con_switch_time, 0)
+                            self.assertGreater(current.last_buff_time, 0)
+                        else:
+                            self.assertEqual(current.last_outro_time, -1)
+                self.assertEqual(fills, expected_fills)
+                self.assertEqual(keys, expected_keys)
+                self.assertIs(task._active_char_rotation, outer_rotation)
+
+    def test_lily_heavy_releases_mouse_on_start_and_finish_timeouts(self):
+        for observations in ([False], [True, False]):
+            with self.subTest(observations=observations):
+                task = SimpleNamespace(check_combat=Mock(), mouse_down=Mock(), mouse_up=Mock(),
+                                       wait_until=Mock(side_effect=observations))
+                char = Lily(task, 0)
+                char.sleep = Mock()
+                self.assertFalse(char.perform_heavy())
+                task.mouse_down.assert_called_once()
+                task.mouse_up.assert_called_once()
+                char.sleep.assert_not_called()
+
+    def test_lily_heavy_propagates_cancellation_and_input_errors_after_release(self):
+        for error in (TaskDisabledException(), ForegroundInputError(), ForegroundInputInterrupted()):
+            boundaries = [('开始等待', [error]), ('结束等待', [True, error])]
+            if isinstance(error, (TaskDisabledException, ForegroundInputError)):
+                boundaries.append(('诊断截图', [False]))
+            for boundary, observations in boundaries:
+                with self.subTest(error=type(error).__name__, boundary=boundary):
+                    outer_rotation = object()
+                    task = SimpleNamespace(check_combat=Mock(), mouse_down=Mock(), mouse_up=Mock(),
+                                           wait_until=Mock(side_effect=observations), screenshot=Mock(),
+                                           use_liberation=True, _active_char_rotation=outer_rotation)
+                    if boundary == '诊断截图':
+                        task.screenshot.side_effect = error
+                    char = Lily(task, 0)
+                    char.in_slumberland = Mock(return_value=False)
+                    char.click_echo = Mock()
+                    char.build_forte = Mock(return_value=True)
+                    char.is_mouse_forte_full = Mock(return_value=True)
+                    char.fill_concerto = Mock()
+                    char.click_liberation = Mock()
+                    char.switch_next_char = Mock()
+                    char.sleep = Mock()
+                    with self.assertRaises(type(error)):
+                        char.perform()
+                    task.mouse_up.assert_called_once()
+                    if boundary == '诊断截图':
+                        task.screenshot.assert_called_once_with('莉莉重击结果无法确认')
+                    else:
+                        task.screenshot.assert_not_called()
+                    char.fill_concerto.assert_not_called()
+                    char.click_liberation.assert_not_called()
+                    char.switch_next_char.assert_not_called()
+                    char.sleep.assert_not_called()
+                    self.assertIs(task._active_char_rotation, outer_rotation)
 
 
 if __name__ == "__main__":

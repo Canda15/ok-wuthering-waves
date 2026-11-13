@@ -1,4 +1,4 @@
-"""构建便携交付；普通提交覆盖当前部署快照，正式发布沿用镜像标签。"""
+"""构建 incoming 完整便携交付；当前工作树与正式裸 Git 更新锚点分别验证。"""
 
 from __future__ import annotations
 
@@ -16,28 +16,37 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from selfhost.framework_tree import IGNORED_DIR_NAMES, IGNORED_SUFFIXES, iter_payload_files, tree_digest
+from selfhost import portable_protocol as protocol
 
 LAUNCHER_URL = (
-    "https://github.com/Canda15/ok-wuthering-waves/releases/download/launcher-1/NoNo-win32.zip"
+    "https://github.com/Canda15/ok-wuthering-waves/releases/download/launcher-2/NoNo-win32.zip"
 )
 PROFILE_NAME = "China"
-VERSION_TAG = re.compile(r"v?\d+\.\d+\.\d+")
+STABLE_VERSION_TAG = re.compile(r"v?\d+\.\d+\.\d+")
+VERSION_TAG = re.compile(r"v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?")
 PRIVATE_ENVIRONMENT = {
     "GITHUB_TOKEN", "GH_TOKEN", "CNB_TOKEN", "OK_GH", "SIGNPATH_API_TOKEN",
     "GEMINI_API_KEY", "AI_API_KEY", "MIRRORCHYANUPLOADTOKEN", "ACTIONS_RUNTIME_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
+    "NONO_USER_DATA_ROOT", "__COMPAT_LAYER",
 }
 
 PROBE_IMPORTS = ("ok", "selfhost", "pyappify", "ok.device.interaction_methods.foreground_input")
 
 
-def process_environment() -> dict[str, str]:
-    return {
+def process_environment(temporary_root: Path | None = None) -> dict[str, str]:
+    environment = {
         **{key: value for key, value in os.environ.items()
            if key.upper() not in PRIVATE_ENVIRONMENT and not key.upper().startswith(("PYAPPIFY_", "PIP_"))},
         "QT_QPA_PLATFORM": "offscreen", "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PIP_CONFIG_FILE": os.devnull,
+        # 只用于隔离构建子进程；核验仍要求产物保留正式 requireAdministrator 资源。
+        "__COMPAT_LAYER": "RunAsInvoker",
     }
+    if temporary_root is not None:
+        # 官方下载器和 pip 共用系统临时变量；完整构建只允许写入本次隔离目录。
+        environment.update({key: str(temporary_root) for key in ("TMP", "TEMP", "RUNNER_TEMP")})
+    return environment
 
 
 def hidden_process_options() -> dict:
@@ -68,10 +77,11 @@ def diagnostic_tail(output: str | bytes | None) -> str:
     return "\n".join(text.splitlines()[-12:])[-2000:] or "（无输出）"
 
 
-def run(command: list[str], cwd: Path, *, timeout: int = 120) -> str:
+def run(command: list[str], cwd: Path, *, timeout: int = 120,
+        temporary_root: Path | None = None) -> str:
     role = Path(command[0]).name
     try:
-        result = subprocess.run(command, cwd=cwd, env=process_environment(), capture_output=True,
+        result = subprocess.run(command, cwd=cwd, env=process_environment(temporary_root), capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=timeout,
                                 **hidden_process_options())
     except subprocess.TimeoutExpired as error:
@@ -135,7 +145,7 @@ def clean_caches(build_root: Path, root: Path) -> None:
 
 
 def prepare_snapshot(source: Path, destination: Path, version: str, build_root: Path) -> dict[str, str]:
-    if not VERSION_TAG.fullmatch(version):
+    if not STABLE_VERSION_TAG.fullmatch(version):
         raise RuntimeError(f"更新底座没有合法版本标签：{version}")
     require_path(build_root, destination)
     native = source / "selfhost" / "NoNo.exe"
@@ -207,13 +217,11 @@ def prepare_snapshot(source: Path, destination: Path, version: str, build_root: 
     return digests
 
 
-def replace_deployment(snapshot: Path, destination: Path, build_root: Path, *, preserve_git: bool) -> None:
+def replace_deployment(snapshot: Path, destination: Path, build_root: Path, *, preserve_git: bool = False) -> None:
     require_path(build_root, destination)
-    if preserve_git and not (destination / ".git").is_dir():
-        raise RuntimeError("正式 setup 没有生成可供后续更新的 repo/.git。")
+    if preserve_git or (destination / "HEAD").is_file() or (destination / ".git").exists():
+        raise RuntimeError("新版裸仓库只作为更新锚点，不能用部署快照覆盖。")
     for child in destination.iterdir():
-        if preserve_git and child.name == ".git":
-            continue
         require_path(build_root, child)
         if child.is_dir():
             remove_tree(build_root, child)
@@ -229,26 +237,47 @@ def replace_deployment(snapshot: Path, destination: Path, build_root: Path, *, p
         raise RuntimeError("实际部署树与当前源码快照不一致。")
 
 
-def fetch_launcher(destination: Path, app_name: str) -> Path:
-    archive = destination / "launcher.zip"
-    with urllib.request.urlopen(LAUNCHER_URL, timeout=120) as response, archive.open("wb") as stream:
-        shutil.copyfileobj(response, stream)
-    checksum_url = LAUNCHER_URL.rsplit("/", 1)[0] + "/NoNo-win32-sha256.txt"
-    with urllib.request.urlopen(checksum_url, timeout=120) as response:
-        expected = response.read().decode("ascii").split()[0].lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected) or sha256(archive) != expected:
-        raise RuntimeError("固定启动器下载内容与发布的 SHA-256 不一致。")
+def fetch_launcher(destination: Path, app_name: str, candidate: Path | None = None,
+                   proof_path: Path | None = None, *, published: bool = False) -> Path:
+    """默认消费已构建候选；新固定 tag 只有明确选择发布来源时才下载。"""
+    if app_name != "NoNo":
+        raise RuntimeError("便携交付仅接受 NoNo 启动器。")
     launcher = destination / f"{app_name}.exe"
-    with zipfile.ZipFile(archive) as package:
-        name = f"{app_name}/{app_name}.exe"
-        if name not in package.namelist():
-            raise RuntimeError(f"固定启动器包缺少 {name}。")
-        launcher.write_bytes(package.read(name))
-    literal = str(launcher).replace("'", "''")
-    product_name = run(["powershell", "-NoProfile", "-Command",
-                        f"(Get-Item -LiteralPath '{literal}').VersionInfo.ProductName"], destination).strip()
-    if product_name != app_name:
-        raise RuntimeError(f"启动器的产品名 {product_name!r} 与应用名 {app_name!r} 不一致。")
+    if published:
+        if candidate is not None or proof_path is not None:
+            raise RuntimeError("候选启动器和固定发布来源不能同时选择。")
+        archive = destination / "launcher.zip"
+        with urllib.request.urlopen(LAUNCHER_URL, timeout=120) as response, archive.open("wb") as stream:
+            shutil.copyfileobj(response, stream)
+        base = LAUNCHER_URL.rsplit("/", 1)[0]
+        with urllib.request.urlopen(base + "/NoNo-win32-sha256.txt", timeout=120) as response:
+            expected = response.read().decode("ascii").split()[0].lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected) or sha256(archive) != expected:
+            raise RuntimeError("固定启动器下载内容与发布的 SHA-256 不一致。")
+        with zipfile.ZipFile(archive) as package:
+            if {entry.filename for entry in package.infolist() if not entry.is_dir()} != {"NoNo/NoNo.exe"}:
+                raise RuntimeError("固定启动器 ZIP 成员不匹配。")
+            launcher.write_bytes(package.read("NoNo/NoNo.exe"))
+        proof_path = destination / "launcher-build.json"
+        with urllib.request.urlopen(base + "/launcher-build.json", timeout=120) as response:
+            proof_path.write_bytes(response.read())
+        candidate = launcher
+        archive.unlink()
+    else:
+        candidate = candidate or Path(__file__).resolve().parents[1] / "build/launcher-dist/NoNo.exe"
+        proof_path = proof_path or candidate.parent / "launcher-build.json"
+        if not candidate.is_file() or not proof_path.is_file():
+            raise RuntimeError("缺少新版候选启动器，请先运行 build_launcher.ps1 或传入 --launcher-exe。")
+    from launcher.verify import inspect_executable
+    proof = json.loads(proof_path.read_bytes())
+    inspected = inspect_executable(candidate, Path(__file__).resolve().parents[1] / "icons/icon.ico")
+    if proof != inspected:
+        raise RuntimeError("候选启动器源码身份、PE、图标或摘要与构建清单不一致。")
+    if candidate.resolve() != launcher.resolve():
+        shutil.copy2(candidate, launcher)
+    if sha256(launcher) != proof["exe_sha256"]:
+        raise RuntimeError("候选启动器复制后摘要发生漂移。")
+    (destination / "launcher-build.json").write_bytes(protocol.json_bytes(proof))
     return launcher
 
 
@@ -262,11 +291,13 @@ def read_app_state(bundle: Path, app_name: str) -> dict:
     if state.get("current_profile") != PROFILE_NAME:
         raise RuntimeError("启动器应用元数据没有保留 China profile。")
     if not isinstance(state.get("current_version"), str) or not VERSION_TAG.fullmatch(state["current_version"]):
-        raise RuntimeError("启动器应用元数据没有合法稳定更新版本。")
+        raise RuntimeError("启动器应用元数据没有合法更新版本。")
     return state
 
 
 def assert_update_anchor(repo: Path, state: dict, version: str, commit: str) -> None:
+    if (repo / ".git").exists() or git(repo, "rev-parse", "--is-bare-repository") != "true":
+        raise RuntimeError("正式更新底座必须是独立裸 Git 仓库。")
     if state["current_version"] != version:
         raise RuntimeError("当前部署文件覆盖后，启动器的正式更新版本发生漂移。")
     if git(repo, "rev-parse", "HEAD") != commit or git(repo, "rev-parse", f"{version}^{{commit}}") != commit:
@@ -279,7 +310,8 @@ def assert_update_anchor(repo: Path, state: dict, version: str, commit: str) -> 
             raise RuntimeError("便携包更新来源不能包含临时路径、地址或凭据。")
 
 
-def probe_executable(executable: Path, working: Path, runtime: Path, *, check_deployment: bool) -> dict:
+def probe_executable(executable: Path, working: Path, runtime: Path, *, check_deployment: bool,
+                     provide_user_root: bool = False, temporary_root: Path | None = None) -> dict:
     code = (
         "import ctypes, importlib, importlib.metadata, json, os, pathlib, re, sys; "
         "image = ctypes.create_unicode_buffer(32768); "
@@ -300,9 +332,17 @@ def probe_executable(executable: Path, working: Path, runtime: Path, *, check_de
     code += (
         "print(json.dumps({'pid': os.getpid(), 'executable': sys.executable, 'image': image.value, "
         "'prefix': sys.prefix, 'python_version': f'{sys.version_info.major}.{sys.version_info.minor}', "
-        "'sources': sources}))\n"
+        "'sources': sources, 'user_data_root': os.getenv('NONO_USER_DATA_ROOT')}))\n"
     )
-    with subprocess.Popen([str(executable), "-c", code], cwd=working, env=process_environment(),
+    environment = process_environment(temporary_root)
+    portable_layout = (working.name == "working" and working.parent.name == "NoNo"
+                       and working.parents[1].name == "apps" and working.parents[2].name == "data")
+    portable_root = working.parents[3] if portable_layout else None
+    if provide_user_root:
+        if portable_root is None:
+            raise RuntimeError("稳定用户根探针需要正式便携布局。")
+        environment["NONO_USER_DATA_ROOT"] = str(portable_root / "data/user/NoNo")
+    with subprocess.Popen([str(executable), "-c", code], cwd=working, env=environment,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                           errors="replace", **hidden_process_options()) as process:
         try:
@@ -320,215 +360,307 @@ def probe_executable(executable: Path, working: Path, runtime: Path, *, check_de
         raise RuntimeError("便携进程没有使用预期的 EXE 入口。")
     if Path(identity["prefix"]).resolve() != runtime.resolve():
         raise RuntimeError("便携进程没有加载便携目录中的 Python 运行环境。")
+    if (portable_root is not None and (not identity.get("user_data_root")
+            or Path(identity["user_data_root"]).resolve() != (portable_root / "data/user/NoNo").resolve())):
+        raise RuntimeError("便携进程没有使用统一稳定用户目录。")
     for name, path in identity["sources"].items():
         if not Path(path).resolve().is_relative_to(working.resolve()):
             raise RuntimeError(f"便携进程的 {name} 没有从当前部署树导入。")
     return identity
 
 
-def required_bundle_files(app_name: str, metadata_file: str) -> set[str]:
-    app = f"data/apps/{app_name}"
-    return {
-        f"{app_name}.exe", "pyappify.yml", metadata_file,
-        f"{app}/python/python.exe", f"{app}/python/python3.dll",
-        *(f"{app}/{folder}/{file}" for folder in ("repo", "working")
-          for file in ("main.py", "requirements.txt", "selfhost/NoNo.exe", "selfhost/ok_pin.json")),
-    }
+def required_bundle_files(app_name: str, bundle_id: str) -> set[str]:
+    return protocol.required_files(app_name, bundle_id)
 
 
 def verify_archive(archive: Path, app_name: str, manifest: dict) -> None:
-    prefix = f"{app_name}/"
-    with zipfile.ZipFile(archive) as package:
-        names = {entry.filename for entry in package.infolist() if not entry.is_dir()}
-        required = required_bundle_files(app_name, manifest["app_metadata_file"]) | {"build-info.json"}
-        if not {prefix + name for name in required} <= names:
-            raise RuntimeError("便携归档缺少启动入口、运行环境或部署文件。")
-        for name in names:
-            if not name.startswith(prefix) or ".." in PurePosixPath(name).parts or "\\" in name:
-                raise RuntimeError(f"便携归档包含越界路径：{name}")
-        if json.loads(package.read(prefix + "build-info.json")) != manifest:
-            raise RuntimeError("便携归档中的构建信息发生漂移。")
-        for folder in ("repo", "working"):
-            deployment_prefix = f"{prefix}data/apps/{app_name}/{folder}/"
-            actual_files = {
-                name[len(deployment_prefix):] for name in names
-                if name.startswith(deployment_prefix)
-                and ".git" not in PurePosixPath(name[len(deployment_prefix):]).parts
-            }
-            if actual_files != set(manifest["deployment_files"]):
-                raise RuntimeError(f"便携归档中的 {folder} 包含缺失或过时的部署文件。")
-            for relative, expected in manifest["deployment_files"].items():
-                name = deployment_prefix + relative
-                if name not in names:
-                    raise RuntimeError(f"便携归档缺少当前部署文件：{name}")
-                with package.open(name) as stream:
-                    actual = hashlib.file_digest(stream, "sha256").hexdigest()
-                if actual != expected:
-                    raise RuntimeError(f"便携归档中的当前部署文件发生漂移：{name}")
-        if package.testzip() is not None:
-            raise RuntimeError("便携归档的文件校验失败。")
+    protocol.verify_archive(archive, app_name, manifest)
+
+
+def incoming_payload(bundle: Path, manifest: dict) -> Path:
+    protocol.validate_manifest(manifest)
+    return bundle / "data/incoming/NoNo" / manifest["bundle_id"]
+
+
+def verify_payload_tree(bundle: Path, manifest: dict) -> None:
+    payload = incoming_payload(bundle, manifest)
+    files, directories = protocol.collect_tree(payload)
+    files.pop("manifest.json", None)
+    if files != manifest["payload_files"] or directories != manifest["payload_directories"]:
+        raise RuntimeError("完整 incoming 载荷发生漂移。")
+    if (protocol.file_record(bundle / "NoNo.exe")["sha256"] != manifest["launcher"]["exe_sha256"]
+            or (payload / "manifest.json").read_bytes() != protocol.json_bytes(manifest)
+            or (bundle / "data/incoming/NoNo/selected.json").read_bytes()
+            != protocol.json_bytes(protocol.selected_package(manifest))):
+        raise RuntimeError("incoming 选择清单或启动器身份发生漂移。")
 
 
 def archive_bundle(bundle: Path, output: Path, manifest: dict, build_root: Path) -> Path:
     require_path(build_root, bundle)
     require_path(build_root, output)
-    app_name = bundle.name
-    for relative in required_bundle_files(app_name, manifest["app_metadata_file"]):
-        path = require_path(build_root, bundle / relative)
-        if not path.is_file():
-            raise RuntimeError(f"便携目录缺少必要文件：{relative}")
-    for folder in ("repo", "working"):
-        actual = deployment_digests(bundle / "data" / "apps" / app_name / folder)
-        if actual != manifest["deployment_files"]:
-            raise RuntimeError(f"归档前 {folder} 与当前部署快照不一致。")
-    (bundle / "build-info.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    verify_payload_tree(bundle, manifest)
+    for relative in required_bundle_files(bundle.name, manifest["bundle_id"]):
+        if not require_path(build_root, bundle / relative).is_file():
+            raise RuntimeError("便携目录缺少必要环境、入口或安装种子。")
+    # 避免把验证接收后产生的 live、用户配置或私有备份意外归档。
+    files, directories = protocol.collect_tree(bundle)
+    prefix = f"data/incoming/NoNo/{manifest['bundle_id']}/"
+    expected = {"NoNo.exe", "data/incoming/NoNo/selected.json", prefix + "manifest.json",
+                *(prefix + name for name in manifest["payload_files"])}
+    if set(files) != expected:
+        raise RuntimeError("归档根包含 live 或用户私有文件。")
     output.mkdir(parents=True, exist_ok=True)
-    archive = require_path(build_root, output / f"{app_name}-win32-portable.zip")
+    archive = require_path(build_root, output / "NoNo-win32-portable.zip")
     archive.unlink(missing_ok=True)
-    seven_zip = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "7-Zip" / "7z.exe"
+    seven_zip = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "7-Zip/7z.exe"
     if seven_zip.is_file():
-        # 保留 Windows 资源管理器可直接解压的标准 ZIP 容器，复用发行的 7-Zip 压缩等级。
-        run([str(seven_zip), "a", "-tzip", "-mx=5", "-bd", str(archive), app_name], bundle.parent,
-            timeout=900)
+        run([str(seven_zip), "a", "-tzip", "-mx=5", "-bd", str(archive), bundle.name],
+            bundle.parent, timeout=900)
     else:
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as package:
-            for path in iter_payload_files(bundle):
-                package.write(path, f"{app_name}/{path.relative_to(bundle).as_posix()}")
-    verify_archive(archive, app_name, manifest)
-    checksum = require_path(build_root, output / f"{app_name}-win32-sha256.txt")
+            # 没有 7-Zip 时也保留裸库和 Python 的空目录，接收器按完整目录身份校验。
+            for relative in directories:
+                package.write(bundle / relative, f"{bundle.name}/{relative}/")
+            for relative in sorted(files):
+                package.write(bundle / relative, f"{bundle.name}/{relative}")
+    verify_archive(archive, bundle.name, manifest)
+    checksum = require_path(build_root, output / "NoNo-win32-sha256.txt")
     checksum.write_text(f"{sha256(archive)}  {archive.name}\n", encoding="ascii")
     return archive
 
 
 def verify_portable_metadata(bundle: Path, stage: Path, app_name: str) -> None:
-    app = bundle / "data" / "apps" / app_name
-    paths = [app / "app.json", app / "repo" / ".git" / "config"]
+    app = bundle / "data/apps" / app_name
+    paths = [app / "app.json", app / "repo/config"]
     for pattern in ("*.pth", "*._pth", "pyvenv.cfg", "direct_url.json"):
         paths.extend((app / "python").rglob(pattern))
     temporary_names = (str(stage), stage.as_posix(), json.dumps(str(stage))[1:-1])
     for path in paths:
+        if not path.is_file():
+            raise RuntimeError("便携安装状态或裸仓库配置缺失。")
         content = path.read_text(encoding="utf-8").casefold()
         if any(name.casefold() in content for name in temporary_names) or "file://" in content:
-            raise RuntimeError(f"便携元数据残留了构建机临时来源：{path.name}")
+            raise RuntimeError("便携元数据残留构建机临时来源。")
 
 
-def build_portable(source: Path, *, source_sha: str | None = None, release_tag: str | None = None) -> Path:
+def package_incoming(installation: Path, destination: Path, build_info: dict,
+                     launcher_proof: dict, build_root: Path) -> tuple[Path, dict]:
+    require_path(build_root, installation)
+    require_path(build_root, destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(installation / "NoNo.exe", destination / "NoNo.exe")
+    incoming = destination / "data/incoming/NoNo"
+    incoming.mkdir(parents=True)
+    payload = incoming / "preparing"
+    payload.mkdir()
+    app = installation / "data/apps/NoNo"
+    for folder in ("repo", "working", "python"):
+        # Git 对象常带只读属性；新交付副本采用普通文件，保证同包再次解压可覆盖 incoming。
+        # 只复制新载荷字节，原安装和正式裸仓库的属性保持不变。
+        shutil.copytree(app / folder, payload / folder, copy_function=shutil.copyfile)
+    seed = read_app_state(installation, "NoNo")
+    # 构建环境没有用户偏好，seed 只提供缺项默认；升级时由 Rust 合并旧 raw。
+    seed.update({"running": False, "auto_start": False, "update_state": "idle",
+                 "update_target_version": None, "update_error": None,
+                 "app_starting_version": None, "update_note": []})
+    seed.pop("current_version_missing", None)
+    (payload / "app-seed.json").write_bytes(protocol.json_bytes(seed))
+    (payload / "root").mkdir()
+    shutil.copy2(installation / "pyappify.yml", payload / "root/pyappify.yml")
+    (payload / "root/build-info.json").write_bytes(protocol.json_bytes(build_info))
+    manifest = protocol.make_manifest(
+        source_sha=build_info["source_sha"], version=build_info["base_update_version"],
+        commit=build_info["base_update_commit"], working=payload / "working",
+        launcher=launcher_proof, kind=build_info["build_kind"], payload=payload)
+    (payload / "manifest.json").write_bytes(protocol.json_bytes(manifest))
+    final = require_path(build_root, incoming / manifest["bundle_id"])
+    payload.rename(final)
+    (incoming / "selected.json").write_bytes(protocol.json_bytes(protocol.selected_package(manifest)))
+    verify_payload_tree(destination, manifest)
+    return destination, manifest
+
+
+def verify_received_state(root: Path, manifest: dict, expected_preferences: dict | None = None) -> None:
+    state = read_app_state(root, "NoNo")
+    app = root / "data/apps/NoNo"
+    assert_update_anchor(app / "repo", state, manifest["base_update_version"], manifest["base_update_commit"])
+    if protocol.collect_tree(app / "working")[0] != manifest["working_files"]:
+        raise RuntimeError("接收后的工作树没有保持本次源码。")
+    for marker in ("repo.git.migrating", "repo.checkout.old", ".pip_update_needed.tmp"):
+        if (app / marker).exists():
+            raise RuntimeError("接收后仍有旧库或失败标记。")
+    if state.get("update_state") != "idle" or state.get("update_target_version") is not None or state.get("update_error") is not None:
+        raise RuntimeError("接收后没有隔离旧更新操作态。")
+    if expected_preferences and any(state.get(key) != value for key, value in expected_preferences.items()):
+        raise RuntimeError("接收后用户偏好或未知字段丢失。")
+    receipt = json.loads((root / "data/state/NoNo/accepted.json").read_bytes())
+    if receipt["bundle_id"] != manifest["bundle_id"] or receipt["source_sha"] != manifest["source_sha"]:
+        raise RuntimeError("接收收据与源码身份不一致。")
+
+
+def verify_package_reception(bundle: Path, manifest: dict, build_root: Path) -> None:
+    """只运行接收 CLI；用合成旧文件验证实际 Windows 覆盖，不启动业务界面。"""
+    check_root = bundle.parent / "reception"
+    require_path(build_root, check_root)
+    check_root.mkdir()
+    expected = {}
+    for legacy in (False, True):
+        target = check_root / ("legacy" if legacy else "fresh") / "NoNo"
+        target.parent.mkdir()
+        shutil.copytree(bundle, target)
+        if legacy:
+            app = target / "data/apps/NoNo"
+            (app / "working/configs").mkdir(parents=True)
+            account = protocol.json_bytes({"accounts": [{"id": "合成账号"}], "enabled": False, "unknown": {"value": 0}})
+            (app / "working/configs/MultiAccountConfig.json").write_bytes(account)
+            (app / "working/custom-source.py").write_bytes("自定义 = '合成源码'\n".encode())
+            (app / "repo/.git").mkdir(parents=True)
+            (app / "repo/.git/HEAD").write_bytes(b"old non-bare head")
+            (app / "repo.git.migrating").mkdir()
+            (app / "working/.pip_update_needed.tmp").write_bytes(b"old marker")
+            (app / "python").mkdir()
+            (app / "python/old-user-file.bin").write_bytes(b"synthetic original")
+            seed = json.loads((incoming_payload(bundle, manifest) / "app-seed.json").read_bytes())
+            seed.update({"auto_start": False, "update_method": "AUTO_UPDATE_PRE_RELEASE",
+                         "update_state": "failed", "update_target_version": "v0.0.1",
+                         "update_error": "合成旧错误", "unknown": {"preserved": False}})
+            (app / "app.json").write_bytes(protocol.json_bytes(seed))
+            (target / "data/config").mkdir()
+            (target / "data/config/app_config.json").write_bytes(protocol.json_bytes({"Language": "zh-CN", "unknown": {"preserved": True}}))
+            expected = {"auto_start": False, "update_method": "AUTO_UPDATE_PRE_RELEASE", "unknown": {"preserved": False}}
+        run([str(target / "NoNo.exe"), "--nono-receive-only"], target, timeout=1200)
+        verify_received_state(target, manifest, expected if legacy else None)
+        if legacy and (target / "data/user/NoNo/configs/MultiAccountConfig.json").read_bytes() != account:
+            raise RuntimeError("实际旧目录迁移没有保持合成账号原件。")
+        # 同包重新解压只覆盖 incoming；后来的用户偏好不能被 seed 重新播种。
+        app_json = target / "data/apps/NoNo/app.json"
+        state = json.loads(app_json.read_bytes())
+        state["auto_start"] = True
+        state["update_method"] = "MANUAL_UPDATE"
+        app_json.write_bytes(protocol.json_bytes(state))
+        before = app_json.read_bytes()
+        shutil.copytree(bundle / "data/incoming", target / "data/incoming", dirs_exist_ok=True)
+        run([str(target / "NoNo.exe"), "--nono-receive-only"], target, timeout=1200)
+        if app_json.read_bytes() != before:
+            raise RuntimeError("同包重复接收覆盖了后来修改的用户偏好。")
+
+
+def build_portable(source: Path, *, source_sha: str | None = None, release_tag: str | None = None,
+                   launcher_exe: Path | None = None, launcher_proof: Path | None = None,
+                   published_launcher: bool = False) -> Path:
     if sys.platform != "win32":
-        raise RuntimeError("便携运行环境和原生进程验证需要在 Windows 上构建。")
+        raise RuntimeError("便携环境、根接收和原生进程验证需要 Windows。")
     actual_sha = git(source, "rev-parse", "HEAD")
     if source_sha is not None and source_sha != actual_sha:
         raise RuntimeError("当前检出源码 SHA 与本次编译要求不一致。")
     if release_tag is not None and not VERSION_TAG.fullmatch(release_tag):
-        raise RuntimeError("正式便携发布必须使用稳定版本标签。")
-    if release_tag is None and not (source / "selfhost" / "NoNo.exe").is_file():
-        raise RuntimeError("当前源码缺少已编译的原生宿主，请先运行 build_runtime.ps1。")
+        raise RuntimeError("正式便携发布必须使用合法的正式或 alpha/beta/rc 标签。")
+    if release_tag is None and not (source / "selfhost/NoNo.exe").is_file():
+        raise RuntimeError("缺少已编译的原生宿主，请先运行 build_runtime.ps1。")
     configuration = (source / "pyappify.yml").read_bytes()
-    match = re.search(rb'^name:\s*"([^"\r\n]+)"', configuration, re.MULTILINE)
-    if not match:
-        raise RuntimeError("pyappify.yml 没有明确的应用名。")
-    app_name = match[1].decode("utf-8")
-    if app_name != "NoNo":
-        raise RuntimeError("便携交付需要与固定 NoNo 启动器同名的应用配置。")
+    if not re.search(rb'^name:\s*"NoNo"\s*$', configuration, re.MULTILINE):
+        raise RuntimeError("便携交付需要明确的 NoNo 应用名。")
     build_root = require_path(source, source / "build")
     build_root.mkdir(exist_ok=True)
     temporary = tempfile.TemporaryDirectory(prefix="portable-", dir=build_root)
     stage = require_path(build_root, Path(temporary.name))
     try:
-        bundle = stage / app_name
-        bundle.mkdir()
-        print("下载并校验固定启动器。", flush=True)
-        launcher = fetch_launcher(bundle, app_name)
-        (bundle / "launcher.zip").unlink()
-        (bundle / "pyappify.yml").write_bytes(configuration)
-        arguments = [str(launcher), "-c", "setup", "-p", PROFILE_NAME]
+        process_temp = stage / "process-temp"
+        process_temp.mkdir()
+        installation = stage / "installation/NoNo"
+        installation.mkdir(parents=True)
+        print("核验本次新版候选启动器。", flush=True)
+        launcher = fetch_launcher(installation, "NoNo", launcher_exe, launcher_proof, published=published_launcher)
+        proof = json.loads((installation / "launcher-build.json").read_bytes())
+        (installation / "pyappify.yml").write_bytes(configuration)
+        setup = [str(launcher), "-c", "setup", "-p", PROFILE_NAME]
         if release_tag:
-            arguments += ["--setup-version", release_tag]
-        # 普通提交也只连接正式镜像：先建立可被客户端长期识别的合法 Git 更新锚点。
-        # 临时本地 tag 在首次 fetch 时会被清除并触发强制回退，不能用来安装当前源码。
-        print("安装正式运行环境与合法更新底座。", flush=True)
-        run(arguments, bundle, timeout=1800)
-        state = read_app_state(bundle, app_name)
-        base_version = state["current_version"]
-        if release_tag and base_version != release_tag:
-            raise RuntimeError("正式 setup 没有检出本次发布标签。")
-        app = bundle / "data" / "apps" / app_name
+            setup += ["--setup-version", release_tag]
+        print("安装正式运行环境与裸 Git 更新底座。", flush=True)
+        run(setup, installation, timeout=1800, temporary_root=process_temp)
+        state = read_app_state(installation, "NoNo")
+        version = state["current_version"]
+        app = installation / "data/apps/NoNo"
         repo, working, runtime = app / "repo", app / "working", app / "python"
-        base_commit = git(repo, "rev-parse", "HEAD")
-        assert_update_anchor(repo, state, base_version, base_commit)
-        if release_tag:
-            digests = deployment_digests(repo)
-        else:
-            print(f"覆盖本次源码部署快照：{actual_sha}。", flush=True)
-            snapshot = stage / "snapshot"
-            digests = prepare_snapshot(source, snapshot, base_version, build_root)
-            # 只保留 repo/.git 作为正式更新锚点；实际代码来自当前 SHA 的白名单快照。
-            # 旧代码和资源必须删除，不能只覆盖同名文件后把镜像残留一起压入包。
-            replace_deployment(snapshot, repo, build_root, preserve_git=True)
-            replace_deployment(snapshot, working, build_root, preserve_git=False)
-            (bundle / "pyappify.yml").write_bytes(configuration)
-            # 已有 repo 的无标签 setup 只 fetch，不 checkout；从当前物理树重建 working，
-            # 按当前 YML 安装依赖并合并完整 App。避免用非必要的版本列表入口刷新安装态。
-            print("按当前部署快照重新安装依赖并刷新启动器元数据。", flush=True)
-            run([str(launcher), "-c", "setup", "-p", PROFILE_NAME], bundle, timeout=1800)
-            state = read_app_state(bundle, app_name)
-        assert_update_anchor(repo, state, base_version, base_commit)
-        selected_profile = next(profile for profile in state["profiles"] if profile["name"] == PROFILE_NAME)
-        if selected_profile.get("main_script") != "selfhost/NoNo.exe":
-            raise RuntimeError("启动器应用元数据没有使用当前原生业务入口。")
-        if (bundle / "pyappify.yml").read_bytes() != configuration:
-            raise RuntimeError("启动器根目录配置与当前源码配置不一致。")
-        print("核对实际部署树、框架来源和便携进程。", flush=True)
-        for deployment in (repo, working):
-            if deployment_digests(deployment) != digests:
-                raise RuntimeError("启动器处理后实际部署树与预期快照不一致。")
-            run([sys.executable, str(source / "scripts" / "sync_ok.py"), "--check", "--root", str(deployment)],
-                source)
-        python_identity = probe_executable(runtime / "python.exe", working, runtime, check_deployment=True)
-        probe_executable(working / "selfhost" / "NoNo.exe", working, runtime, check_deployment=True)
-        if python_identity["python_version"] != selected_profile.get("requires_python"):
-            raise RuntimeError("便携 Python 版本与当前部署配置不一致。")
-        for folder in (bundle / "cache", bundle / "data" / "logs"):
-            remove_tree(build_root, folder)
-        clean_caches(build_root, bundle)
-        manifest = {
-            "schema_version": 1,
-            "build_kind": "release_tag" if release_tag else "commit_snapshot",
-            "source_sha": actual_sha,
-            "base_update_version": base_version,
-            "base_update_commit": base_commit,
-            "app_metadata_file": f"data/apps/{app_name}/app.json",
-            "deployment_tree_sha256": tree_digest(digests),
-            "deployment_files": digests,
-            "native_sha256": digests["selfhost/NoNo.exe"],
-            "launcher_sha256": sha256(launcher),
-            "framework_pin": json.loads((working / "selfhost" / "ok_pin.json").read_text(encoding="utf-8")),
-        }
+        commit = git(repo, "rev-parse", "HEAD")
+        if release_tag and version != release_tag:
+            raise RuntimeError("正式 setup 没有检出本次发布标签。")
+        assert_update_anchor(repo, state, version, commit)
         if not release_tag:
-            manifest["generated_sources"] = {
-                ".gitignore": ".update_repo_gitignore",
-                "selfhost/NoNo.exe": "scripts/build_runtime.ps1",
-                "pyappify/": "现有发行准备函数内联的固定依赖",
-                "config.py / requirements.txt": "ok.update.inline_ok_requirements",
-            }
-        # 安装态只允许正式来源，不把构建机目录、临时 URL 或 pip 安装记录里的凭据打进包。
-        verify_portable_metadata(bundle, stage, app_name)
+            snapshot = stage / "snapshot"
+            digests = prepare_snapshot(source, snapshot, version, build_root)
+            replace_deployment(snapshot, working, build_root)
+            (installation / "pyappify.yml").write_bytes(configuration)
+            install_manifest = protocol.make_manifest(
+                source_sha=actual_sha, version=version, commit=commit, working=working,
+                launcher=proof, kind="working_install")
+            manifest_path = installation / "working-install.json"
+            manifest_path.write_bytes(protocol.json_bytes(install_manifest))
+            print("安装当前工作树依赖并严格保存完整 App。", flush=True)
+            run([str(launcher), "--nono-install-working", str(manifest_path), "-p", PROFILE_NAME],
+                installation, timeout=1800, temporary_root=process_temp)
+            record = json.loads((installation / "data/state/NoNo/install-working.json").read_bytes())
+            if record.get("state") != "completed":
+                raise RuntimeError("当前工作树安装没有提交完成记录。")
+            state = read_app_state(installation, "NoNo")
+        else:
+            digests = deployment_digests(working)
+        assert_update_anchor(repo, state, version, commit)
+        profile = next(item for item in state["profiles"] if item["name"] == PROFILE_NAME)
+        if profile.get("main_script") != "selfhost/NoNo.exe":
+            raise RuntimeError("完整 App 未使用当前原生业务入口。")
+        if (installation / "pyappify.yml").read_bytes() != configuration:
+            raise RuntimeError("根配置与本次源码配置不一致。")
+        if deployment_digests(working) != digests:
+            raise RuntimeError("安装后当前工作树源码发生漂移。")
+        if (working / ".pip_update_needed.tmp").exists():
+            raise RuntimeError("当前工作树残留未完成依赖标记。")
+        run([sys.executable, str(source / "scripts/sync_ok.py"), "--check", "--root", str(working)], source)
+        from ok.update.inline_ok_requirements import verify_inlined_pyappify
+        verify_inlined_pyappify(str(working))
+        print("验证便携 Python、原生 PID 与稳定用户根。", flush=True)
+        identity = probe_executable(runtime / "python.exe", working, runtime, check_deployment=True,
+                                    provide_user_root=True, temporary_root=process_temp)
+        probe_executable(working / "selfhost/NoNo.exe", working, runtime, check_deployment=True,
+                         temporary_root=process_temp)
+        if identity["python_version"] != profile.get("requires_python"):
+            raise RuntimeError("便携 Python 版本与当前运行配置不一致。")
+        for folder in (installation / "cache", installation / "data/logs", installation / "logs"):
+            remove_tree(build_root, folder)
+        clean_caches(build_root, installation)
+        if deployment_digests(working) != digests:
+            raise RuntimeError("缓存清理改变了业务部署文件。")
+        verify_portable_metadata(installation, stage, "NoNo")
+        build_info = {
+            "schema_version": 1, "build_kind": "release_tag" if release_tag else "commit_snapshot",
+            "source_sha": actual_sha, "base_update_version": version, "base_update_commit": commit,
+            "deployment_tree_sha256": tree_digest(digests), "deployment_files": digests,
+            "framework_pin": json.loads((working / "selfhost/ok_pin.json").read_bytes()),
+            "launcher": proof, "app_metadata_file": "app-seed.json",
+            "verification": {"python": True, "native_pid": True, "stable_user_root": True},
+        }
+        bundle, manifest = package_incoming(installation, stage / "package/NoNo", build_info, proof, build_root)
+        print("验证新目录、旧非裸目录和同包重复覆盖接收。", flush=True)
+        verify_package_reception(bundle, manifest, build_root)
         archive = archive_bundle(bundle, build_root / "portable-dist", manifest, build_root)
-        print(f"已验证完整便携包：{archive}", flush=True)
+        print(f"完整便携包已生成并验证：{archive}", flush=True)
         return archive
     finally:
         require_path(build_root, stage)
         temporary.cleanup()
 
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建并验证完整 NoNo Windows 便携包。")
     parser.add_argument("--source-sha", help="普通编译需要交付的完整源码 SHA。")
-    parser.add_argument("--release-tag", help="沿用正式镜像发布的稳定标签；省略时交付当前源码快照。")
+    parser.add_argument("--release-tag", help="沿用正式镜像发布标签（支持 alpha/beta/rc）；省略时交付当前源码快照。")
+    parser.add_argument("--launcher-exe", type=Path, help="本次已构建并核验的 NoNo 1.2.7 候选 EXE。")
+    parser.add_argument("--launcher-proof", type=Path, help="候选源码与 PE 清单；默认取 EXE 同目录 launcher-build.json。")
+    parser.add_argument("--published-launcher", action="store_true", help="明确使用固定 launcher-2 发布来源；该资产需已发布。")
     arguments = parser.parse_args()
     try:
         build_portable(Path(__file__).resolve().parents[1], source_sha=arguments.source_sha,
-                       release_tag=arguments.release_tag)
+                       release_tag=arguments.release_tag, launcher_exe=arguments.launcher_exe,
+                       launcher_proof=arguments.launcher_proof, published_launcher=arguments.published_launcher)
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"便携打包失败：{error}", file=sys.stderr)
         return 1

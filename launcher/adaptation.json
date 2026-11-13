@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "baselines_sha256": "0504a5bbf8e217b082f604917dc22203ddcaa7a4e9cfd9578a548fc36d0e0eee",
+  "files": {
+    "adapters/nono_install.rs": "8dc8f0e7a0d83603d5d8dd31b2a7010f5044ada9b4116ba3f23aa13b50b464b6",
+    "adapters/nono_portable.rs": "db9b1005cc33fe2a170ed8b9a239630f583aa933e1d52686b00813f5c7a724a5",
+    "adapters/nono_state.rs": "2579a80ed880c8369b7b9b2f06e89973df9b97a49a7f89a8d1aa6275fd54aee3",
+    "Cargo.lock": "0663c7354159b6cc4fa5bd6ccfcf7059055454995c8da5c54e56eadf288d9c85",
+    "patches/action.patch": "fe7fa897902e2fb108bd093c61b13ce2abf5730f3542f26a63616004baf6d283",
+    "patches/v1.2.7.patch": "64639875a000a6daf6e278382b3132cdb368bfb7c56e926190f867562d9a0e68"
+  },
+  "adaptation_sha256": "d0f631132d06759a31e4ca05075281abb5977d5998e5fc588568615c005a4f04"
+}

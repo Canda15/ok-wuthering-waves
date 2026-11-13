@@ -55,6 +55,10 @@ project environment with a local client script, as described by the library.
 Read the selected server's `list_skills()` and relevant `get_skill(skill_id)`
 results as well, and check that its project and library match the intended target.
 
+在 Windows 上运行 Python MCP 客户端和测试时，使用 `-X utf8` 或等效的
+UTF-8 流设置。任务名称和日志可能包含中文及表情；控制台编码错误不能
+直接认定为服务或任务失败。
+
 Reuse a live server for this project. Discover it through the configured artifact
 directory, normally `logs/mcp/connections/*.json`, with `connection.json` as a
 compatibility fallback. Prefer the library's `discover_mcp_servers()` helper when
@@ -71,6 +75,9 @@ terminal `get_run_status()` result before testing. A failed reload leaves old
 instances in place. New registrations and changed non-plugin helpers, including
 `src/char` modules and combat helpers, require restarting the owned runtime;
 reloading a task alone does not refresh those imported dependencies.
+将相关辅助函数、注册和素材修改一起完成，通过离线检查后再重启，确保
+验证的是同一套代码。不能为了省去重启而测试旧导入模块，或在测试脚本里
+另写一套角色循环。
 
 Exercise the registered implementation through a thin `run_task` harness with an
 absolute file path. Follow the library's `Task(BaseTask)` contract with
@@ -116,10 +123,23 @@ failure. Validate visible reward settlement and a second run that skips complete
 content. Respect a requested current-screen baseline rather than automatically
 returning to the open world.
 
-Use ok-script MCP for game development and real input/capture validation.
-Computer Use can optionally verify the OK-WW GUI task card; it is not needed by
-the game task. If the desktop plugin is unavailable, state that the GUI Start
-check remains untested while preserving the independently verified MCP results.
+游戏开发及真实输入、截图验证使用 ok-script MCP，并遵守所选框架的接口
+限制，包括该流程对 Computer Use 的禁止要求。若范围包含 GUI 生命周期，
+仅通过允许的 API 操作任务卡，并说明尚未完成的 GUI 验证。
+
+## 鸣潮深塔验证
+
+已获授权的重置应复用注册战斗任务的 `restart_combat_in_abyss()`。
+角色介绍和环境帮助可能不出现：先识别再关闭，未出现时直接继续。
+新增浮层恢复逻辑应放入公共生产辅助函数，同时覆盖出现和不出现的情况，
+不能只在临时测试脚本中修复。避免盲按 Esc 或关闭按钮，以免打开其它菜单。
+
+重置后验证实际队伍 HUD 和加载的角色身份。辅助函数开始后会暂时强制
+战斗识别，因此该标志本身不能证明场地或目标角色已经就绪。
+
+根据实际场地选择完成断言。有些模拟场地以出现退出目标结束，并不弹出
+独立成功窗口。必须确认对应的可见结束状态；丢失目标或战斗任务返回真值
+不能单独证明完成。场地完成验证与单角色循环、满协奏交接验证分别记录。
 
 ## Apply project conventions
 

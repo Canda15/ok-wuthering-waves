@@ -10,17 +10,22 @@
 """
 
 import inspect
+import ast
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
-from contextlib import ExitStack, redirect_stdout
+import xml.etree.ElementTree as ET
+from concurrent.futures import CancelledError
+from contextlib import ExitStack, chdir, redirect_stdout
 from importlib import util as importlib_util
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -46,6 +51,12 @@ class TestSelfhostSmoke(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.user_root = Path(self.temp_dir.name) / 'user'
+        # 路径消费者导入前隔离便携环境，不能加载继承环境里的用户脚本或诊断内容。
+        self.user_data_patch = patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(self.user_root),
+                                                      'OK_DISABLE_FILE_LOG': '1'})
+        self.user_data_patch.start()
         from ok import og
         from ok.util.config import Config
         # 两个页面在构造时会读 og.app 的翻译和配置目录,这里给最小替身,
@@ -55,14 +66,14 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.app_patch.start()
         self.config_class = Config
         self.old_config_folder = Config.config_folder
-        self.temp_dir = tempfile.TemporaryDirectory()
-        Config.config_folder = self.temp_dir.name
+        Config.config_folder = str(self.user_root / 'configs')
 
     def tearDown(self):
         self.config_class.config_folder = self.old_config_folder
         self.temp_dir.cleanup()
         self.app.processEvents()
         self.app_patch.stop()
+        self.user_data_patch.stop()
 
     def test_apply_registers_both_tabs_and_is_idempotent(self):
         from selfhost.overrides import CUSTOM_TABS, apply
@@ -90,8 +101,8 @@ class TestSelfhostSmoke(unittest.TestCase):
         }
         apply(config)
         self.assertEqual(config['gui_title'], APP_NAME)
-        self.assertEqual(config['log_file'], f'logs/{APP_NAME}.log')
-        self.assertEqual(config['error_log_file'], f'logs/{APP_NAME}_error.log')
+        self.assertEqual(Path(config['log_file']), self.user_root / 'logs' / f'{APP_NAME}.log')
+        self.assertEqual(Path(config['error_log_file']), self.user_root / 'logs' / f'{APP_NAME}_error.log')
         self.assertEqual(config['links'], {})
         self.assertNotIn('update_pyappify', config)
 
@@ -219,6 +230,425 @@ class TestSelfhostSmoke(unittest.TestCase):
             finally:
                 tab.close()
                 tab.deleteLater()
+
+    def test_config_preserves_unknown_fields_and_explicit_values_without_rewriting(self):
+        from ok.util import config as config_module
+        path = Path(self.config_class.config_folder) / '扩展配置.json'
+        path.parent.mkdir(parents=True)
+        original = b'{ "enabled": false, "hotkey": "F10", "unknown": {"false": false, "zero": 0, "null": null} }'
+        path.write_bytes(original)
+        with patch.object(config_module, 'write_json_file', wraps=config_module.write_json_file) as writer:
+            loaded = self.config_class('扩展配置', {'enabled': True, 'hotkey': 'F9'})
+            writer.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+            self.assertIs(loaded['enabled'], False)
+            self.assertEqual(loaded['hotkey'], 'F10')
+            loaded['enabled'] = True
+            loaded['nullable_extension'] = None
+        saved = json.loads(path.read_bytes())
+        self.assertEqual(saved['unknown'], {'false': False, 'zero': 0, 'null': None})
+        self.assertIn('nullable_extension', saved)
+        self.assertIsNone(saved['nullable_extension'])
+
+    def test_config_only_fills_missing_defaults_once(self):
+        from ok.util import config as config_module
+        path = Path(self.config_class.config_folder) / '缺省配置.json'
+        path.parent.mkdir(parents=True)
+        path.write_text('{"enabled": false, "extension": {"active": true}}', encoding='utf-8')
+        with patch.object(config_module, 'write_json_file', wraps=config_module.write_json_file) as writer:
+            loaded = self.config_class('缺省配置', {'enabled': True, 'new_option': False})
+            writer.assert_called_once()
+        self.assertIs(loaded['enabled'], False)
+        self.assertIs(loaded['new_option'], False)
+        self.assertEqual(json.loads(path.read_bytes())['extension'], {'active': True})
+
+    def test_corrupt_or_non_object_config_fails_without_overwriting_original(self):
+        path = Path(self.config_class.config_folder) / '损坏配置.json'
+        path.parent.mkdir(parents=True)
+        for original in (b'{"private":', b'\xff', b'[]', b'null', b'false', b'1',
+                         b'{"private": NaN}', b'{"private": Infinity}', b'{"private": -Infinity}'):
+            with self.subTest(original_kind=original[:1]):
+                path.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    self.config_class('损坏配置', {'enabled': False})
+                if original.startswith(b'{"private": ') and original.endswith(b'}'):
+                    from ok.util.file import read_json_file
+                    with self.assertRaisesRegex(ValueError, 'CONFIG_JSON_INVALID'):
+                        read_json_file(path, strict=True)
+                    self.assertIsInstance(read_json_file(path), dict)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_nonfinite_nested_config_writes_keep_valid_original_and_no_temporary_files(self):
+        from ok.util.file import write_json_file
+        path = Path(self.config_class.config_folder) / '非有限配置.json'
+        path.parent.mkdir(parents=True)
+        original = b'{"enabled": false, "extension": {"zero": 0}}'
+        for value in (float('nan'), float('inf'), -float('inf')):
+            path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, 'CONFIG_JSON_INVALID'):
+                write_json_file(path, {'extension': {'nested': [value]}})
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_real_ui_config_preserves_unknown_false_and_rejects_corrupt_original(self):
+        from ok.ui.qt.common.config import UiConfig
+        from selfhost.portable import process_environment, hidden_process_options
+        path = self.user_root / 'configs' / '界面配置.json'
+        path.parent.mkdir(parents=True)
+        original = b'{ "mica": false, "theme": "dark", "extension": {"flag": false, "count": 0, "null": null} }'
+        path.write_bytes(original)
+        config = UiConfig(str(path))
+        self.assertEqual(config.backdrop, 'none')
+        self.assertEqual(path.read_bytes(), original)
+        config.set_theme_mode('light')
+        stored = json.loads(path.read_bytes())
+        self.assertEqual(stored['extension'], {'flag': False, 'count': 0, 'null': None})
+        self.assertIs(stored['mica'], False)
+        for malformed in (b'{partial', b'[]', b'{"theme":NaN}', b'{"theme":Infinity}', b'{"theme":-Infinity}'):
+            path.write_bytes(malformed)
+            with self.assertRaises(ValueError):
+                UiConfig(str(path))
+            self.assertEqual(path.read_bytes(), malformed)
+        # 在独立进程真实导入全局 cfg，避免已导入模块缓存影响环境切换断言。
+        environment = {**process_environment(), 'NONO_USER_DATA_ROOT': str(self.user_root)}
+        code = ('from pathlib import Path; from ok.ui.qt.common.config import cfg; '
+                'import os; assert Path(cfg.path).resolve() == '
+                '(Path(os.environ["NONO_USER_DATA_ROOT"])/"configs"/"ui_config.json").resolve()')
+        result = subprocess.run([sys.executable, '-B', '-c', code],
+                                cwd=Path(__file__).resolve().parents[1], env=environment,
+                                capture_output=True, text=True, timeout=60, **hidden_process_options())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_atomic_config_writes_keep_original_on_serialization_flush_or_replace_failure(self):
+        from ok.util import file as file_module
+        path = Path(self.config_class.config_folder) / '原子配置.json'
+        path.parent.mkdir(parents=True)
+        original = b'{"enabled": false, "extension": {"zero": 0}}'
+        for failure in ('serialize', 'fsync', 'replace'):
+            with self.subTest(failure=failure):
+                path.write_bytes(original)
+                loaded = self.config_class('原子配置', {'enabled': False})
+                with ExitStack() as stack:
+                    if failure == 'serialize':
+                        value = object()
+                        exception = TypeError
+                    else:
+                        value = True
+                        exception = OSError
+                        stack.enter_context(patch.object(file_module.os, failure, side_effect=OSError('合成写入失败')))
+                    with self.assertRaises(exception):
+                        loaded['enabled'] = value
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_config_logs_do_not_expose_values_keys_or_write_error_details(self):
+        from ok.util import config as config_module
+        marker = '合成私密字段'
+        with patch.object(config_module, 'logger') as logger:
+            loaded = self.config_class('日志配置', {'value': marker})
+            with self.assertRaises(KeyError):
+                loaded[marker]
+            with patch.object(config_module, 'write_json_file', side_effect=OSError(marker)):
+                with self.assertRaises(OSError):
+                    loaded['value'] = '变更值'
+            self.assertNotIn(marker, str(logger.mock_calls))
+            self.assertNotIn('变更值', str(logger.mock_calls))
+
+    def test_shortcut_defaults_and_explicit_user_choices_survive_loading(self):
+        from ok.util import GlobalConfig as global_config_module
+        from ok.util import shortcut
+        menu = global_config_module.CREATE_START_MENU_SHORTCUT
+        desktop = global_config_module.CREATE_DESKTOP_SHORTCUT
+        path = Path(self.config_class.config_folder) / 'Basic Options.json'
+        path.parent.mkdir(parents=True)
+        choices = ({}, {menu: True, desktop: False}, {menu: False, desktop: True})
+        for choice in choices:
+            with self.subTest(choice=choice), patch.object(global_config_module, 'shortcut_supported', return_value=True):
+                path.write_text(json.dumps({**choice, 'extension': {'enabled': False}}), encoding='utf-8')
+                global_config = global_config_module.GlobalConfig([])
+                basic = global_config_module.register_basic_options(global_config)
+                self.assertIs(basic[menu], choice.get(menu, False))
+                self.assertIs(basic[desktop], choice.get(desktop, False))
+                self.assertEqual(basic['extension'], {'enabled': False})
+                with patch.object(shortcut.threading, 'Thread') as worker:
+                    shortcut.create_app_shortcut(basic)
+                    if any(choice.values()):
+                        self.assertEqual(worker.call_args.kwargs['args'], (basic[menu], basic[desktop]))
+                        worker.return_value.start.assert_called_once()
+                    else:
+                        worker.assert_not_called()
+
+    def test_user_paths_reach_tasks_plugins_templates_features_and_screenshots(self):
+        from ok import og
+        from ok.core import screenshot as screenshot_module
+        from ok.core.mcp_runner import McpTaskRunner
+        from ok.core.script_packager import get_ok_import_folder, get_ok_tasks_folder
+        from ok.core.task_manager import TaskManager
+        from ok.core.template_store import CocoTemplateStore
+        from ok.feature.FeatureSet import FeatureSet
+        from ok.ui.qt.tasks.TemplateTab import get_coco_path
+        from ok.util.clazz import generate_label_enum
+        from selfhost.overrides import apply
+        config = {}
+        apply(config)
+        self.assertEqual(Path(config['config_folder']), self.user_root / 'configs')
+        self.assertEqual(Path(get_ok_tasks_folder()), self.user_root / 'ok_tasks')
+        self.assertEqual(Path(get_ok_import_folder()), self.user_root / 'ok_import')
+        with patch.object(og, 'config', {'custom_tasks': True}), \
+                patch.object(TaskManager, 'load_user_tasks'), patch.object(TaskManager, 'load_imported_tasks'):
+            manager = TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+        self.assertEqual(Path(manager.task_folder), self.user_root / 'ok_tasks')
+        plugin = self.user_root / 'ok_import' / 'synthetic_plugin'
+        plugin.mkdir(parents=True)
+        sources = list(FeatureSet._feature_sources(SimpleNamespace(coco_json='assets/coco.json',
+                                                                 template_folder='assets/templates')))
+        self.assertEqual(sources[0], ('assets/coco.json', 'assets/templates', None))
+        self.assertEqual(Path(sources[1][0]), self.user_root / 'ok_tasks/assets/coco_annotations.json')
+        self.assertEqual(Path(sources[2][1]), plugin / 'assets/templates')
+        self.assertEqual(CocoTemplateStore().folder, self.user_root / 'ok_templates')
+        self.assertEqual(Path(get_coco_path()), self.user_root / 'ok_templates/coco_annotations.json')
+        generate_label_enum('ok_tasks.SyntheticLabels', ['synthetic_feature'])
+        self.assertTrue((self.user_root / 'ok_tasks/SyntheticLabels.py').is_file())
+        external = Path(self.temp_dir.name) / 'external'
+        self.assertEqual(CocoTemplateStore(external).folder, external)
+        signals = SimpleNamespace(draw_box=Mock(), clear_box=Mock(), screenshot=Mock())
+        for configured in (None, str(external)):
+            with patch.object(og, 'ok', SimpleNamespace(config={'screenshots_folder': configured})), \
+                    patch.object(screenshot_module, 'communicate', signals), \
+                    patch.object(screenshot_module.threading, 'Thread'), \
+                    patch.object(screenshot_module, 'find_first_existing_file', return_value=''), \
+                    patch.object(screenshot_module.ImageFont, 'load_default'):
+                screenshot = screenshot_module.Screenshot(Mock(), False)
+            self.assertEqual(Path(screenshot.screenshot_folder), external if configured else self.user_root / 'screenshots')
+        executor = Mock()
+        runner = McpTaskRunner(executor, SimpleNamespace(), SimpleNamespace())
+        self.assertEqual(runner.artifact_directory, self.user_root / 'logs/mcp')
+        executor.enable_frame_snapshots.assert_called_once()
+
+    def test_user_path_resolver_keeps_source_mode_and_explicit_external_paths(self):
+        from ok.core.script_packager import get_ok_tasks_folder
+        from ok.util.file import get_user_data_path
+        from selfhost.overrides import apply
+        external = Path(self.temp_dir.name) / 'external'
+        self.assertEqual(Path(get_user_data_path(external)), external)
+        with chdir(self.temp_dir.name):
+            self.assertEqual(Path(get_user_data_path('..', 'outside')), Path(self.temp_dir.name).parent / 'outside')
+            with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': ''}):
+                self.assertEqual(Path(get_ok_tasks_folder()), Path(self.temp_dir.name) / 'ok_tasks')
+                config = {'config_folder': str(external)}
+                apply(config)
+                self.assertEqual(config['config_folder'], str(external))
+                self.assertEqual(config['log_file'], 'logs/NoNo.log')
+        with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': 'relative-root'}):
+            with self.assertRaises(ValueError):
+                get_user_data_path('configs')
+
+    def test_diagnostics_export_uses_stable_folders_and_relative_archive_names(self):
+        from ok import og
+        from ok.ui.qt.shell import diagnostics
+        downloads = Path(self.temp_dir.name) / 'downloads'
+        for folder in ('logs', 'screenshots'):
+            directory = self.user_root / folder
+            directory.mkdir(parents=True)
+            (directory / 'synthetic.txt').write_text('合成诊断', encoding='utf-8')
+        with patch.object(og, 'config', {'gui_title': 'NoNo'}), \
+                patch('ok.util.file.get_downloads_folder', return_value=str(downloads)), \
+                patch.object(diagnostics, 'reveal_in_explorer') as reveal:
+            diagnostics.export_logs()
+        reveal.assert_called_once_with(downloads / 'NoNo-log.zip')
+        with zipfile.ZipFile(downloads / 'NoNo-log.zip') as archive:
+            self.assertEqual(set(archive.namelist()), {'logs/synthetic.txt', 'screenshots/synthetic.txt'})
+
+    def test_pyappify_inline_requires_actual_version_and_rejects_stale_directory(self):
+        from ok.update import inline_ok_requirements as inliner
+        destination = Path(self.temp_dir.name) / 'inline'
+        destination.mkdir()
+        with redirect_stdout(StringIO()):
+            inliner.inline_site_packages(destination, ('pyappify',))
+        self.assertEqual(inliner.verify_inlined_pyappify(destination), '1.0.20')
+        for name in inliner.PYAPPIFY_UPDATE_MODULES:
+            self.assertTrue((destination / 'pyappify' / name).is_file())
+        stale = destination / 'pyappify/updater_ui.py'
+        stale.write_bytes('# 合成旧模块\n'.encode('utf-8'))
+        with patch.object(inliner, 'find_and_copy_site_package') as copier:
+            with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_INLINE_MISMATCH'):
+                inliner.inline_site_packages(destination, ('pyappify',))
+            copier.assert_not_called()
+        self.assertEqual(stale.read_bytes(), '# 合成旧模块\n'.encode('utf-8'))
+        with patch.object(inliner, 'distribution', return_value=SimpleNamespace(version='1.0.19')), \
+                patch.object(inliner, 'find_and_copy_site_package') as copier:
+            with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_VERSION_MISMATCH'):
+                inliner.inline_site_packages(destination, ('pyappify',))
+            copier.assert_not_called()
+
+    def test_b7_resources_keep_foreground_messages_and_removed_update_source_keys(self):
+        from PySide6 import QtCore
+        repo = Path(__file__).resolve().parents[1]
+        qt_folder = repo / 'ok/ui/qt'
+        current = {
+            ('SelectInteractionListView', '前台系统键鼠'),
+            ('SelectInteractionListView', '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续'),
+            ('app', '需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
+            ('app', '需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
+        }
+        removed = {('SelectInteractionListView', name) for name in
+                   ('Genshin', 'PostMessage', 'PyDirect', 'Pynput', 'WindowsInteraction')}
+        removed.update({('app', 'Requires the local QQ client window to be open and running'),
+                        ('app', 'Requires the local WeChat client window to be open and running')})
+        removed.update({('UpdateCard', name) for name in
+                        ('Aliyun', 'Failed to change pip source: {error}', 'Huawei Cloud', 'Pip source', 'PyPI',
+                         'System default', 'Tencent Cloud', 'Tsinghua', 'USTC')})
+        locales = ('en_US', 'es_ES', 'ja_JP', 'ko_KR', 'zh_CN', 'zh_TW')
+        captions = {}
+        caption_keys = (('SelectInteractionListView', 'Default Interaction'), ('UpdateCard', 'Switch'))
+
+        def check_translator(translator, caption):
+            # 通用选择标题和版本切换按钮仍保留；撤出的只是旧后端和下载源选项。
+            for key, expected in caption.items():
+                self.assertEqual(translator.translate(*key), expected)
+            for context, source in current:
+                self.assertEqual(translator.translate(context, source), source)
+            for context, source in removed:
+                self.assertEqual(translator.translate(context, source), '')
+
+        for locale in locales:
+            with self.subTest(locale=locale):
+                messages = {(context.findtext('name'), message.findtext('source')): message
+                            for context in ET.parse(qt_folder / f'i18n/{locale}.ts').getroot().findall('context')
+                            for message in context.findall('message')
+                            if message.find('translation') is not None
+                            and message.find('translation').get('type') not in ('vanished', 'obsolete')}
+                self.assertTrue(current <= messages.keys())
+                self.assertFalse(removed & messages.keys())
+                captions[locale] = {key: ''.join(messages[key].find('translation').itertext()) for key in caption_keys}
+                translator = QtCore.QTranslator()
+                self.assertTrue(translator.load(str(qt_folder / f'i18n/{locale}.qm')))
+                check_translator(translator, captions[locale])
+        tree = ast.parse((qt_folder / 'resources.py').read_bytes())
+        names = {'qt_resource_struct', 'qt_resource_name', 'qt_resource_data'}
+        data = {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
+                if isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id in names}
+        self.assertEqual(data.keys(), names)
+        arguments = (3, data['qt_resource_struct'], data['qt_resource_name'], data['qt_resource_data'])
+        self.assertTrue(QtCore.qRegisterResourceData(*arguments))
+        try:
+            self.assertFalse(QtCore.QFile.exists(':/i18n/en_US.qm'))
+            for locale in locales[1:]:
+                with self.subTest(embedded_locale=locale):
+                    resource_name = f':/i18n/{locale}.qm'
+                    resource = QtCore.QFile(resource_name)
+                    self.assertTrue(resource.open(QtCore.QIODevice.OpenModeFlag.ReadOnly))
+                    content = bytes(resource.readAll())
+                    resource.close()
+                    self.assertEqual(content, (qt_folder / f'i18n/{locale}.qm').read_bytes())
+                    translator = QtCore.QTranslator()
+                    self.assertTrue(translator.load(resource_name))
+                    check_translator(translator, captions[locale])
+        finally:
+            self.assertTrue(QtCore.qUnregisterResourceData(*arguments))
+        manifest = json.loads((repo / 'selfhost/logic_patches.json').read_bytes())
+        self.assertEqual(manifest['framework_version'], '3.0.5b7')
+        paths = {entry['path'] for entry in manifest['entries']}
+        self.assertNotIn('ui/qt/MainWindow.py', paths)
+        self.assertNotIn('ui/qt/about/UpdateCard.py', paths)
+
+    def test_update_card_passes_language_and_supports_legacy_notes(self):
+        from ok.ui.qt.about import UpdateCard as update_module
+        from pyappify.versions import entry_notes
+        entries = [{'version': 'v3.8.0', 'update_note': ['旧协议说明']}]
+        exit_event = threading.Event()
+        for modern in (True, False):
+            calls = []
+
+            def calculate_modern(versions, current, target, language=None):
+                calls.append(('notes', language))
+                return ['合成更新说明']
+
+            def calculate_legacy(versions, current, target):
+                calls.append(('notes', None))
+                return ['合成更新说明']
+
+            def update_modern(version, exit_event=None, language=None):
+                calls.append(('update', version, exit_event, language))
+                return {'mocked': True}
+
+            def update_legacy(version, exit_event=None):
+                calls.append(('update', version, exit_event, None))
+                return {'mocked': True}
+
+            api = SimpleNamespace(get_version_list=lambda release_only, exit_event: entries,
+                                  calculate_update_notes=calculate_modern if modern else calculate_legacy,
+                                  update_to_version=update_modern if modern else update_legacy,
+                                  is_greater_version=lambda left, right: left > right)
+            card = update_module.UpdateCard('v3.7.20', api, exit_event=exit_event)
+            try:
+                with patch.object(update_module, '_ui_locale', return_value='zh_CN'), \
+                        patch.object(card, '_run_in_background',
+                                     side_effect=lambda operation, signal, name: signal.emit((True, operation()))):
+                    card.check_for_updates()
+                    card.update_to_version('v3.8.0')
+                    self.assertIn(('notes', 'zh_CN' if modern else None), calls)
+                    self.assertIn(('update', 'v3.8.0', exit_event, 'zh_CN' if modern else None), calls)
+                    self.assertFalse(card._busy)
+                    self.assertEqual(card._entry_notes(entries[0]), ['旧协议说明'])
+                    api.entry_notes = entry_notes
+                    localized = {**entries[0], 'localized_notes': {'zh-CN': ['中文说明']}}
+                    self.assertEqual(card._entry_notes(localized), ['中文说明'])
+            finally:
+                card.close()
+                card.deleteLater()
+
+    def test_update_card_cancelled_background_check_clears_busy_without_quitting(self):
+        from ok.ui.qt.about import UpdateCard as update_module
+        exit_event = threading.Event()
+
+        def cancelled(release_only, exit_event):
+            self.assertTrue(exit_event.is_set())
+            raise CancelledError('合成取消')
+
+        card = update_module.UpdateCard('v3.8.0', SimpleNamespace(get_version_list=cancelled), exit_event=exit_event)
+        try:
+            with patch.object(update_module.threading, 'Thread') as worker, \
+                    patch.object(update_module, 'communicate', SimpleNamespace(quit=Mock())) as signals:
+                card.check_for_updates()
+                card.check_for_updates()
+                worker.assert_called_once()
+                self.assertTrue(card._busy)
+                exit_event.set()
+                worker.call_args.kwargs['target']()
+                self.assertFalse(card._busy)
+                self.assertTrue(card.check_button.isEnabled())
+                self.assertIn('合成取消', card.status_label.text())
+                signals.quit.emit.assert_not_called()
+        finally:
+            card.close()
+            card.deleteLater()
+
+    def test_main_window_startup_update_check_only_runs_while_idle(self):
+        from ok import og
+        from ok.ui.qt.MainWindow import MainWindow
+        executor = SimpleNamespace(paused=True)
+        controller = SimpleNamespace(starting=False)
+        about = SimpleNamespace(update_card=object(), check_for_updates=Mock())
+        window = SimpleNamespace(basic_global_config={}, executor=executor, about_tab=about)
+        window._game_starting_or_started = lambda: MainWindow._game_starting_or_started(window)
+        cases = ((False, False, False, True), (True, False, False, True),
+                 (False, True, False, True), (False, False, True, True), (False, False, False, False))
+        for auto_start, requested, starting, paused in cases:
+            with self.subTest(auto_start=auto_start, requested=requested, starting=starting, paused=paused), \
+                    patch.object(og, 'app', SimpleNamespace(start_controller=controller)), \
+                    patch.object(og, 'ok', SimpleNamespace(args={'task': requested})):
+                window.basic_global_config['Auto Start Game When App Starts'] = auto_start
+                controller.starting = starting
+                executor.paused = paused
+                about.check_for_updates.reset_mock()
+                MainWindow._startup_update_check(window)
+                if not auto_start and not requested and not starting and paused:
+                    about.check_for_updates.assert_called_once_with(automatic=True)
+                else:
+                    about.check_for_updates.assert_not_called()
 
 
 class TestLogicPatchReplay(unittest.TestCase):
@@ -508,14 +938,13 @@ class TestPortableBundle(unittest.TestCase):
         self.files = {
             'main.py': 'TOKEN = "原始提交"\n'.encode(),
             'config.py': b'version = "dev"\n',
-            'requirements.txt': b'pyappify[standalone]==1.0.19\nexample==1.0.0\n',
+            'requirements.txt': b'pyappify[standalone]==1.0.20\nexample==1.0.0\n',
             'pyappify.yml': self.configuration.encode(),
             'src/task.py': '业务值 = "当前源码"\n'.encode(),
             'ok/__init__.py': b'FRAMEWORK = "current"\n',
             'ok/core/foreground_fixture.py': b'FRAMEWORK_STATE = "current"\n',
             'selfhost/__init__.py': b'\n',
             'selfhost/ok_pin.json': b'{"package": "ok-script", "version": "test"}\n',
-            'pyappify/__init__.py': b'\n',
             'assets/current.bin': b'current asset',
             '.update_repo_gitignore': b'__pycache__/\n*.pyc\nlogs/\n',
             'deploy.txt': b'src\nok\nselfhost\npyappify\nmain.py\nconfig.py\nrequirements.txt\npyappify.yml\nassets\n',
@@ -552,35 +981,9 @@ class TestPortableBundle(unittest.TestCase):
         return snapshot, digests
 
     def prepare_bundle(self):
-        snapshot, digests = self.prepare_snapshot()
-        bundle = self.root / 'NoNo'
-        app = bundle / 'data' / 'apps' / 'NoNo'
-        repo, working, runtime = app / 'repo', app / 'working', app / 'python'
-        repo.mkdir(parents=True)
-        (repo / 'main.py').write_bytes(b'old mirror source')
-        (repo / 'removed.py').write_bytes(b'obsolete source')
-        self.initialize_repository(repo)
-        self.portable.git(repo, 'remote', 'add', 'origin', 'https://github.com/Canda15/nono-update.git')
-        working.mkdir()
-        runtime.mkdir()
-        self.portable.replace_deployment(snapshot, repo, self.build_root, preserve_git=True)
-        self.portable.replace_deployment(snapshot, working, self.build_root, preserve_git=False)
-        (bundle / 'NoNo.exe').write_bytes(b'MZ-launcher')
-        (bundle / 'pyappify.yml').write_bytes(self.files['pyappify.yml'])
-        (runtime / 'python.exe').write_bytes(b'MZ-python')
-        (runtime / 'python3.dll').write_bytes(b'portable python library')
-        (app / 'app.json').write_text(json.dumps({
-            'name': 'NoNo', 'installed': True, 'current_profile': 'China',
-            'current_version': self.version,
-            'profiles': [{'name': 'China', 'git_url': 'https://github.com/Canda15/nono-update.git'}],
-        }), encoding='utf-8')
-        manifest = {
-            'source_sha': self.portable.git(self.source, 'rev-parse', 'HEAD'),
-            'base_update_version': self.version,
-            'app_metadata_file': 'data/apps/NoNo/app.json',
-            'deployment_files': digests,
-        }
-        return bundle, manifest
+        installation, info = self.prepare_installation()
+        return self.portable.package_incoming(installation, self.root / 'package/NoNo', info,
+                                              self.launcher_proof, self.build_root)
 
     def test_snapshot_uses_current_checkout_and_explicit_host_without_private_or_developer_files(self):
         (self.source / 'main.py').write_text('TOKEN = "本次构建"\n', encoding='utf-8')
@@ -599,27 +1002,20 @@ class TestPortableBundle(unittest.TestCase):
         ))
 
     def test_overlay_replaces_both_trees_deletes_stale_files_and_preserves_official_git_anchor(self):
-        snapshot, digests = self.prepare_snapshot()
-        repo = self.root / 'bundle' / 'data' / 'apps' / 'NoNo' / 'repo'
-        working = repo.parent / 'working'
-        repo.mkdir(parents=True)
-        (repo / 'main.py').write_bytes(b'old mirror source')
-        (repo / 'removed.py').write_bytes(b'obsolete source')
-        self.initialize_repository(repo)
-        self.portable.git(repo, 'remote', 'add', 'origin', 'https://github.com/Canda15/nono-update.git')
-        anchor = self.portable.git(repo, 'rev-parse', 'HEAD')
-        config_before = (repo / '.git' / 'config').read_bytes()
-        working.mkdir()
-        (working / 'removed.py').write_bytes(b'obsolete working source')
-        self.portable.replace_deployment(snapshot, repo, self.build_root, preserve_git=True)
-        self.portable.replace_deployment(snapshot, working, self.build_root, preserve_git=False)
-        self.assertEqual(self.portable.git(repo, 'rev-parse', 'HEAD'), anchor)
-        self.assertEqual(self.portable.git(repo, 'rev-parse', self.version), anchor)
-        self.assertEqual((repo / '.git' / 'config').read_bytes(), config_before)
-        for root in (repo, working):
-            self.assertEqual(self.portable.deployment_digests(root), digests)
-            self.assertFalse((root / 'removed.py').exists())
-            self.assertEqual((root / 'main.py').read_bytes(), self.files['main.py'])
+        installation, info = self.prepare_installation()
+        app = installation / 'data/apps/NoNo'
+        working, repo = app / 'working', app / 'repo'
+        snapshot = self.root / 'snapshot'
+        (working / 'removed.py').write_bytes(b'obsolete source')
+        before = self.portable.deployment_digests(repo)
+        self.portable.replace_deployment(snapshot, working, self.build_root)
+        self.assertEqual(self.portable.deployment_digests(working), info['deployment_files'])
+        self.assertFalse((working / 'removed.py').exists())
+        self.assertEqual(self.portable.deployment_digests(repo), before)
+        self.assertEqual(self.portable.git(repo, 'rev-parse', 'HEAD'), info['base_update_commit'])
+        with self.assertRaisesRegex(RuntimeError, '裸仓库'):
+            self.portable.replace_deployment(snapshot, repo, self.build_root, preserve_git=True)
+        self.assertEqual(self.portable.deployment_digests(repo), before)
 
     def test_missing_compiled_host_and_escaping_deploy_entry_are_rejected_before_copy(self):
         native = self.source / 'selfhost' / 'NoNo.exe'
@@ -700,7 +1096,9 @@ class TestPortableBundle(unittest.TestCase):
         }
         with patch.dict(os.environ, inherited):
             parent = dict(os.environ)
-            environment = self.portable.process_environment()
+            process_temp = self.root / 'process-temp'
+            process_temp.mkdir()
+            environment = self.portable.process_environment(process_temp)
             self.assertTrue(dict(os.environ) == parent, '环境隔离不能修改调用者进程')
             self.assertEqual({key for key in environment if key.upper().startswith('PIP_')},
                              {'PIP_CONFIG_FILE'})
@@ -709,129 +1107,110 @@ class TestPortableBundle(unittest.TestCase):
                 self.assertNotIn(key, environment)
             for key in ('PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'):
                 self.assertEqual(environment.get(key), parent.get(key))
+            for key in ('TEMP', 'TMP', 'RUNNER_TEMP'):
+                self.assertEqual(environment[key], str(process_temp))
             # 真实子进程只读取环境，不执行 pip，也不会向伪造的安装目录写入文件。
             code = (
                 'import json, os, sys; print(json.dumps({"environment": '
                 '{key: value for key, value in os.environ.items() if key.upper().startswith("PIP_") '
-                'or key.upper() in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}, "prefix": sys.prefix}))'
+                'or key.upper() in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}, "prefix": sys.prefix, '
+                '"temporary": {key: os.environ[key] for key in ("TEMP", "TMP", "RUNNER_TEMP")}}))'
             )
-            child = json.loads(self.portable.run([sys.executable, '-c', code], self.root))
+            child = json.loads(self.portable.run([sys.executable, '-c', code], self.root,
+                                                temporary_root=process_temp))
             self.assertEqual(Path(child['prefix']).resolve(), Path(sys.prefix).resolve())
             self.assertEqual({key for key in child['environment'] if key.upper().startswith('PIP_')},
                              {'PIP_CONFIG_FILE'})
             for key in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
                 self.assertNotIn(key, child['environment'])
+            self.assertEqual(set(child['temporary'].values()), {str(process_temp)})
             self.assertFalse((self.root / 'external').exists())
             self.assertTrue(dict(os.environ) == parent, '环境隔离不能修改调用者进程')
 
     def test_actual_archive_contains_runtime_current_sources_pin_and_update_metadata(self):
         bundle, manifest = self.prepare_bundle()
         archive = self.portable.archive_bundle(bundle, self.root / 'artifacts', manifest, self.build_root)
+        payload = f"NoNo/data/incoming/NoNo/{manifest['bundle_id']}/"
         with zipfile.ZipFile(archive) as package:
-            for folder in ('repo', 'working'):
-                prefix = f'NoNo/data/apps/NoNo/{folder}/'
-                self.assertEqual(package.read(prefix + 'main.py'), self.files['main.py'])
-                self.assertEqual(package.read(prefix + 'selfhost/NoNo.exe'), b'MZ-current-native-host')
-                self.assertEqual(package.read(prefix + '.gitignore'), self.files['.update_repo_gitignore'])
-                self.assertEqual(package.read(prefix + 'selfhost/ok_pin.json'), self.files['selfhost/ok_pin.json'])
-            self.assertEqual(package.read('NoNo/data/apps/NoNo/python/python.exe'), b'MZ-python')
-            self.assertEqual(package.read('NoNo/data/apps/NoNo/python/python3.dll'), b'portable python library')
-            self.assertEqual(json.loads(package.read('NoNo/build-info.json')), manifest)
-            self.assertEqual(json.loads(package.read('NoNo/data/apps/NoNo/app.json'))['current_version'], self.version)
-            self.assertFalse(any('removed.py' in name or 'private' in name for name in package.namelist()))
-            self.assertIn('NoNo/data/apps/NoNo/repo/.git/HEAD', package.namelist())
+            self.assertEqual(package.read(payload + 'working/main.py'), self.files['main.py'])
+            self.assertEqual(package.read(payload + 'working/selfhost/NoNo.exe'), b'MZ-current-native-host')
+            self.assertEqual(package.read(payload + 'working/selfhost/ok_pin.json'), self.files['selfhost/ok_pin.json'])
+            self.assertEqual(package.read(payload + 'python/python.exe'), b'MZ-python')
+            self.assertEqual(package.read(payload + 'python/python3.dll'), b'portable python library')
+            self.assertEqual(json.loads(package.read(payload + 'app-seed.json'))['current_version'], self.version)
+            self.assertEqual(json.loads(package.read(payload + 'manifest.json')), manifest)
+            self.assertIn(payload + 'repo/HEAD', package.namelist())
+            self.assertFalse(any('/data/apps/' in name or '/data/config/' in name or
+                                 '/data/user/' in name or '/data/backups/' in name for name in package.namelist()))
+            self.assertNotIn('NoNo/pyappify.yml', package.namelist())
         expected_checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-        self.assertEqual((archive.parent / 'NoNo-win32-sha256.txt').read_text(encoding='ascii'),
-                         f'{expected_checksum}  NoNo-win32-portable.zip\n')
+        self.assertEqual((archive.parent / 'NoNo-win32-sha256.txt').read_text().strip(),
+                         f'{expected_checksum}  NoNo-win32-portable.zip')
 
     def test_build_uses_setup_to_refresh_current_snapshot_and_keeps_release_on_one_tag_setup(self):
-        template, _manifest = self.prepare_bundle()
-        template_repo = template / 'data' / 'apps' / 'NoNo' / 'repo'
-        self.portable.git(template_repo, 'add', '.')
-        self.portable.git(template_repo, '-c', 'user.name=便携交付测试', '-c',
-                          'user.email=portable-test@example.invalid', 'commit', '-m', '准备正式部署底座')
-        self.portable.git(template_repo, 'tag', '-f', self.version)
-        anchor = self.portable.git(template_repo, 'rev-parse', 'HEAD')
-        (self.source / 'main.py').write_text('TOKEN = "本次 CI 源码"\n', encoding='utf-8')
-        (self.source / 'requirements.txt').write_bytes(b'pyappify[standalone]==1.0.19\nexample==2.0.0\n')
-        self.portable.git(self.source, 'add', '--', 'main.py', 'requirements.txt')
-        self.portable.git(self.source, '-c', 'user.name=便携交付测试', '-c',
-                          'user.email=portable-test@example.invalid', 'commit', '-m', '准备本次源码变更')
+        template, base_info = self.prepare_installation()
         original_run = self.portable.run
-        for release_tag in (None, self.version):
+        source_sha = self.portable.git(self.source, 'rev-parse', 'HEAD')
+        (self.source / 'main.py').write_bytes(b'current source snapshot')
+        (self.source / 'requirements.txt').write_bytes(b'example==2.0.0\n')
+        for release_tag in (None, self.version, 'v3.8.1-beta.1'):
             with self.subTest(release_tag=release_tag):
-                if release_tag:
-                    self.portable.git(self.source, 'checkout', '--force', release_tag)
-                source_sha = self.portable.git(self.source, 'rev-parse', 'HEAD')
-                setup_calls = []
-                checks = []
-
-                def fetch_launcher(destination, app_name):
-                    (destination / 'launcher.zip').write_bytes(b'fixture launcher archive')
-                    launcher = destination / f'{app_name}.exe'
-                    launcher.write_bytes(b'MZ-fixture-launcher')
-                    return launcher
-
-                def execute(command, cwd, *, timeout=120):
+                calls, checks = [], []
+                def fetch(destination, app_name, candidate=None, proof_path=None, *, published=False):
+                    shutil.copy2(template / 'NoNo.exe', destination / 'NoNo.exe')
+                    shutil.copy2(template / 'launcher-build.json', destination / 'launcher-build.json')
+                    return destination / 'NoNo.exe'
+                def execute(command, cwd, *, timeout=120, temporary_root=None):
                     if command[0] == str(cwd / 'NoNo.exe'):
-                        expected = ['-c', 'setup', '-p', 'China']
-                        if release_tag:
-                            expected += ['--setup-version', release_tag]
-                        self.assertEqual(command[1:], expected, '仅使用已经实际成功的 setup 入口')
-                        setup_calls.append(command)
-                        app = cwd / 'data' / 'apps' / 'NoNo'
-                        repo, working, runtime = app / 'repo', app / 'working', app / 'python'
-                        if len(setup_calls) == 1:
+                        self.assertTrue(temporary_root.is_relative_to(cwd.parents[1]))
+                        self.assertTrue(temporary_root.is_dir())
+                        app = cwd / 'data/apps/NoNo'
+                        if command[1:5] == ['-c', 'setup', '-p', 'China']:
+                            calls.append('setup')
                             shutil.copytree(template, cwd, dirs_exist_ok=True)
+                            if release_tag:
+                                state = json.loads((app / 'app.json').read_bytes())
+                                state['current_version'] = release_tag
+                                (app / 'app.json').write_text(json.dumps(state), encoding='utf-8')
+                                self.portable.git(app / 'repo', 'tag', release_tag) if release_tag != self.version else None
+                        elif command[1] == '--nono-install-working':
+                            calls.append('working')
+                            install = json.loads(Path(command[2]).read_bytes())
+                            self.assertEqual(install['build_kind'], 'working_install')
+                            self.assertEqual((app / 'working/main.py').read_bytes(), b'current source snapshot')
+                            state_dir = cwd / 'data/state/NoNo'
+                            state_dir.mkdir(parents=True, exist_ok=True)
+                            (state_dir / 'install-working.json').write_text('{"state":"completed"}', encoding='utf-8')
                         else:
-                            self.assertEqual((repo / 'main.py').read_bytes(), (self.source / 'main.py').read_bytes())
-                            self.assertFalse((repo / 'removed.py').exists())
-                            # 模拟真实二次 setup：重建 working，并按当前物理树安装依赖与合并配置。
-                            self.portable.remove_tree(self.build_root, working)
-                            shutil.copytree(repo, working, ignore=shutil.ignore_patterns('.git'))
-                        state = self.portable.read_app_state(cwd, 'NoNo')
-                        state['profiles'][0].update({
-                            'main_script': 'selfhost/NoNo.exe', 'requires_python': '3.12',
-                            'requirements': 'requirements.txt', 'pip_args': '--no-deps',
-                        })
-                        state['auto_start'] = False
-                        state['update_method'] = 'AUTO_UPDATE'
-                        (app / 'app.json').write_text(json.dumps(state), encoding='utf-8')
-                        (runtime / 'installed-requirements.txt').write_bytes((working / 'requirements.txt').read_bytes())
-                        return 'setup 已完成'
+                            self.fail('调用了未声明的启动器安装入口。')
+                        (app / 'python/installed-requirements.txt').write_bytes((app / 'working/requirements.txt').read_bytes())
+                        return '合成安装完成'
                     if '--check' in command and '--root' in command:
                         checks.append(Path(command[-1]).name)
-                        return '来源检查已完成'
-                    if command[0] == 'git' or Path(command[0]).name == '7z.exe':
-                        return original_run(command, cwd, timeout=timeout)
-                    self.fail(f'便携编排调用了非必要命令：{Path(command[0]).name}')
-
-                with patch.object(self.portable, 'fetch_launcher', side_effect=fetch_launcher), \
+                        return '合成来源检查完成'
+                    return original_run(command, cwd, timeout=timeout, temporary_root=temporary_root)
+                with patch.object(self.portable, 'fetch_launcher', side_effect=fetch), \
                         patch.object(self.portable, 'run', side_effect=execute), \
                         patch.object(self.portable, 'probe_executable', return_value={'python_version': '3.12'}) as probe, \
+                        patch.object(self.portable, 'verify_package_reception') as reception, \
                         patch.object(self.portable, 'prepare_snapshot', wraps=self.portable.prepare_snapshot) as snapshot:
                     archive = self.portable.build_portable(self.source, source_sha=source_sha, release_tag=release_tag)
-                    self.assertEqual(len(setup_calls), 1 if release_tag else 2)
+                    self.assertEqual(calls, ['setup'] if release_tag else ['setup', 'working'])
                     self.assertEqual(snapshot.call_count, 0 if release_tag else 1)
-                    self.assertEqual(checks, ['repo', 'working'])
+                    self.assertEqual(checks, ['working'])
                     self.assertEqual(probe.call_count, 2)
+                    reception.assert_called_once()
                 with zipfile.ZipFile(archive) as package:
-                    info = json.loads(package.read('NoNo/build-info.json'))
+                    selected = json.loads(package.read('NoNo/data/incoming/NoNo/selected.json'))
+                    prefix = f"NoNo/data/incoming/NoNo/{selected['bundle_id']}/"
+                    info = json.loads(package.read(prefix + 'root/build-info.json'))
                     self.assertEqual(info['source_sha'], source_sha)
-                    self.assertEqual(info['base_update_commit'], anchor)
-                    self.assertEqual(info['base_update_version'], self.version)
-                    state = json.loads(package.read('NoNo/data/apps/NoNo/app.json'))
-                    self.assertFalse(state['auto_start'])
-                    self.assertEqual(state['update_method'], 'AUTO_UPDATE')
-                    expected_source = self.files['main.py'] if release_tag else (self.source / 'main.py').read_bytes()
-                    expected_requirements = b'example==1.0.0\n' if release_tag else b'example==2.0.0\n'
-                    for folder in ('repo', 'working'):
-                        self.assertEqual(package.read(f'NoNo/data/apps/NoNo/{folder}/main.py'), expected_source)
-                    installed = package.read('NoNo/data/apps/NoNo/python/installed-requirements.txt')
-                    self.assertEqual(installed, package.read('NoNo/data/apps/NoNo/working/requirements.txt'))
-                    self.assertEqual(installed.decode().splitlines(), expected_requirements.decode().splitlines())
-                    self.assertEqual(package.read('NoNo/data/apps/NoNo/repo/.git/HEAD'),
-                                     (template_repo / '.git' / 'HEAD').read_bytes())
+                    self.assertEqual(info['base_update_commit'], base_info['base_update_commit'])
+                    self.assertEqual(info['base_update_version'], release_tag or self.version)
+                    self.assertEqual(package.read(prefix + 'python/installed-requirements.txt'),
+                                     package.read(prefix + 'working/requirements.txt'))
+                    expected_source = self.files['main.py'] if release_tag else b'current source snapshot'
+                    self.assertEqual(package.read(prefix + 'working/main.py'), expected_source)
 
     def test_command_timeout_retains_bounded_text_bytes_and_empty_tails_without_credentials(self):
         stdout = ('不保留的日志头\n' + '中间日志\n' * 100
@@ -870,49 +1249,138 @@ class TestPortableBundle(unittest.TestCase):
     def test_archive_rejects_missing_runtime_host_or_changed_current_deployment(self):
         bundle, manifest = self.prepare_bundle()
         output = self.root / 'artifacts'
-        for relative in ('data/apps/NoNo/python/python3.dll', 'data/apps/NoNo/working/selfhost/NoNo.exe'):
+        payload = self.portable.incoming_payload(bundle, manifest)
+        for relative in ('python/python3.dll', 'working/selfhost/NoNo.exe'):
             with self.subTest(relative=relative):
-                missing = bundle / relative
+                missing = payload / relative
                 content = missing.read_bytes()
                 missing.unlink()
-                with self.assertRaisesRegex(RuntimeError, '缺少必要文件'):
+                with self.assertRaisesRegex(RuntimeError, '载荷发生漂移'):
                     self.portable.archive_bundle(bundle, output, manifest, self.build_root)
                 self.assertFalse(output.exists())
                 missing.write_bytes(content)
-        (bundle / 'data' / 'apps' / 'NoNo' / 'working' / 'main.py').write_bytes(b'stale mirror source')
-        with self.assertRaisesRegex(RuntimeError, '当前部署快照不一致'):
+        (payload / 'working/main.py').write_bytes(b'stale mirror source')
+        with self.assertRaisesRegex(RuntimeError, '载荷发生漂移'):
             self.portable.archive_bundle(bundle, output, manifest, self.build_root)
-        self.assertFalse(output.exists())
 
     def test_archive_verification_rejects_stale_files_and_local_install_metadata(self):
         bundle, manifest = self.prepare_bundle()
         archive = self.portable.archive_bundle(bundle, self.root / 'artifacts', manifest, self.build_root)
         with zipfile.ZipFile(archive, 'a') as package:
             package.writestr('NoNo/data/apps/NoNo/working/obsolete.py', b'old mirror source')
-        with self.assertRaisesRegex(RuntimeError, '过时的部署文件'):
+        with self.assertRaisesRegex(RuntimeError, '用户状态文件'):
             self.portable.verify_archive(archive, 'NoNo', manifest)
-        metadata = bundle / 'data' / 'apps' / 'NoNo' / 'python' / 'Lib' / 'site-packages' / 'sample.dist-info'
+        installation = self.root / 'installation/NoNo'
+        metadata = installation / 'data/apps/NoNo/python/Lib/site-packages/sample.dist-info'
         metadata.mkdir(parents=True)
         (metadata / 'direct_url.json').write_text('{"url": "file:///runner/private/source"}', encoding='utf-8')
         with self.assertRaisesRegex(RuntimeError, '临时来源'):
-            self.portable.verify_portable_metadata(bundle, self.root, 'NoNo')
+            self.portable.verify_portable_metadata(installation, self.root, 'NoNo')
 
     def test_same_name_installed_metadata_and_current_version_are_required(self):
-        bundle, _manifest = self.prepare_bundle()
-        state = self.portable.read_app_state(bundle, 'NoNo')
-        repo = bundle / 'data' / 'apps' / 'NoNo' / 'repo'
-        commit = self.portable.git(repo, 'rev-parse', 'HEAD')
-        self.portable.assert_update_anchor(repo, state, self.version, commit)
-        metadata = bundle / 'data' / 'apps' / 'NoNo' / 'app.json'
-        state['name'] = 'other'
-        metadata.write_text(json.dumps(state), encoding='utf-8')
-        with self.assertRaisesRegex(RuntimeError, '名字或安装状态'):
-            self.portable.read_app_state(bundle, 'NoNo')
-        state['name'] = 'NoNo'
-        state['current_version'] = 'dev'
-        metadata.write_text(json.dumps(state), encoding='utf-8')
-        with self.assertRaisesRegex(RuntimeError, '合法稳定更新版本'):
-            self.portable.read_app_state(bundle, 'NoNo')
+        installation, info = self.prepare_installation()
+        state = self.portable.read_app_state(installation, 'NoNo')
+        repo = installation / 'data/apps/NoNo/repo'
+        self.portable.assert_update_anchor(repo, state, self.version, info['base_update_commit'])
+        metadata = installation / 'data/apps/NoNo/app.json'
+        for changes, expected in (({'name': 'other'}, '名字或安装状态'), ({'current_version': 'dev'}, '合法')):
+            with self.subTest(changes=changes):
+                metadata.write_text(json.dumps({**state, **changes}), encoding='utf-8')
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    self.portable.read_app_state(installation, 'NoNo')
+
+    def prepare_installation(self):
+        snapshot, digests = self.prepare_snapshot()
+        installation = self.root / 'installation' / 'NoNo'
+        app = installation / 'data/apps/NoNo'
+        working, runtime = app / 'working', app / 'python'
+        shutil.copytree(snapshot, working)
+        runtime.mkdir()
+        # 真实 wheel 同时存在大写包名和下划线目录，不能只用全小写空树掩盖 Windows 排序差异。
+        (runtime / 'Lib/site-packages/PySide6').mkdir(parents=True)
+        (runtime / 'Lib/site-packages/_fixture').mkdir()
+        anchor = self.root / 'anchor'
+        anchor.mkdir()
+        (anchor / 'main.py').write_bytes(b'official base source')
+        self.initialize_repository(anchor)
+        self.portable.run(['git', 'clone', '--bare', '--no-hardlinks', str(anchor), str(app / 'repo')], self.root)
+        self.portable.git(app / 'repo', 'remote', 'set-url', 'origin', 'https://github.com/Canda15/nono-update.git')
+        # Git pack/对象通常只读，用受控HEAD覆盖同一属性边界，不读取真实安装。
+        (app / 'repo/HEAD').chmod(stat.S_IRUSR)
+        (installation / 'NoNo.exe').write_bytes(b'MZ-launcher')
+        (installation / 'pyappify.yml').write_bytes(self.files['pyappify.yml'])
+        for name, content in {'python.exe': b'MZ-python', 'python3.dll': b'portable python library',
+                              'python312.dll': b'portable runtime'}.items():
+            (runtime / name).write_bytes(content)
+        (app / 'app.json').write_text(json.dumps({
+            'name': 'NoNo', 'installed': True, 'current_profile': 'China', 'current_version': self.version,
+            'auto_start': False, 'update_method': 'AUTO_UPDATE', 'update_state': 'idle',
+            'profiles': [{'name': 'China', 'git_url': 'https://github.com/Canda15/nono-update.git',
+                          'main_script': 'selfhost/NoNo.exe', 'requires_python': '3.12',
+                          'requirements': 'requirements.txt', 'pip_args': '--no-deps'}],
+        }), encoding='utf-8')
+        self.launcher_proof = {
+            'schema_version': 1, 'app_name': 'NoNo', 'version': '1.2.7',
+            'source_sha': '31cd261eb8360ba2cf9ac63ec59fa5ef253cca2a',
+            'action_sha': '6dcb02954bb5fab5b83e95f1af243078213ec1ab',
+            'adaptation_sha256': 'a' * 64, 'source_tree_sha256': 'b' * 64,
+            'exe_sha256': self.portable.sha256(installation / 'NoNo.exe'),
+        }
+        (installation / 'launcher-build.json').write_text(json.dumps(self.launcher_proof), encoding='utf-8')
+        info = {'schema_version': 1, 'build_kind': 'commit_snapshot',
+                'source_sha': self.portable.git(self.source, 'rev-parse', 'HEAD'),
+                'base_update_version': self.version,
+                'base_update_commit': self.portable.git(app / 'repo', 'rev-parse', 'HEAD'),
+                'deployment_files': digests, 'app_metadata_file': 'app-seed.json'}
+        return installation, info
+
+    def test_zip_fallback_restores_empty_directories_and_private_state_is_rejected(self):
+        bundle, manifest = self.prepare_bundle()
+        from selfhost import portable_protocol
+        # 单独屏蔽 7-Zip 探测，其余真实文件检查保持有效。
+        original_is_file = Path.is_file
+        with patch.object(Path, 'is_file', autospec=True,
+                          side_effect=lambda path: False if path.name == '7z.exe' else original_is_file(path)):
+            archive = self.portable.archive_bundle(bundle, self.root / 'fallback', manifest, self.build_root)
+        extracted = self.root / 'extracted'
+        with zipfile.ZipFile(archive) as package:
+            package.extractall(extracted)
+        payload = self.portable.incoming_payload(bundle, manifest)
+        restored = self.portable.incoming_payload(extracted / 'NoNo', manifest)
+        self.assertEqual(portable_protocol.collect_tree(payload), portable_protocol.collect_tree(restored))
+        source_head = self.root / 'installation/NoNo/data/apps/NoNo/repo/HEAD'
+        self.assertFalse(source_head.stat().st_mode & stat.S_IWUSR)
+        self.assertTrue((payload / 'repo/HEAD').stat().st_mode & stat.S_IWUSR)
+        # 同包再次实际解压覆盖，原裸库仍只读，交付副本目录和文件身份保持一致。
+        with zipfile.ZipFile(archive) as package:
+            package.extractall(extracted)
+        self.assertEqual(portable_protocol.collect_tree(payload), portable_protocol.collect_tree(restored))
+        for relative in ('data/config', 'root/private', 'working/configs', 'working/Configs',
+                         'working/LOGS/empty', 'python/.PIP_UPDATE_NEEDED.tmp'):
+            with self.subTest(directory=relative):
+                changed = {**manifest, 'payload_directories': sorted({*manifest['payload_directories'], relative})}
+                changed = portable_protocol.seal_manifest(changed)
+                with self.assertRaises(RuntimeError):
+                    portable_protocol.validate_manifest(changed)
+        for relative in ('working/Configs/private.json', 'working/.PIP_UPDATE_NEEDED.tmp'):
+            with self.subTest(file=relative):
+                changed = {**manifest, 'payload_files': {**manifest['payload_files'], relative: {
+                    'size': 0, 'sha256': hashlib.sha256(b'').hexdigest()}}}
+                changed = portable_protocol.seal_manifest(changed)
+                with self.assertRaises(RuntimeError):
+                    portable_protocol.validate_manifest(changed)
+        for value in (float('nan'), float('inf'), float('-inf')):
+            with self.subTest(nonfinite=value), self.assertRaises(ValueError):
+                portable_protocol.json_bytes({'unknown': {'nested': value}})
+        for relative in ('data/apps/NoNo/app.json', 'data/config/app_config.json', 'data/user/NoNo/configs/account.json',
+                         'data/state/NoNo/receive.json', 'data/backups/NoNo/original.json', 'pyappify.yml'):
+            with self.subTest(relative=relative):
+                unsafe = self.root / 'unsafe.zip'
+                shutil.copy2(archive, unsafe)
+                with zipfile.ZipFile(unsafe, 'a') as package:
+                    package.writestr('NoNo/' + relative, b'private user original')
+                with self.assertRaises(RuntimeError):
+                    self.portable.verify_archive(unsafe, 'NoNo', manifest)
 
 
 @unittest.skipUnless(sys.platform == 'win32' and
@@ -1037,4 +1505,51 @@ class TestNativeRuntime(unittest.TestCase):
             self.assertIn('无法加载程序运行时', result.stderr)
         finally:
             backup.rename(library)
+
+    def test_portable_direct_entry_derives_user_root_and_blocks_pending_or_busy_installation(self):
+        import ctypes
+        from ctypes import wintypes
+        from selfhost.portable import process_environment, hidden_process_options
+        portable = self.root / 'portable-direct/NoNo'
+        working = portable / 'data/apps/NoNo/working'
+        runtime = portable / 'data/apps/NoNo/python'
+        shutil.copytree(self.working, working)
+        shutil.copytree(self.runtime, runtime)
+        executable = working / 'selfhost/NoNo.exe'
+        code = ('import json,os,subprocess,sys; '
+                'child=subprocess.run([sys.executable,"-c","import os; print(os.getenv(\\\"NONO_USER_DATA_ROOT\\\"))"],'
+                'capture_output=True,text=True,check=True); '
+                'print(json.dumps({"root":os.getenv("NONO_USER_DATA_ROOT"),"child":child.stdout.strip()}))')
+        environment = process_environment()
+        self.assertNotIn('NONO_USER_DATA_ROOT', environment)
+        def invoke(script=code):
+            return subprocess.run([str(executable), '-c', script], cwd=self.root, env=environment,
+                                  capture_output=True, text=True, encoding='utf-8', timeout=30,
+                                  **hidden_process_options())
+        result = invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)
+        expected = (portable / 'data/user/NoNo').resolve()
+        self.assertEqual(Path(identity['root']).resolve(), expected)
+        self.assertEqual(Path(identity['child']).resolve(), expected)
+        pending = portable / 'data/state/NoNo/receive.pending'
+        pending.write_bytes(b'pending receive')
+        refused = invoke('print("不能执行此业务")')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertNotIn('不能执行此业务', refused.stdout)
+        pending.unlink()
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        lease = kernel.CreateFileW(str(portable / 'data/state/NoNo/runtime.lock'), 0x80000000 | 0x40000000,
+                                   0, None, 3, 0x80, None)
+        self.assertNotEqual(lease, wintypes.HANDLE(-1).value)
+        try:
+            refused = invoke('print("不能在交换期间执行")')
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertNotIn('不能在交换期间执行', refused.stdout)
+        finally:
+            kernel.CloseHandle(lease)
 

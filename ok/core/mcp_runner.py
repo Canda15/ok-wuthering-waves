@@ -18,6 +18,7 @@ from pathlib import Path
 from ok.core.code_runner import capture_output
 from ok.task.exceptions import TaskDisabledException
 from ok.task.task import BaseTask, TriggerTask
+from ok.util.file import get_user_data_path
 from ok.util.logger import Logger
 
 
@@ -42,7 +43,7 @@ class McpTaskRunner:
         self.executor = executor
         self.app = app
         self.screenshot_service = screenshot_service
-        self.artifact_directory = Path(artifact_directory).resolve()
+        self.artifact_directory = Path(get_user_data_path(artifact_directory)).resolve()
         self.prepare = prepare
         self.task_manager = task_manager
         self._lock = threading.RLock()

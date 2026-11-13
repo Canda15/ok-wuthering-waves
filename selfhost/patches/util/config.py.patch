@@ -1,0 +1,109 @@
+--- a/util/config.py
++++ b/util/config.py
+@@ -1,5 +1,7 @@
+ ## Config.py
+-from ok.util.file import get_relative_path, read_json_file, write_json_file
++import os
++
++from ok.util.file import get_relative_path, get_user_data_path, read_json_file, write_json_file
+ from ok.util.logger import Logger
+ 
+ logger = Logger.get_logger("Config")
+@@ -20,7 +22,8 @@
+ 
+ 
+ class Config(dict):
+-    config_folder = 'configs'
++    # 便携进程在导入时就进入稳定根，提前创建的配置对象也不能落回 working。
++    config_folder = get_user_data_path('configs') if os.environ.get('NONO_USER_DATA_ROOT') else 'configs'
+ 
+     def __init__(self, name, default, folder=None, validator=None):
+         """
+@@ -37,8 +40,8 @@
+             folder = self.config_folder
+         self.config_file = get_relative_path(folder, f"{name}.json")
+ 
+-        # Read the config file, if it exists, otherwise use default
+-        config = read_json_file(self.config_file)
++        # 坏配置必须交给用户恢复；不能把读取失败当作首次安装而覆写默认值。
++        config = read_json_file(self.config_file, strict=True)
+         if config is None:
+             self.reset_to_default()
+         else:
+@@ -46,7 +49,7 @@
+             modified = self.verify_config(config, default)
+             if modified:
+                 self.save_file()
+-        logger.debug(f'init self.config = {self}')
++        logger.debug(f'配置已加载，字段数：{len(self)}')
+ 
+     def save_file(self):
+         """
+@@ -54,8 +57,9 @@
+         """
+         try:
+             write_json_file(self.config_file, self)
+-        except Exception as e:
+-            logger.error(f'save_file error: {e}')
++        except Exception:
++            logger.error('配置保存失败（CONFIG_WRITE_FAILED）')
++            raise
+ 
+     def get_default(self, key):
+         return self.default.get(key)
+@@ -67,7 +71,7 @@
+         super().clear()
+         self.update(self.default)
+         self.save_file()
+-        logger.debug(f'reset_to_default self.config = {self}')
++        logger.debug(f'配置已重置，字段数：{len(self)}')
+ 
+     def pop(self, key, default=None):
+         """
+@@ -97,18 +101,16 @@
+         self.save_file()
+ 
+     def __setitem__(self, key, value):
+-        if value != self.get(key) and self.validate(key, value):
+-            old_value = self.get(key)
++        if (key not in self or value != self.get(key)) and self.validate(key, value):
+             super().__setitem__(key, value)
+-            if old_value != value:
+-                self.save_file()
++            self.save_file()
+ 
+     def __getitem__(self, key):
+         try:
+             return super().__getitem__(key)
+-        except KeyError as e:
+-            logger.error(f'KeyError: {key} not found in config: {self}')
+-            raise e
++        except KeyError:
++            logger.error('配置字段不存在（CONFIG_KEY_MISSING）')
++            raise
+ 
+     def has_user_config(self):
+         return not all(key.startswith('_') for key in self)
+@@ -136,8 +138,9 @@
+         :param default_config: The default configuration.
+         :return: True if the config was modified, False otherwise.
+         """
+-        modified = any(key not in default_config for key in current)
+-        verified = {}
++        # 新版本只补缺省项；账号、插件及历史扩展字段不由已知默认键决定去留。
++        modified = False
++        verified = dict(current)
+ 
+         for key in default_config:
+             if key not in current or not isinstance(current[key], type(default_config[key])):
+@@ -154,9 +157,7 @@
+                 value = current[key]
+             verified[key] = value
+ 
+-        # Avoid __setitem__ while hydrating the object. __setitem__ persists
+-        # changes, which previously rewrote the complete JSON file once per
+-        # key whenever an existing config was loaded.
++        # 初始化直接更新内存，避免逐字段触发持久化；有效配置加载时无需写盘。
+         dict.clear(self)
+         dict.update(self, verified)
+ 

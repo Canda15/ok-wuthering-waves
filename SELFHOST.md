@@ -15,12 +15,12 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | `ok-script` 3.0.5b4 |
+| 版本 | `ok-script` 3.0.5b7（适配上游应用 v3.8.0） |
 | 权威来源 | `selfhost/ok_pin.json`（版本、原始 wheel、完整补丁后树与逻辑差异集合的 SHA-256，由 `scripts/sync_ok.py` 维护） |
-| 来源 | PyPI wheel `ok_script-3.0.5b4-py3-none-any.whl` |
-| 原始 wheel SHA-256 | `be5839467f3acedf997deb3a824c2de27d35cb4c2dbcd14f6eedd9e55c6cf3e8` |
+| 来源 | PyPI wheel `ok_script-3.0.5b7-py3-none-any.whl` |
+| 原始 wheel SHA-256 | `3ddb003bb62bb3e80e7ada0c7261067773f0c0b1ce5784829cc3844a7bc59fb3` |
 | 内联范围 | wheel 的 `ok/` 基线共 281 个有效文件；逻辑差异后的实际数量由 `--check` 给出 |
-| 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info。前两个 `ok/` 内没有任何引用，dist-info 只用于包元数据，`ok/` 也没有 `importlib.metadata` 之类的读取 |
+| 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info 不作为框架源码入库；生成依赖和内联版本依据原始 wheel、pin 及严格来源清单，不能回退到另一份已安装的 ok-script |
 
 内联以固定 wheel 为基线，再施加品牌与已登记的逻辑差异，但**没有上游框架的 git 历史**。
 最初因本机沙箱禁止 `sh.exe` 创建命名管道、`git subtree` 无法运行，采用了“下载 wheel 解包后入库”的方式。
@@ -43,9 +43,8 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
    `task_tab_query` 在 3.0 被整体移除，全仓库无任何引用，留着就是一枚"被 import 就炸"的地雷。
 8. 新增 `selfhost/`（自有差异目录，见下节），`main.py` 在构造 `OK()` 前调用
    `selfhost.overrides.apply(config)`，`deploy.txt` 增加 `selfhost` 一行。
-9. `build.yml` 的 `package` job 不再调用 `ok-oldking/pyappify-action`，改为"下载上一次发布里的
-   启动器 → 跑一次 setup → 打成便携 zip"，并删掉 SignPath 签名与 NSIS 安装包那条链路
-   （详见"产物与构建耗时"）。
+9. `build.yml` 的 `package` job 使用共享便携打包器，构建经过来源核验的 NoNo 启动器，
+   安装完整运行环境并生成 ZIP，不经过上游的 SignPath 与 NSIS 安装包链路。
 10. 改名成 NoNo：`pyappify.yml` 的 `name`（决定 exe 名、解压目录、`data/apps/<name>`、资产名）
     与 `selfhost/overrides.py` 的 `APP_NAME`（决定窗口标题等）必须一致。config 侧的品牌项
     ——`gui_title`、两个日志文件名、`links`、`update_pyappify`——全部在 `overrides.apply_branding()`
@@ -79,6 +78,11 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 | `framework_tree.py` | 框架源码、差异来源及部署校验共用的树摘要算法 | 同步 / 校验时 |
 | `ok_pin.json` | 框架版本、原始 wheel、补丁后树与差异集合摘要的权威来源 | 同步 / 校验时 |
 | `runtime/host.c`、`runtime/host.rc` | 原生业务宿主及图标、产品名等 EXE 资源 | `scripts/build_runtime.ps1` 编译时 |
+| `portable.py` | 当前部署快照、启动器证据、完整运行时和 incoming 包的校验及归档 | 普通编译与正式发布共用 |
+
+启动器差异单独放在 `launcher/`：官方 Rust 与 Action 的固定来源、最小统一差异、NoNo 接收与
+持久化模块，以及全部载荷的摘要都可审查。构建先校验固定来源，应用差异，再重编译 Action 的
+`dist/index.js` 和实际 EXE，不能只修改未执行的 Action 源文件，也不能复用未验证的现成二进制。
 
 当前 `selfhost/overrides.py` 负责把上游取消注册的两个页面（角色代码、多账号配置）加回
 `config['custom_tabs']`。时序上必须在 `OK(config)` 之前——`OK.__init__` 按引用保存这个
@@ -98,7 +102,7 @@ dict，`MainWindow` 读的是同一个对象。
 `main_script` 改为 `selfhost/NoNo.exe`，启动器直接执行这个业务宿主。宿主加载同一便携目录中的
 `python3.dll`，通过 `Py_Main` 在自身进程执行 `main.py`，因此业务进程的映像名和产品名都为
 NoNo。图标复用 `icons/icon.ico`。这是 [CPython 官方说明的自定义宿主方式](https://docs.python.org/3.12/using/windows.html#the-embeddable-package)，
-[pyappify 官方也支持把 EXE 配为入口](https://github.com/ok-oldking/pyappify/tree/v1.2.4)。
+[pyappify 官方也支持把 EXE 配为入口](https://github.com/ok-oldking/pyappify/tree/v1.2.7)。
 
 选择此方案是为了继续使用现有的源码更新、依赖管理和动态角色加载。PyInstaller 也能生成业务
 EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍然分发整个便携目录，不能只复制
@@ -115,10 +119,10 @@ EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍�
 .\scripts\build_runtime.ps1
 ```
 
-构建产物 `selfhost/NoNo.exe` 不提交到源码仓库，只由发布流程推入部署树。新下载的便携包直接
-使用原生宿主；当前 v1.2.4 启动器也会读取部署目录中的 `pyappify.yml`，旧安装升级后从根目录
-的启动器启动一次即可使用新入口并刷新快捷方式。已有计划任务的 XML 仍指向旧解释器，需在
-界面里重新创建。开发调试仍使用原来的 Python 入口。
+构建产物 `selfhost/NoNo.exe` 不提交到源码仓库，只由发布流程推入部署树。便携包使用自建
+v1.2.7 根启动器与原生业务宿主；快捷方式默认关闭，已有明确开启的设置保留。覆盖升级不创建、
+删除或重建系统计划任务。更早仍指向旧 Python 的外部计划任务，需要用户按实际入口自行调整。
+源码调试仍使用 Python；`main_updater.py` 是源码独立更新管理器，不是便携版必需入口。
 
 除前台输入与任务恢复迁移外，工坊数据源也保留一处**有意偏差**：`src/gui/CharacterCodeTab.py:44-63`。
 三个历史入口全断了——上游自建的 `cfokwwchar.ok-script.com`（DNS NXDOMAIN）、旧 Pages 的
@@ -149,7 +153,7 @@ EXE，但需要另外维护依赖收集和冻结后的更新机制。这里仍�
 
 ```powershell
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py'            # 优先取上游 pyproject 版本，没有声明才用 pin
-& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b4   # 明确固定已经审查的版本
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b7   # 明确固定已经审查的版本
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --dry-run  # 下载并验证重放，只报告差异
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check    # 离线校验框架、基线及差异来源
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check --root 'E:\deploy\NoNo'  # 示例：校验另一棵部署树
@@ -233,8 +237,8 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 "合并干净、构建成功、启动 ImportError"挡在发版之前。
 
 标签必须沿用上游版本号本身（`v3.7.17`），不能加 `+xmod` 之类的后缀。约束来自启动器而不是
-`ok/util/version.py`：`pyappify` 认标签的正则是 `^v?\d+\.\d+\.\d+(-alpha|beta|rc\.\d+)?$`，
-`ok-ww.exe -c setup --setup-version v3.7.17+xmod` 会直接报 `Invalid setup version tag`，便携包
+`ok/util/version.py`：当前 PyAppify 支持 `v?数字.数字.数字` 及可选 `[-.](alpha|beta|rc)[.数字]`，
+`NoNo.exe -c setup --setup-version v3.7.17+xmod` 会直接报版本标签无效，便携包
 在 setup 这一步就失败；而客户端拉版本列表用同一个正则，带后缀的标签也进不了列表，等于自更新
 永远看不到新版本。所以 fork 里同名标签被改指到自己的合并提交，语义是"同一版本号 + 我们的补丁"。
 
@@ -248,7 +252,7 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | 现在就要跟上上游最新 release | **Sync upstream release** | 自己取上游 `releases/latest`，合并、重建 `ok/`、跑冒烟、推 master、改 tag、派发打包，一条龙。该 tag 已合并时直接退出，勾 `force` 才会重来一遍 |
 | 只是重新打一次已有的版本 | **Windows Release** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
 | 编译普通源码提交并下载便携包 | **Windows 编译检查** | master 推送自动运行，也可手动派发；生成完整 NoNo-win32-portable.zip，不要求发布 tag |
-| 重新编启动器 | **Build launcher** | 约 12 分钟，全在 Tauri 冷编译；只有改名字/图标/UAC 才需要 |
+| 重新编启动器 | **构建 NoNo 启动器** | 固定官方来源并应用 NoNo 差异；先产出候选，发布需显式授权 |
 
 `Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
 源码打包，用的是 `pyappify.yml` 里 `git_url` 指向的镜像仓库里已有的那份部署树。
@@ -261,7 +265,7 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | --- | --- |
 | `Windows Release` | tag 一推就打包（由 `Sync upstream release` 派发） |
 | `Sync upstream release` | 12 小时轮询上游 release |
-| `Build launcher` | 手动重编启动器 |
+| `构建 NoNo 启动器` | 手动重编候选启动器；默认只上传工件，显式发布使用新的 launcher-2 |
 | `Windows 编译检查` | master 推送验证完整框架及前台核心，编译原生业务 EXE 并上传对应 SHA 的产物 |
 
 其余全部在 GitHub 侧 `disabled_manually`：`Documentation`、`close_stale_issues`、
@@ -278,37 +282,42 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 
 `.github/workflows/windows-compile.yml` 对每次 master 推送运行，不使用分支名生成发布版本，也不写入
 更新镜像。顺序为安装现有依赖 → `scripts/check_foreground.ps1` → `scripts/build_runtime.ps1` →
-`python -m selfhost.portable --source-sha <本次 SHA>` → 上传完整便携包。
+共享 `.github/actions/build-nono-launcher` 构建并核验启动器 →
+`python -m selfhost.portable --source-sha <本次 SHA> --launcher-exe build/launcher-dist/NoNo.exe` → 上传完整便携包。
 仓库权限仅为 `contents: read`，检出固定到本次 SHA，测试进程不继承 CI 凭据。
 
 `check_foreground.ps1` 默认先运行 `sync_ok.py --check`，再通过既有 `run_test.py` 执行集中输入、桌面通知、
-多账号、无音消除、一次性战斗、公共资源恢复和自维护测试。每个文件使用独立进程及临时配置目录，
-避免加载开发机账号和通知设置。开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 调用默认完整门禁，
+多账号、无音消除、一次性战斗、资源恢复、角色识别、Lily、绯雪皮肤、深塔和自维护测试。
+每个文件使用独立进程。`run_test.py` 的父进程创建临时用户目录，持有到测试进程完全退出；
+在任何框架导入前设置 `NONO_USER_DATA_ROOT`、`OK_DISABLE_FILE_LOG=1`，并明确配置、截图和日志路径。
+不能仅替换 `config_folder`：截图测试会强制开启 debug，旧框架会清空默认截图目录。
+父进程在测试进程完全退出后检查后台线程错误标记，不能仅凭 unittest 的成功字样判定通过。
+开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 调用默认完整门禁，
 只有最终差异收集后框架检查通过才能继续编译。
 
 `build_runtime.ps1` 继续负责唯一宿主编译入口和原生进程验证。之后共享打包器生成
 `build/portable-dist/NoNo-win32-portable.zip` 与 `NoNo-win32-sha256.txt`，Actions 工件名为
 `NoNo-portable-windows-<本次完整 SHA>`，保留 14 天；运行摘要提供完整便携包的下载链接。
-ZIP 内是 `NoNo/` 目录，包含根启动器、Python 运行环境、依赖、部署代码以及
-`data/apps/NoNo/working/selfhost/NoNo.exe` 业务宿主，解压后双击 `NoNo/NoNo.exe`。
+ZIP 内是 `NoNo/` 目录，仅直接投递根启动器和 `data/incoming/NoNo/` 下的完整包。
+incoming 包包含裸 Git 仓库、部署代码、原生业务宿主、Python、依赖及文件清单；
+首次双击根 `NoNo.exe` 时，接收守卫验证并安装为 `data/apps/NoNo/` 下的正式目录。
 GitHub Actions 的工件下载容器内含上述 ZIP 和校验文件；正式 Release 的资产仍直接叫
 `NoNo-win32-portable.zip`。业务宿主仍在自己的进程执行原有 `main.py` 和内联框架。
 
-普通编译采用当前提交的部署文件快照。打包器先通过固定启动器的正式 setup 准备运行环境和有效的
-更新版本锚点，再按已跟踪文件与 `deploy.txt` 白名单，把本次源码部署到便携目录的 `repo` 和
-`working` 物理树；新增的业务宿主、内联 pyappify 和部署忽略规则有明确生成来源。
-覆盖后再运行同一启动器的无标签 setup，由当前物理部署树同步 working、安装本次依赖并保存完整应用状态。
-两棵实际部署树都校验完整内容和框架 pin，并验证便携 Python 与实际原生宿主。正式标签模式仍只运行一次
-带标签 setup；普通模式不借用版本列表查询完成安装状态合并。
+普通编译先运行一次官方 setup，取得真实正式更新锚点及运行环境，再按已跟踪文件与
+`deploy.txt` 白名单构造本次 working 快照。随后通过新增的
+`--nono-install-working <manifest> -p China` 调用官方依赖安装后半段，安装当前 requirements，
+严格保存 App 状态；不能再调用可能重新检出或覆盖 working 的 setup。
+裸仓库保留真实正式锚点，当前源码仅部署到 working；原生宿主、内联 PyAppify 和忽略规则有明确生成来源。
+正式标签模式仅执行一次真实带标签 setup，并保留官方 alpha、beta、rc 标签格式；普通快照仍使用稳定锚点。
+两种模式都校验 working、框架来源、真实便携 Python 与原生宿主，
+再生成带完整大小和 SHA-256 清单的 incoming 包；版本查询不能替代真实安装。
 `tests/`、`ok_templates/`、未跟踪的账号配置、缓存和运行日志不会成为部署快照。
 
-便携包中的 `build-info.json` 分开记录本次 `source_sha`、正式更新底座的 `base_update_version` 和
-`base_update_commit`、部署文件摘要及框架 pin。普通快照保留 setup 的正式 Git HEAD、版本标签、
-更新地址和应用状态，实际运行文件使用本次快照；Git 锚点不能冒充源码提交。
-这是为了兼容固定启动器 v1.2.4 的
-[当前版本检查](https://github.com/ok-oldking/pyappify/blob/v1.2.4/src-tauri/src/app_service.rs)：
-临时本地版本标签在连接正式镜像后会消失，启动器随后可能强制回退，因此普通构建不创建临时远端版本、
-不改镜像标签。正式版本更新仍由原有标签发布流程提供。
+`build-info.json` 与接收 manifest 分开记录本次 `source_sha`、正式更新底座的版本和提交、
+working 文件摘要、框架 pin，以及启动器来源证据。Git 锚点不能冒充源码提交，普通构建不创建
+临时远端标签、不改镜像标签。接收后的第一次启动有独立更新检查保护，避免旧错误状态或
+“当前版本缺失”路径立刻检出镜像并覆盖当前快照；用户明确保存的自动更新策略继续保留。
 
 提交后的验收按本次推送 SHA 查找这个工作流，确认核心检查、编译和上传均成功，不能用旧 SHA 的成功
 代替本次结果。`GITHUB_TOKEN` 产生的推送不会递归触发 push 工作流，既有上游同步仍通过显式派发标签
@@ -318,6 +327,32 @@ Windows Release 保留全仓库测试与镜像发布链路，打包步骤调用�
 `python -m selfhost.portable --release-tag <tag>`。正式模式按该 tag setup 镜像部署树，不覆盖为普通快照；
 两种模式都使用 `sync_ok.py --check --root` 核对 pin、逻辑载荷、完整框架和生成资源，再验证真实运行时中的
 原生进程。缺少运行环境、错误的部署内容或字节漂移都会在上传便携包前失败。
+
+### 直接覆盖升级与用户数据
+
+先退出正在运行的 NoNo，将新 ZIP 中 `NoNo/` 的内容覆盖到原 `NoNo/` 目录，再启动根 `NoNo.exe`。
+无需安装器、手工删除旧 repo 或重新设置账号。压缩包不能直接包含正式 `app.json`、全局启动器
+配置、用户目录或 live repo／working／python，否则解压时会先覆盖旧数据，启动守卫无法保护。
+
+| 目录 | 用途 |
+| --- | --- |
+| `data/incoming/NoNo/` | 新包与选择清单，启动前逐文件核验 |
+| `data/apps/NoNo/` | 接收后的裸 repo、working、Python 与 App 状态 |
+| `data/user/NoNo/` | 稳定用户配置、任务开关、账号数据、快捷键、自定义任务、插件和素材 |
+| `data/state/NoNo/` | 接收事务、收据、首次更新检查保护及运行租约 |
+| `data/backups/NoNo/` | 旧目录原件、未知文件和冲突副本 |
+
+根启动器在任何 App／CLI 读取前接收包：验证来源、文件大小和摘要、真实 Git 锚点及 Python，
+保护旧原件，准备同卷新目录，再按持久化事务整体交换。每次移动先保存意图，重复启动按实际目录
+身份恢复；失败不启动半安装目录。新包选择变化时先处理上一事务，不混用两份载荷。
+同一包已接收后不会再次播种状态或重置用户后来修改的偏好。
+
+旧 working 用户目录自动迁到 `data/user/NoNo`，已有稳定目录优先，两份冲突均保留。
+明确指向便携目录外的截图路径不移动、不跟随、不删除。未知配置键与嵌套内容保留，缺项补默认值；
+损坏 JSON 明确失败并保留原字节，保存采用原子写，日志不输出账号、配置值或完整用户对象。
+严格读取拒绝 NaN、Infinity 和 -Infinity，写入也拒绝非有限数值，不能重新序列化覆盖坏原件。
+普通双击启动的接收失败显示固定中文提示；构建 CLI 保留标准错误和非零退出，不弹出桌面窗口。
+运行时键 `NONO_USER_DATA_ROOT` 连接所有消费者；源码运行未设置此键时沿用旧路径。
 
 ### 更新仓库：部署树镜像 `Canda15/nono-update`
 
@@ -348,7 +383,7 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 `deploy.txt` 因此是"发布内容"的唯一权威：新增一个需要随包下发的目录（比如 `selfhost`），
 必须同时加进 `deploy.txt`，否则该目录不会出现在镜像里，运行时 `ImportError`。
 
-## 产物与构建耗时
+## 产物与启动器构建
 
 每次发布只有一个能用的包：
 
@@ -357,53 +392,32 @@ token 输入，所以凭据嵌在 `repos` 的 URL 里）。
 | `NoNo-win32-portable.zip` | 便携版，解压即用，整个目录可以直接搬走 |
 | `NoNo-win32-sha256.txt` | 便携包的 SHA-256 |
 
-启动器（`NoNo.exe`）不再是应用发布页上的资产，而是单独编译一次、挂在 `launcher-1` 这个固定
-tag 的 release 上（`.github/workflows/build-launcher.yml`，手动触发）。原因只有一个：上游那份
-exe 的 PE 版本信息里写着 `ok-ww`，而这是 config 改不到的地方，只能用本仓库的 `pyappify.yml`
-自己编一次。工作流里有一条硬检查：编出来的 exe 只要 `ProductName`/`FileDescription`/
-`CompanyName` 还匹配 `ok-ww|ok-script` 就直接失败。
+新启动器基于官方 v1.2.7 固定提交，保留官方 Git／版本模型，添加 NoNo 接收与严格持久化。
+旧 `launcher-1` 资产保留，不能将新裸库包交给旧 v1.2.4 启动器。
+新的 `launcher-2` 固定发布与应用版本分开，未经发布验证不作为默认下载来源。
+普通 CI 直接构建候选并交给打包器，因此不依赖尚未发布的固定资产。
 
-便携版由共享 `selfhost/portable.py` 生成，不再经过 `ok-oldking/pyappify-action`：
-下载启动器 → 把 `pyappify.yml` 放在 exe 旁边 → 跑一次
-`NoNo.exe -c setup -p China --setup-version <tag>` → 校验部署树和真实运行环境 →
-删掉 `cache/` 与 `data/logs/` → 打包成 zip。普通 master 模式在运行环境安装后增加当前部署快照步骤。
-`data/apps/<name>` 那个目录名来自 `pyappify.yml`，与 exe 文件名无关。
+在仓库根目录构建：
 
-`selfhost/portable.py` 的 `LAUNCHER_URL` 钉死在 `launcher-1`，并核对发布的摘要和启动器的品牌：
-用 `latest` 会解析到应用发布页，那里没有启动器。重建启动器、换 tag 时要同步改这一常量；**`launcher-1` 这个 release
-不能删**，删了发版会在下载启动器这一步 404。
+```powershell
+.\scripts\build_launcher.ps1
+```
 
-之所以成立：启动器的路径全部相对自身所在目录（`utils/path.rs` 用 `current_dir`，
-`lib.rs` 启动时强制 `set_current_dir(exe_dir)`），既不写注册表也不写 `%APPDATA%`，
-NSIS 安装包只是把这个目录复制到 Program Files——那我们直接发这个目录就行。
-`pyappify.yml` 必须和 exe 放在一起：启动器在 cwd 里读它（`app.rs:198 read_embedded_app`），
-读不到就退回 pyappify 自带的默认配置，setup 会跑去克隆上游。
-启动器是 GUI 子系统的 exe，PowerShell 里必须 `Start-Process -Wait -PassThru` 再读
-`ExitCode`——用 `&` 调用不会等待，`$LASTEXITCODE` 还是空，会把失败当成功。
+默认产出 `build/launcher-dist/NoNo.exe` 与 `launcher-build.json`。可指定 `-OutputDirectory`；
+`-PrepareActionOnly` 仅验证并准备固定 Action、应用 hook 和重建 `dist/index.js`，不能代替 EXE 编译。
+启动器证据关联官方提交、差异载荷和二进制摘要，并核验 v1.2.7、NoNo 品牌、图标与 UAC 资源。
 
-| 阶段 | v3.7.17（旧流程，两个 profile） | 现在（便携包，实测 run 41852651983） |
-| --- | --- | --- |
-| validate（checkout / pip install / 跑测试） | 3.1 min | 2.8 min |
-| synchronize（推镜像仓库） | 1.6 min | 1.5 min |
-| package（下载启动器 / setup / 打 zip） | 10.9 min | 1.4 min |
-| publish（上传 Release 资产） | 0.6 min | 0.3 min |
-| **合计** | **16.2 min** | **6.2 min** |
+打包器接受 `--launcher-exe <候选>`，默认读取候选旁的 `launcher-build.json`；
+`--launcher-proof` 可明确指定证据。没有候选时要求先构建；固定发布下载必须显式使用
+`--published-launcher`，不能回退到旧包或应用发布页的 `latest`。
 
-旧流程的 `package` 里 7.7 分钟是 makensis：每个 profile 都要把 224 MB 载荷压成一个 NSIS
-离线安装包。现在没有 NSIS，`package` 只剩三件事：下载启动器（3 秒）、跑一次 setup
-（克隆镜像仓库 + pip 装依赖 + 下载 Python 运行时）、`7z -mx=5` 压一次。
-便携目录实测 697 MB，压出来是 329 MB 的 zip；`-mx=9` 大约能再省几十 MB，但压缩时间翻倍，
-对自用不值得。
-更早还有一版 29.3 分钟，那时 `package` 里含一次 9m17s 的 Tauri 冷编译，启动器复用之后
-这段也不再出现。
+便携目录的路径相对根 EXE，不写注册表或 `%APPDATA%`。根守卫先接收根配置，再交给官方读取链，
+避免缺少根配置时误用上游默认源。启动器是 GUI 子系统 EXE，构建 CLI 用
+`Start-Process -WindowStyle Hidden -Wait -PassThru` 或等效等待方式，必须检查实际退出码。
 
-启动器二进制现在是自建的（`launcher-1`），需要重建时手动跑一次
-`.github/workflows/build-launcher.yml`：约 10 分钟，全部时间花在 Tauri 的 Rust 冷编译上
-（`pyappify-action` 自己装 rustup，没有 cargo 缓存）。它与应用版本号无关——版本号由 setup
-按 tag 生成，所以除非要改启动器本身（名字、图标、UAC），不需要重建。
-
-能缓存的只有 pip 依赖：三个 job 的 `actions/setup-python` 都带 `cache: pip`。
-便携目录每次内容都变（版本号、源码），压缩产物没有缓存价值。
+新版每次 CI 包含启动器原生编译，冷构建耗时不能沿用旧 `launcher-1` 下载复用流程的历史数字。
+包体与耗时以对应 SHA 的实际 Actions 记录为准。便携目录每次源码与 manifest 都会变化，
+不复用旧 ZIP；依赖缓存不能替代完整来源及运行时检查。
 
 ## 尚未完成
 
@@ -438,10 +452,9 @@ NSIS 安装包只是把这个目录复制到 Program Files——那我们直接�
 
 对新旧安装的影响：
 
-- 旧目录（`ok-ww/`）不会被改名，它读自己那份 `pyappify.yml`，更新照旧走镜像仓库的 tag；
-  想迁到新名字就下载新的便携包，把旧目录的 `configs/` 拷进新的 `NoNo/configs/`。
-- 首次用新名字启动是一次全新 setup（`data/apps/NoNo` 重新克隆 + 装依赖），几分钟，一次性。
-- 计划任务文件夹从 `\OK-WW` 变成 `\NoNo`：改名前的定时任务不会自动迁移，需要在界面里重建。
+- 已使用 NoNo 的便携目录按上文直接覆盖，旧用户数据自动保护并迁移到稳定目录。
+- 更早名为 `ok-ww` 的应用不会自动改名，本轮接收协议只处理 `data/apps/NoNo`。
+- 系统计划任务和用户显式开启的快捷方式偏好保留；自动创建快捷方式的默认值仍为关闭。
 
 ## 许可
 

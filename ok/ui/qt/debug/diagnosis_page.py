@@ -441,9 +441,9 @@ class DiagnosisPage(QWidget):
 
     def dump_threads(self) -> None:
         from ok.capture.windows.dump import dump_threads
-        from ok.util.file import get_relative_path
+        from ok.util.file import get_user_data_path
         dump_threads()
-        path = get_relative_path(os.path.join('logs', "thread_dumps.txt"))
+        path = get_user_data_path('logs', 'thread_dumps.txt')
         show_toast(self, _tr("Saved to {path}").format(path=path), _tr("Dump Threads"), tone="success",
                    action=(_tr("Open"), lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path))))
 

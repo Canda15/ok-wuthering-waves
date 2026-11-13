@@ -5,13 +5,19 @@ name = "ok-wuthering-waves"
 script = ""
 
 [[actions]]
-name = "Run main_debug.py"
+name = "运行调试入口"
 icon = "run"
 command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.codex\run.ps1 -EntryPoint main_debug.py'
 platform = "win32"
 
 [[actions]]
-name = "Run main.py"
+name = "运行源码入口"
 icon = "run"
 command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.codex\run.ps1 -EntryPoint main.py'
+platform = "win32"
+
+[[actions]]
+name = "运行源码更新管理器"
+icon = "run"
+command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.codex\run.ps1 -EntryPoint main_updater.py'
 platform = "win32"

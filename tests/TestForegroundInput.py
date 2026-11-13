@@ -1,12 +1,16 @@
 """前台输入状态机与跨层生命周期；全部原生输入及用户配置均使用替身。"""
 
 import ctypes
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -535,6 +539,283 @@ class TestForegroundLifecycle(InputFixture):
         self.task.on_foreground_resume = Mock()
         executor.current_task = self.task
         executor.onetime_tasks = [self.task]
+
+    def _make_combat_task(self):
+        from src.scene.WWScene import WWScene
+        from src.task.BaseCombatTask import BaseCombatTask
+
+        self.executor.device_manager.supported_ratio = None
+        task = BaseCombatTask.__new__(BaseCombatTask)
+        task.__dict__.update(self.task.__dict__)
+        task.__dict__.pop('on_foreground_resume', None)
+        task.scene = WWScene()
+        task._foreground_epoch = 0
+        task.next_monthly_card_start = 0
+        task._abyss_combat_active = True
+        task.chars = [None, None, None]
+        task.freeze_durations = []
+        task.cds = {}
+        self.executor.scene = task.scene
+        self.executor.current_task = task
+        self.executor.onetime_tasks = [task]
+        self.executor.next_frame()
+        task.skip_combat_check = True
+        task.use_liberation = True
+        return task
+
+    def _schedule_focus_loss(self):
+        lost = False
+        restore_at = self.clock() + 0.14
+
+        def change_focus():
+            nonlocal lost
+            if not lost:
+                self.native.foreground = 20
+                lost = True
+            elif self.clock() >= restore_at:
+                self.native.foreground = 10
+                self.clock.after_wait = None
+
+        self.clock.after_wait = change_focus
+
+    def _make_lily_rotation(self, interrupted_stage=None):
+        from src.char.BaseChar import BaseChar
+        from src.char.Lily import Lily
+
+        task = self._make_combat_task()
+        task.is_con_full = Mock(return_value=True)
+        char = Lily(task, 0)
+        task.chars = [char, None, None]
+        char.in_slumberland = Mock(return_value=False)
+        char.click_echo = Mock()
+        char.build_forte = Mock(return_value=True)
+        char.is_mouse_forte_full = Mock(return_value=True)
+        char.liberation_available = Mock(return_value=True)
+        char.fill_concerto = Mock(return_value=True)
+        char.click_liberation = Mock(return_value=True)
+        char.switch_next_char = Mock()
+        observations = 0
+
+        def heavy_state():
+            nonlocal observations
+            observations += 1
+            if interrupted_stage == '结束等待' and observations == 1:
+                self._schedule_focus_loss()
+            return observations == 1
+
+        char.heavy_in_progress = Mock(side_effect=heavy_state)
+        if interrupted_stage == '开始等待':
+            self._schedule_focus_loss()
+        if interrupted_stage == '收尾休眠':
+            def sleep(seconds, check_combat=True):
+                self._schedule_focus_loss()
+                return BaseChar.sleep(char, seconds, check_combat)
+
+            char.sleep = sleep
+        return task, char
+
+    def _assert_lily_rotation_interrupted(self, stage):
+        task, char = self._make_lily_rotation(stage)
+        epoch = task._foreground_epoch
+        # 保留真实 perform → wait/sleep → 执行器 → 恢复钩子，只有系统输入与抓帧使用替身。
+        with patch.object(task, 'mouse_up', wraps=task.mouse_up) as release:
+            with self.assertRaises(ForegroundInputInterrupted):
+                char.perform()
+            release.assert_called_once()
+        char.fill_concerto.assert_not_called()
+        char.click_liberation.assert_not_called()
+        char.switch_next_char.assert_not_called()
+        self.assertEqual(task.chars, [None, None, None])
+        self.assertGreater(task._foreground_epoch, epoch)
+        self.assertIsNone(task._active_char_rotation)
+        self.assertFalse(self.core._held)
+        self.assertEqual(self.native.inserted, [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+        self.window.bring_to_front.assert_not_called()
+
+    def test_Lily开始等待内恢复释放并退出旧轮转(self):
+        self._assert_lily_rotation_interrupted('开始等待')
+
+    def test_Lily结束等待内恢复释放并退出旧轮转(self):
+        self._assert_lily_rotation_interrupted('结束等待')
+
+    def test_Lily收尾sleep内恢复释放并退出旧轮转(self):
+        self._assert_lily_rotation_interrupted('收尾休眠')
+
+    def test_Lily正常重击完成释放并进入后续阶段(self):
+        for liberation_confirmed in (True, False):
+            with self.subTest(liberation_confirmed=liberation_confirmed):
+                task, char = self._make_lily_rotation()
+                if not liberation_confirmed:
+                    char.click_liberation.return_value = False
+                    char.in_slumberland.side_effect = [False, True]
+                before = len(self.native.inserted)
+                with patch.object(task, 'mouse_up', wraps=task.mouse_up) as release:
+                    char.perform()
+                    release.assert_called_once()
+                char.fill_concerto.assert_called_once_with(0.8)
+                char.click_liberation.assert_called_once()
+                task.is_con_full.assert_called_once()
+                char.switch_next_char.assert_called_once()
+                self.assertIsNone(task._active_char_rotation)
+                self.assertFalse(self.core._held)
+                self.assertEqual(self.native.inserted[before:],
+                                 [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+
+    def test_Lily协奏未确认时停止轮转且不进入后续技能或切人(self):
+        for stage, can_liberate, fills, liberated, entered_slumberland, screenshot_name in (
+            ('首次满协奏', False, [False], False, False, '莉莉协奏补充结果无法确认'),
+            ('首次解放补能', True, [False], True, False, '莉莉协奏补充结果无法确认'),
+            ('解放失败后二次补能', True, [True, False], False, False, '莉莉协奏补充结果无法确认'),
+            ('解放成功后仍未满', True, [True], True, False, '莉莉延奏交接无法确认'),
+            ('解放未确认但已进梦乡', True, [True], False, True, '莉莉延奏交接无法确认'),
+        ):
+            with self.subTest(stage=stage):
+                task, char = self._make_lily_rotation()
+                task.screenshot = Mock(wraps=task.screenshot)
+                task.is_con_full.return_value = False
+                char.liberation_available.return_value = can_liberate
+                char.fill_concerto.side_effect = fills
+                char.click_liberation.return_value = liberated
+                if entered_slumberland:
+                    char.in_slumberland.side_effect = [False, True]
+                if stage == '解放成功后仍未满':
+                    # 解放后的新 HUD 必须覆盖旧角色的满协奏缓存。
+                    char.current_con = 1
+                before = len(self.native.inserted)
+                with patch.object(task, 'mouse_up', wraps=task.mouse_up) as release:
+                    with self.assertRaisesRegex(TimeoutError, '协奏'):
+                        char.perform()
+                    release.assert_called_once()
+                task.screenshot.assert_called_once_with(screenshot_name)
+                self.assertEqual(char.fill_concerto.call_count, len(fills))
+                self.assertEqual(char.click_liberation.call_count, int(fills[0]))
+                char.switch_next_char.assert_not_called()
+                self.assertIsNone(task._active_char_rotation)
+                self.assertFalse(self.core._held)
+                self.assertEqual(self.native.inserted[before:],
+                                 [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+                self.window.bring_to_front.assert_not_called()
+
+    def test_Lily协奏阶段取消或输入失败保持原异常并清理轮转(self):
+        for stage in ('首次补能', '二次补能', '交接复核'):
+            for error in (TaskDisabledException(), ForegroundInputError(), ForegroundInputInterrupted()):
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    task, char = self._make_lily_rotation()
+                    task.screenshot = Mock()
+                    if stage == '首次补能':
+                        char.fill_concerto.side_effect = error
+                    elif stage == '二次补能':
+                        char.click_liberation.return_value = False
+                        char.fill_concerto.side_effect = [True, error]
+                    else:
+                        task.is_con_full.side_effect = error
+                    before = len(self.native.inserted)
+                    with patch.object(task, 'mouse_up', wraps=task.mouse_up) as release:
+                        with self.assertRaises(type(error)):
+                            char.perform()
+                        release.assert_called_once()
+                    task.screenshot.assert_not_called()
+                    char.switch_next_char.assert_not_called()
+                    self.assertIsNone(task._active_char_rotation)
+                    self.assertFalse(self.core._held)
+                    self.assertEqual(self.native.inserted[before:],
+                                     [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+                    self.window.bring_to_front.assert_not_called()
+
+    def test_Lily重击开始或收尾超时停止轮转并释放鼠标(self):
+        for started in (False, True):
+            for lose_focus_during_screenshot in (False, True):
+                with self.subTest(started=started, lose_focus_during_screenshot=lose_focus_during_screenshot):
+                    task, char = self._make_lily_rotation()
+                    original_screenshot = task.screenshot
+
+                    def screenshot(name):
+                        if lose_focus_during_screenshot:
+                            self._schedule_focus_loss()
+                            self.native.foreground = 20
+                        return original_screenshot(name)
+
+                    task.screenshot = Mock(side_effect=screenshot)
+                    char.HEAVY_START_TIMEOUT = 0.2
+                    char.HEAVY_TIMEOUT = 0.2
+                    char.heavy_in_progress = Mock(return_value=started)
+                    before = len(self.native.inserted)
+                    with patch.object(task, 'mouse_up', wraps=task.mouse_up) as release, \
+                            patch.object(task, 'wait_until', wraps=task.wait_until) as waits:
+                        with self.assertRaisesRegex(TimeoutError, '重击开始或收尾'):
+                            char.perform()
+                        release.assert_called_once()
+                        self.assertEqual(waits.call_count, 2 if started else 1)
+                    task.screenshot.assert_called_once_with('莉莉重击结果无法确认')
+                    char.fill_concerto.assert_not_called()
+                    char.click_liberation.assert_not_called()
+                    char.switch_next_char.assert_not_called()
+                    self.assertIsNone(task._active_char_rotation)
+                    self.assertFalse(self.core._held)
+                    self.assertEqual(self.native.inserted[before:],
+                                     [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+                    self.window.bring_to_front.assert_not_called()
+
+    def test_深塔介绍关闭等待内恢复仍要求新帧结果(self):
+        task = self._make_combat_task()
+        task.ocr = Mock(return_value=[Box(10, 3, 3, 2, name='战斗特色')])
+        task.screenshot = Mock()
+        original_click = task.click
+
+        def click(*args, **kwargs):
+            result = original_click(*args, **kwargs)
+            if args[0] == 0.942:
+                self._schedule_focus_loss()
+            return result
+
+        with patch.object(task, 'click', side_effect=click) as close:
+            with self.assertRaisesRegex(RuntimeError, '关闭结果无法确认'):
+                task.dismiss_abyss_character_info(time_out=0.4)
+            # 相对坐标会再次调用像素 click；外层意图和实际原生事件分别证明没有重复发送。
+            self.assertEqual([call.args for call in close.call_args_list if call.args[0] == 0.942],
+                             [(0.942, 0.058)])
+        self.assertGreater(task._foreground_epoch, 0)
+        self.assertFalse(self.core._held)
+        self.assertEqual(self.native.inserted, [InputEvent('mouse', 1), InputEvent('mouse', 1, up=True)])
+        self.window.bring_to_front.assert_not_called()
+
+    def test_深塔已发送重挑战恢复后只点新编队确认(self):
+        task = self._make_combat_task()
+        retry = Box(10, 10, 3, 2, name='重新挑战')
+        confirm = Box(20, 10, 3, 2, name='确认')
+        page = 'rechallenge'
+
+        def ocr(*args, match, **kwargs):
+            control = retry if page == 'rechallenge' else confirm if page == 'confirm' else None
+            return [control] if control and match.search(control.name) else []
+
+        task.ocr = Mock(side_effect=ocr)
+        task.find_abyss_start_marker = Mock(side_effect=lambda: retry if page == 'arena' else None)
+        task.find_f_with_text = Mock(side_effect=lambda: confirm if page == 'arena' else None)
+        task.load_chars = Mock(return_value=True)
+        original_click = task.click
+
+        def click(*args, **kwargs):
+            nonlocal page
+            result = original_click(*args, **kwargs)
+            if args[0] is retry:
+                page = 'confirm'
+                self._schedule_focus_loss()
+            elif args[0] is confirm:
+                page = 'arena'
+            return result
+
+        with patch.object(task, 'click', side_effect=click) as clicks, \
+                patch.object(task, 'send_key', wraps=task.send_key) as keys:
+            self.assertTrue(task.restart_combat_in_abyss())
+            self.assertEqual([call.args[0] for call in clicks.call_args_list
+                              if call.args[0] is retry or call.args[0] is confirm], [retry, confirm])
+            keys.assert_called_once_with('f')
+        self.assertGreater(task._foreground_epoch, 0)
+        self.assertFalse(self.core._held)
+        self.assertEqual([event.kind for event in self.native.inserted if not event.up],
+                         ['mouse', 'mouse', 'keyboard'])
+        self.window.bring_to_front.assert_not_called()
 
     def test_薄适配强制移动并保留捕获裁剪负坐标(self):
         self.task.click(20, 30, move=False, after_sleep=0)
@@ -1453,6 +1734,52 @@ class TestMcpForegroundPreparation(InputFixture):
         finally:
             self.finish_threads(worker)
         self.assertFalse(self.native.inserted)
+
+
+class TestRunnerIsolation(unittest.TestCase):
+    def test_隔离入口保留失败码并拒绝后台异常(self):
+        project_root = Path(__file__).resolve().parents[1]
+        source = '''import os
+import threading
+import unittest
+
+
+class RunnerProbe(unittest.TestCase):
+    def test_result(self):
+        mode = os.environ['NONO_RUNNER_PROBE_CASE']
+        if mode == 'assertion':
+            self.fail('预期的主线程断言失败')
+        if mode in ('thread', 'late_thread'):
+            def worker():
+                if mode == 'late_thread':
+                    threading.main_thread().join()
+                raise RuntimeError('预期的后台线程异常')
+            thread = threading.Thread(target=worker)
+            thread.start()
+            if mode == 'thread':
+                thread.join()
+'''
+        with tempfile.TemporaryDirectory(prefix='NoNo-入口回归-') as directory:
+            (Path(directory) / 'isolated_runner_probe.py').write_text(source, encoding='utf-8')
+            environment = os.environ.copy()
+            environment['PYTHONPATH'] = directory
+            environment['QT_QPA_PLATFORM'] = 'offscreen'
+            for mode, expected in (('normal', 0), ('assertion', 1), ('thread', 1), ('late_thread', 1)):
+                with self.subTest(mode=mode):
+                    environment['NONO_RUNNER_PROBE_CASE'] = mode
+                    result = subprocess.run(
+                        [sys.executable, '-X', 'utf8', '-B', '-u',
+                         str(project_root / 'run_test.py'), 'isolated_runner_probe'],
+                        cwd=project_root, env=environment, capture_output=True,
+                        text=True, encoding='utf-8', timeout=30,
+                    )
+                    output = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, expected, output)
+                    self.assertIn('Ran 1 test', output)
+                    if mode in ('thread', 'late_thread'):
+                        # 主线程用例仍成功，失败必须来自实际后台异常及完整子进程收尾。
+                        self.assertIn('\nOK\n', output)
+                        self.assertIn('Exception in thread', output)
 
 
 if __name__ == '__main__':

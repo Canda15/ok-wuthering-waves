@@ -1,88 +1,112 @@
-name: Build launcher
-
-# 启动器（NoNo.exe）是 Tauri 编出来的 Rust 程序，PE 版本信息里写着它的产品名。
-# 上游发布的那份写的是 ok-ww，所以由我们自己用 pyappify 编一次，把名字写进去。
-#
-# 产出挂在一个固定 tag 的 release 上（目前是 launcher-1），build.yml 的
-# BASE_EXE_URL 就钉在那个地址：便携包不再自己编启动器，只下载它。
-# 需要重建时手动触发本工作流；如果换了 tag（launcher-2），记得同步改 BASE_EXE_URL。
-
+name: 构建 NoNo 启动器
+run-name: NoNo 1.2.7 启动器 · ${{ github.sha }}
 on:
   workflow_dispatch:
-
+    inputs:
+      publish:
+        description: 核验后发布新的 launcher-2；默认仅上传审阅工件。
+        type: boolean
+        default: false
 permissions:
-  contents: write
-
-env:
-  LAUNCHER_TAG: launcher-1
-  # 钉住 pyappify 版本：启动器是发布产物的地基，不能跟着上游 master 漂移。
-  PYAPPIFY_VERSION: v1.2.4
-
+  contents: read
 jobs:
   launcher:
-    name: 1 · Build launcher
+    name: 编译与审阅工件
     runs-on: windows-latest
-
+    timeout-minutes: 60
     steps:
-      - name: Configure runner
+      - name: 配置换行与路径
         shell: pwsh
         run: |
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
           git config --global core.autocrlf false
           git config --global core.eol lf
-
-      - name: Check out source
+          git config --global core.longpaths true
+      - name: 检出本次源码
         uses: actions/checkout@v4
         with:
+          lfs: true
           persist-credentials: false
-
-      - name: Build the launcher executable
-        id: build
-        uses: ok-oldking/pyappify-action@master
+      - name: 准备 Python
+        uses: actions/setup-python@v5
         with:
-          version: ${{ env.PYAPPIFY_VERSION }}
-          # 只编 exe：离线安装包已经从产物里去掉，NSIS 那几分钟纯属浪费。
-          build_exe_only: true
-
-      - name: Verify the executable carries our name
+          python-version: '3.12'
+      - name: 构建并验证新版启动器
+        id: launcher
+        uses: ./.github/actions/build-nono-launcher
+      - name: 生成启动器工件和校验文件
         shell: pwsh
         run: |
-          $exe = '${{ steps.build.outputs.exe-path }}'
-          if (-not (Test-Path $exe)) { throw "没有找到启动器产物: $exe" }
-          $info = (Get-Item $exe).VersionInfo
-          "FileDescription : $($info.FileDescription)"
-          "ProductName     : $($info.ProductName)"
-          "CompanyName     : $($info.CompanyName)"
-          "FileVersion     : $($info.FileVersion)"
-          "OriginalFilename: $($info.OriginalFilename)"
-          # 这条检查就是本工作流存在的理由：名字必须真的写进 PE,而不是只在文件名上。
-          foreach ($field in @('FileDescription', 'ProductName', 'CompanyName', 'OriginalFilename')) {
-            if ("$($info.$field)" -match 'ok-ww|ok-script') {
-              throw "PE 元数据 $field 仍是上游名字: $($info.$field)"
-            }
-          }
-
-          # 便携包那边按 <解压目录>/<exe> 的结构取用,所以这里也打成同构的 zip。
-          New-Item -ItemType Directory -Force -Path 'launcher\NoNo' | Out-Null
-          Copy-Item $exe 'launcher\NoNo\NoNo.exe'
-          Compress-Archive -Path 'launcher\NoNo' -DestinationPath 'NoNo-win32.zip' -Force
-          $hash = (Get-FileHash 'NoNo-win32.zip' -Algorithm SHA256).Hash.ToLower()
-          "$hash  NoNo-win32.zip" | Set-Content -Encoding ascii 'NoNo-win32-sha256.txt'
-          "launcher 大小: {0:N2} MB" -f ((Get-Item 'NoNo-win32.zip').Length / 1MB)
-
-      - name: Publish the launcher
+          New-Item -ItemType Directory -Path 'build/launcher-release/NoNo' -Force | Out-Null
+          Copy-Item -LiteralPath 'build/launcher-dist/NoNo.exe' -Destination 'build/launcher-release/NoNo/NoNo.exe'
+          Compress-Archive -LiteralPath 'build/launcher-release/NoNo' -DestinationPath 'build/launcher-dist/NoNo-win32.zip' -Force
+          $hash = (Get-FileHash -LiteralPath 'build/launcher-dist/NoNo-win32.zip' -Algorithm SHA256).Hash.ToLower()
+          $checksumText = $hash + '  NoNo-win32.zip' + [char]10
+          [IO.File]::WriteAllText([IO.Path]::GetFullPath('build/launcher-dist/NoNo-win32-sha256.txt'), $checksumText, [Text.Encoding]::ASCII)
+      - name: 上传可审阅启动器工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoNo-launcher-1.2.7-${{ github.sha }}
+          path: |
+            build/launcher-dist/NoNo-win32.zip
+            build/launcher-dist/NoNo-win32-sha256.txt
+            build/launcher-dist/launcher-build.json
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    name: 发布新固定启动器
+    needs: launcher
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nono-fixed-launcher-2
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: 下载已核验工件
+        uses: actions/download-artifact@v4
+        with:
+          name: NoNo-launcher-1.2.7-${{ github.sha }}
+          path: launcher-release
+      - name: 拒绝覆盖已有固定标签
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          for endpoint in ('git/ref/tags/launcher-2', 'releases/tags/launcher-2'):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['REPOSITORY']}/{endpoint}",
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      continue
+                  raise SystemExit('固定标签查询失败，禁止继续发布。') from None
+              raise SystemExit('launcher-2 已存在，禁止覆盖或移动固定标签。')
+          PY
+      - name: 发布新的固定工件
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.LAUNCHER_TAG }}
-          name: Launcher
-          # 不能设为 latest:否则 /releases/latest 会解析到启动器,而不是应用版本。
+          tag_name: launcher-2
+          target_commitish: ${{ github.sha }}
+          name: NoNo 1.2.7 启动器
           make_latest: 'false'
           fail_on_unmatched_files: true
           body: |
-            NoNo 的启动器（由 pyappify ${{ env.PYAPPIFY_VERSION }} + 本仓库的 `pyappify.yml` 编译）。
-
-            `build.yml` 的 `BASE_EXE_URL` 指向这里：便携包不自带编译步骤，启动器从本 release 下载。
-            **不要删除本 release 的 `NoNo-win32.zip`**，删了下次发版会在下载启动器这一步 404。
+            固定官方 v1.2.7 源码、NoNo 接收协议与品牌编译的启动器。
+            源码、统一差异、PE、图标和 UAC 证明见 launcher-build.json。
+            此资源供完整便携打包器使用；用户升级请下载完整 NoNo-win32-portable.zip。
+            保留旧 launcher-1，不覆盖旧版本。
           files: |
-            NoNo-win32.zip
-            NoNo-win32-sha256.txt
+            launcher-release/NoNo-win32.zip
+            launcher-release/NoNo-win32-sha256.txt
+            launcher-release/launcher-build.json

@@ -1,9 +1,8 @@
-import os
 import sys
 import threading
 import traceback
 
-from ok.util.file import get_relative_path
+from ok.util.file import ensure_dir_for_file, get_user_data_path
 
 
 def get_thread_name(thread_id):
@@ -23,8 +22,9 @@ def dump_threads():
         thread_dumps.append(thread_dump)
 
     # Write the thread dumps to a file
-    output_file = get_relative_path(os.path.join('logs', "thread_dumps.txt"))
-    print(f'Dumping threads to {output_file}')
+    output_file = get_user_data_path('logs', 'thread_dumps.txt')
+    ensure_dir_for_file(output_file)
+    print('正在保存线程诊断')
 
     with open(output_file, "w", encoding='utf-8') as f:
         f.write("\n\n".join(thread_dumps))

@@ -12,6 +12,7 @@ from ok.ui.qt.util.touch_scroll import enable_touch_scrolling
 
 from ok import Config, og
 from ok.core.template_store import CocoTemplateStore, filename_key
+from ok.core.script_packager import get_ok_tasks_folder
 from ok.ui.qt.kit.buttons import Button
 from ok.ui.qt.kit.dialogs import Dialog, confirm
 from ok.ui.qt.kit.feedback import ProgressRing, show_toast
@@ -73,7 +74,7 @@ class ImageItem(TypedDict):
 
 
 def ensure_template_folder():
-    return str(CocoTemplateStore(os.path.join(os.getcwd(), TEMPLATE_FOLDER)).folder)
+    return str(CocoTemplateStore(TEMPLATE_FOLDER).folder)
 
 
 def get_coco_path():
@@ -86,16 +87,16 @@ def _filename_key(file_name):
 
 
 def load_coco() -> CocoData:
-    return CocoTemplateStore(os.path.join(os.getcwd(), TEMPLATE_FOLDER)).load()
+    return CocoTemplateStore(TEMPLATE_FOLDER).load()
 
 
 def save_coco(coco_data):
-    CocoTemplateStore(os.path.join(os.getcwd(), TEMPLATE_FOLDER)).save(coco_data)
+    CocoTemplateStore(TEMPLATE_FOLDER).save(coco_data)
 
 
 def get_image_files():
     """Get all image files sorted by creation time descending."""
-    store = CocoTemplateStore(os.path.join(os.getcwd(), TEMPLATE_FOLDER))
+    store = CocoTemplateStore(TEMPLATE_FOLDER)
     return [str(item['path']) for item in store.list_images()]
 
 
@@ -1036,7 +1037,7 @@ class TemplateTab(QWidget):
         if not accepted:
             return
 
-        target_folder = os.path.abspath(os.path.join('ok_tasks', 'assets') if to_tasks else 'assets')
+        target_folder = os.path.join(get_ok_tasks_folder(), 'assets') if to_tasks else os.path.abspath('assets')
         if split:
             target_folder = os.path.join(target_folder, 'templates')
         self.template_tab_config['generate_label_enum'] = generate_label_enum

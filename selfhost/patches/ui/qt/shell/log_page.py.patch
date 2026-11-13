@@ -1,0 +1,19 @@
+--- a/ui/qt/shell/log_page.py
++++ b/ui/qt/shell/log_page.py
+@@ -22,6 +22,7 @@
+ from ok.ui.qt.kit.labels import Label
+ from ok.ui.qt.kit.theme import theme
+ from ok.util.config import Config
++from ok.util.file import get_user_data_path
+ 
+ LOG_LINE_PATTERN = re.compile(
+     r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3}\s+"
+@@ -131,7 +132,7 @@
+         super().__init__(parent)
+         self.setObjectName("LogPage")
+         self.config = Config("log_window", {"level": "ALL", "filter_text": ""})
+-        self.log_file = Path(log_file or Path.cwd() / "logs" / "ok-script.log")
++        self.log_file = Path(log_file or get_user_data_path('logs', 'ok-script.log'))
+         self.buffer = LogBuffer(MAX_LINES)
+         self._position = 0
+         self._file_id = None

@@ -52,9 +52,9 @@ def run_in_new_thread(func):
 
 def _write_shutdown_thread_dump():
     """Persist all live Python stacks without depending on logging shutdown."""
-    from ok.util.file import ensure_dir_for_file, get_relative_path
+    from ok.util.file import ensure_dir_for_file, get_user_data_path
 
-    output_file = get_relative_path(os.path.join('logs', 'shutdown_thread_dumps.txt'))
+    output_file = get_user_data_path('logs', 'shutdown_thread_dumps.txt')
     ensure_dir_for_file(output_file)
     threads = {thread.ident: thread for thread in threading.enumerate()}
     dumps = []

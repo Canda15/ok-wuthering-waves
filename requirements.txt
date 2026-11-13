@@ -84,7 +84,7 @@ psutil==7.2.2
     # via
     #   ok-script
     #   pycaw
-pyappify[standalone]==1.0.19
+pyappify[standalone]==1.0.20
     # via
     #   ok-script
     #   ok-ww (pyproject.toml)

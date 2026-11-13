@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from ok.util.handler import Handler, ExitEvent
 from ok.util.logger import Logger
-from ok.util.file import get_path_relative_to_exe
+from ok.util.file import get_path_relative_to_exe, get_user_data_path
 from ok.core.ui_config import resolve_gui_icon, resolve_ui_config, resolve_window_size
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
@@ -712,14 +712,14 @@ class OK:
         if pyappify.app_profile:
             config['profile'] = pyappify.app_profile
         og.config = config
-        config["config_folder"] = config.get("config_folder") or 'configs'
+        config['config_folder'] = config.get('config_folder') or get_user_data_path('configs')
         Config.config_folder = config["config_folder"]
         config['debug'] = config.get("debug", False)
         self.debug = config['debug']
         config_logger_fn(self.config)
         from ok.core.plugin_staging import apply_pending_plugin_changes
         self.plugin_change_results = apply_pending_plugin_changes()
-        logger.info(f"ok-script init {config.get('version')}, {sys.argv}, pid={os.getpid()} config: {config}")
+        logger.info(f'框架已初始化，进程：{os.getpid()}，配置字段数：{len(config)}')
         if self.debug:
             logger.debug(f"environment contains {len(os.environ)} entries")
         # pyappify logs printf-style (log.info("%s", value)), which ok's Logger does not accept.

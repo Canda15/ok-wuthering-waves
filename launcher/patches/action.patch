@@ -1,0 +1,93 @@
+--- a/index.js
++++ b/index.js
+@@ -189,7 +189,12 @@
+ async function run() {
+     try {
+         const useRelease = core.getInput('use_release');
++        const nonoSourceHook = core.getInput('nono_source_hook');
++        if (!nonoSourceHook || useRelease) {
++            throw new Error('NoNo 构建需要显式源码 hook，不能下载现成 EXE。');
++        }
+         const buildExeOnly = core.getBooleanInput('build_exe_only');
++        if (!buildExeOnly) throw new Error('NoNo 适配仅支持完整便携打包器使用的 EXE 构建。');
+         const buildSetup = core.getBooleanInput('build_setup');
+         const addVersionName = core.getBooleanInput('add_version_name');
+         const packageZip = core.getBooleanInput('package_zip');
+@@ -232,8 +237,9 @@
+         const exeSourcePath = path.join(buildDir, 'src-tauri', 'target', 'release', mainBinaryFileName);
+ 
+         let pyappifyVersion = core.getInput('version');
+-
+-
++        if (fs.existsSync(buildDir) || fs.existsSync(exeSourcePath)) {
++            throw new Error('NoNo 构建目录必须全新，不能跳过源码适配和编译。');
++        }
+         if (!fs.existsSync(exeSourcePath)) {
+             core.startGroup('Cloning pyappify repository');
+             await exec.exec('git', ['clone', 'https://github.com/ok-oldking/pyappify.git', buildDir]);
+@@ -255,6 +261,10 @@
+             }
+             core.endGroup();
+ 
++            const nonoPython = process.env.NONO_BUILD_PYTHON;
++            if (!nonoPython) throw new Error('NoNo 构建缺少已核验 Python。');
++            await exec.exec(nonoPython, [nonoSourceHook, '--rust-root', buildDir]);
++
+             await setupPnpm();
+             await setupRust();
+ 
+@@ -289,12 +299,12 @@
+             }
+             core.endGroup();
+             core.startGroup('Building application with Cargo');
+-            await exec.exec('pnpm', ['install'], { cwd: buildDir });
++            await exec.exec('pnpm', ['install', '--frozen-lockfile'], { cwd: buildDir });
+             if (useRelease) {
+                 await downloadAndExtractRelease(useRelease, appName, platform, exeDestPath, exeSourcePath);
+                 core.endGroup();
+             } else {
+-                await exec.exec('pnpm', ['tauri', 'build', '--no-bundle'], { cwd: buildDir });
++                await exec.exec('pnpm', ['tauri', 'build', '--no-bundle', '--', '--locked'], { cwd: buildDir });
+                 core.endGroup();
+             }
+         }
+--- a/action.yml
++++ b/action.yml
+@@ -3,6 +3,9 @@
+ author: ok-oldking
+ 
+ inputs:
++  nono_source_hook:
++    description: '固定源码检出后、品牌处理前执行的 NoNo 适配脚本。'
++    required: true
+   app_version:
+     description: Exact application tag to prepare before installing dependencies. Defaults to the workflow tag on tag builds, or latest stable otherwise. Requires PyAppify v1.2.4 or newer.
+     required: false
+--- a/README.md
++++ b/README.md
+@@ -195,3 +195,11 @@
+ ## License
+ 
+ See [LICENSE.txt](LICENSE.txt).
++
++
++## NoNo 固定源码构建
++
++本仓库适配版增加必填输入 nono_source_hook，指向 NoNo 的固定源码适配脚本。
++它在官方版本检出后、品牌处理前执行，并校验完整提交与差异摘要。
++构建必须使用新目录和 build_exe_only，不允许 use_release 或已有 EXE 快捷路径。
++修改 index.js 后必须以固定 lockfile 重建 dist/index.js，再使用本地 Action。
+--- a/skills/pyappify-setup/SKILL.md
++++ b/skills/pyappify-setup/SKILL.md
+@@ -218,3 +218,11 @@
+    before the workflow existed and will not trigger a build).
+ 
+ Do not commit, tag or push unless the user asks you to.
++
++
++## NoNo 固定源码构建
++
++本仓库适配版增加必填输入 nono_source_hook，指向 NoNo 的固定源码适配脚本。
++它在官方版本检出后、品牌处理前执行，并校验完整提交与差异摘要。
++构建必须使用新目录和 build_exe_only，不允许 use_release 或已有 EXE 快捷路径。
++修改 index.js 后必须以固定 lockfile 重建 dist/index.js，再使用本地 Action。

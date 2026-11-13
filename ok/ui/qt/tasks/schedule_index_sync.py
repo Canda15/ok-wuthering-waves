@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ok.util.logger import Logger
+from ok.util.file import get_user_data_path, write_json_file
 
 logger = Logger.get_logger(__name__)
 
@@ -82,7 +83,7 @@ def _cache_file() -> Optional[Path]:
         from ok import og
 
         config = getattr(og, "config", None) or {}
-        config_folder = config.get("config_folder", "configs")
+        config_folder = get_user_data_path(config.get('config_folder') or 'configs')
         return Path(config_folder) / "schedule_tasks_cache.json"
     except Exception:
         logger.exception("schedule index sync: failed to resolve cache file")
@@ -483,9 +484,8 @@ def _rewrite_current_process_argv(argv_target_map: Dict[str, str]):
 
 def _write_cache(cache_file: Path, data: dict):
     """写回缓存（仅在有变更时调用）。"""
-    with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.info(f"schedule index sync: cache written to {cache_file}")
+    write_json_file(cache_file, data)
+    logger.info('计划任务索引缓存已保存')
 
 
 def resolve_current_schedule_task():

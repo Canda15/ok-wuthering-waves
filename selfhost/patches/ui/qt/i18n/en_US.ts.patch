@@ -1,21 +1,6 @@
 --- a/ui/qt/i18n/en_US.ts
 +++ b/ui/qt/i18n/en_US.ts
-@@ -1259,6 +1259,14 @@
-     <context>
-         <name>app</name>
-         <message>
-+            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
-+            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
-+        </message>
-+        <message>
-+            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
-+            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
-+        </message>
-+        <message>
-             <source>Diagnosis</source>
-             <translation>Diagnosis</translation>
-         </message>
-@@ -1767,14 +1775,6 @@
+@@ -1767,14 +1767,6 @@
              <translation>Requires the local QQ or WeChat client window to be open and running</translation>
          </message>
          <message>
@@ -30,7 +15,24 @@
              <source>SMTP Notification</source>
              <translation>SMTP Notification</translation>
          </message>
-@@ -3343,20 +3343,12 @@
+@@ -2022,7 +2014,15 @@
+             <source>Created or updated shortcuts: {paths}</source>
+             <translation>Created or updated shortcuts: {paths}</translation>
+         </message>
+-    </context>
++    <message>
++            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
++            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
++        </message>
++        <message>
++            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
++            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
++        </message>
++        </context>
+     <context>
+         <name>ScheduleTaskTable</name>
+         <message>
+@@ -3343,22 +3343,6 @@
      <context>
          <name>SelectInteractionListView</name>
          <message>
@@ -48,16 +50,12 @@
 -        <message>
 -            <source>Genshin</source>
 -            <translation>Genshin - Background Support for Some Unity Game</translation>
-+            <source>前台系统键鼠</source>
-+            <translation>前台系统键鼠</translation>
-+        </message>
-+        <message>
-+            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
-+            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
-         </message>
-         <message>
+-        </message>
+-        <message>
              <source>ADBInteraction</source>
-@@ -3370,10 +3362,6 @@
+             <translation>ADBInteraction - Background</translation>
+         </message>
+@@ -3370,11 +3354,15 @@
              <source>Default Interaction</source>
              <translation>Default Interaction</translation>
          </message>
@@ -65,6 +63,16 @@
 -            <source>WindowsInteraction</source>
 -            <translation>WindowsInteraction</translation>
 -        </message>
-     </context>
+-    </context>
++    <message>
++            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
++            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
++        </message>
++        <message>
++            <source>前台系统键鼠</source>
++            <translation>前台系统键鼠</translation>
++        </message>
++        </context>
      <context>
          <name>ImportWarningDialog</name>
+         <message>

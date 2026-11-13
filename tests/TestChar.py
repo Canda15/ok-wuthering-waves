@@ -12,6 +12,7 @@ from src.char.Chisa import Chisa
 from src.char.Ciaccona import Ciaccona
 from src.char.Denia import Denia
 from src.char.Iuno import Iuno
+from src.char.Hiyuki import Hiyuki
 from src.char.Lingyang import Lingyang
 from src.char.Linnai import Linnai
 from src.char.Lucilla import Lucilla
@@ -643,35 +644,41 @@ class TestChar(TaskTestCase):
 
     def test_factory_normalizes_alternate_template_to_canonical_name(self):
         class FoundChar:
-            name = Labels.char_linnai2
             confidence = 0.99
+
+            def __init__(self, name):
+                self.name = name
 
         class Task:
             debug = False
 
-            def __init__(self):
+            def __init__(self, template):
                 self.searches = []
+                self.template = template
 
             def find_best_match_in_box(self, box, names, threshold=0.6):
                 self.searches.append(tuple(names))
-                return FoundChar()
+                return FoundChar(self.template)
 
             def log_info(self, *args, **kwargs):
                 pass
 
-        task = Task()
-        char = get_char_by_pos(task, None, 0, None)
-
-        self.assertIsInstance(char, Linnai)
-        self.assertEqual(char.char_name, Labels.char_linnai)
-
-        char = get_char_by_pos(task, None, 0, char)
-
-        self.assertEqual(char.char_name, Labels.char_linnai)
-        self.assertEqual(
-            task.searches[-1],
-            (Labels.char_linnai, Labels.char_linnai2),
-        )
+        for canonical, alternate, cls in (
+            (Labels.char_linnai, Labels.char_linnai2, Linnai),
+            (Labels.char_hiyuki, Labels.char_hiyuki2, Hiyuki),
+        ):
+            with self.subTest(alternate=alternate):
+                task = Task(alternate)
+                char = get_char_by_pos(task, None, 0, None)
+                self.assertIsInstance(char, cls)
+                self.assertEqual(char.char_name, canonical)
+                char.has_intro = True
+                old_char = char
+                char = get_char_by_pos(task, None, 0, old_char)
+                self.assertIs(char, old_char)
+                self.assertTrue(char.has_intro)
+                self.assertEqual(char.char_name, canonical)
+                self.assertEqual(task.searches[-1], (canonical, alternate))
 
     def test_auto_combat_warms_char_features_only_once(self):
         task = AutoCombatTask.__new__(AutoCombatTask)
@@ -2163,8 +2170,6 @@ class TestChar(TaskTestCase):
         self.assertEqual(self.task.chars[0].name, 'Luhesi')
 
         has_cd = self.task.chars[0].has_cd('liberation')
-        time.sleep(1)
-        self.task.screenshot('click_liberation', show_box=True)
         self.assertTrue(has_cd)
 
 

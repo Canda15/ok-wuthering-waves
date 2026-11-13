@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "rust_version": "v1.2.7",
+  "rust_commit": "31cd261eb8360ba2cf9ac63ec59fa5ef253cca2a",
+  "action_commit": "6dcb02954bb5fab5b83e95f1af243078213ec1ab",
+  "rust_files": {
+    "src-tauri/src/app.rs": {
+      "before_sha256": "af6ea288759512f144b67f2d74541828d40dc946390c12bb56aff61dbae4290d",
+      "after_sha256": "ecba84412eba75fda408f1a1bdae57219194d6bb56afdd28de23417fd53256de"
+    },
+    "src-tauri/src/app_service.rs": {
+      "before_sha256": "972772d35866d4d50c65359f8fe45d082bdccf4068d369d079c4a361ad4fdb90",
+      "after_sha256": "3250b30889159f924803ded4935fb68fe7106ad9e3abd645932367b7a44aa7a0"
+    },
+    "src-tauri/src/config_manager.rs": {
+      "before_sha256": "22b09617f55ca26bbb69a8ac6bb4113e62fe5bfc07a28eb541fca06b2b01ef6e",
+      "after_sha256": "6b0635cd434ab5d675df575a16e29e1174d61979402c1a19fa7504cfc8eacfd1"
+    },
+    "src-tauri/src/execute_python.rs": {
+      "before_sha256": "9ec4281b20efa652b25cd570feff92791a5cd59d7b47b5494f09632854a6a471",
+      "after_sha256": "26c07665ca7d485979dcd27d7d7a92fd187e256492570b62544f75c3d3cdbe67"
+    },
+    "src-tauri/src/lib.rs": {
+      "before_sha256": "055b02684388fcc49e7ab4d0c6b560de4325b1035d575715ca2c9e73bb98fc6d",
+      "after_sha256": "8c926a2c8cdb51ac6b72564da14485eb5c70586b9cebec8a91def1e385612bba"
+    },
+    "src-tauri/Cargo.toml": {
+      "before_sha256": "3a1b4fb7cd98884560e0a1acea3fed33116cde83a34e792d85c4370ffca19f3f",
+      "after_sha256": "16455d628c9612046a247f0b4c6c2bc6558ec589c4bd652e4c17af4520c43a7b"
+    },
+    "src-tauri/Cargo.lock": {
+      "before_sha256": "984622cfb2e36772011f8beecdaddcf1c36e3296be096ca2d4e32ab10a75dbda",
+      "after_sha256": "0663c7354159b6cc4fa5bd6ccfcf7059055454995c8da5c54e56eadf288d9c85"
+    }
+  },
+  "action_files": {
+    "index.js": {
+      "before_sha256": "6da2a6b7645c81cb308db99fa2a71faadfb578d4ed9bef7bc333d7bb9d394730",
+      "after_sha256": "79bfd3d795024b75d69e300d3101b304768b2e07327c2d43346cc69fd189232d"
+    },
+    "action.yml": {
+      "before_sha256": "1325d6def3351f8b792f364773a3a5b1c5cfc1ec57021072ab40e4e0656ee7b3",
+      "after_sha256": "e5edec89a9d88c0a501310654420207d34c16a3d3dc387f2571cec8f40a362aa"
+    },
+    "README.md": {
+      "before_sha256": "a151fb58c15e089e9d44dd112017ecc136fab56ab9841499115e8d30ab2b4fce",
+      "after_sha256": "17f9172e741eea363b1e5145b56bd4b2709685e770603f4f1facfe399ecde342"
+    },
+    "skills/pyappify-setup/SKILL.md": {
+      "before_sha256": "dec75a5be6f1f56986616ccb3bb2a3e4b6ecc583c6ab13a270d75d849944980d",
+      "after_sha256": "3db02b894c8e413d315a9008a7181c0fcbc89eae1245e8002dfa9f2332a6c4ca"
+    }
+  }
+}

@@ -1,0 +1,48 @@
+name: 构建新版 NoNo 启动器
+description: 固定官方源码、应用 NoNo 适配并验证实际 PE 工件。
+outputs:
+  exe-path:
+    description: 已验证的 NoNo 启动器 EXE。
+    value: ${{ steps.verify.outputs.exe-path }}
+  proof-path:
+    description: 源码、PE、图标和 UAC 身份清单。
+    value: ${{ steps.verify.outputs.proof-path }}
+runs:
+  using: composite
+  steps:
+    - name: 固定 Action 与重建实际入口
+      id: prepare
+      shell: pwsh
+      run: .\scripts\build_launcher.ps1 -PrepareActionOnly
+    - name: 准备专属编译临时目录
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path 'build/launcher-action-temp','build/launcher-compiler-temp' -Force | Out-Null
+    - name: 从固定 v1.2.7 编译
+      id: native
+      uses: ./build/nono-launcher-action
+      env:
+        NONO_BUILD_PYTHON: ${{ steps.prepare.outputs.python-path }}
+        RUNNER_TEMP: ${{ github.workspace }}/build/launcher-action-temp
+        TMP: ${{ github.workspace }}/build/launcher-compiler-temp
+        TEMP: ${{ github.workspace }}/build/launcher-compiler-temp
+      with:
+        version: v1.2.7
+        build_exe_only: true
+        build_setup: false
+        package_zip: false
+        nono_source_hook: ${{ github.workspace }}/launcher/apply.py
+    - name: 核验源码、版本、品牌、图标和 UAC
+      id: verify
+      shell: pwsh
+      env:
+        EXE_PATH: ${{ steps.native.outputs.exe-path }}
+        BUILD_PYTHON: ${{ steps.prepare.outputs.python-path }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Path 'build/launcher-dist' -Force | Out-Null
+        Copy-Item -LiteralPath $env:EXE_PATH -Destination 'build/launcher-dist/NoNo.exe'
+        & $env:BUILD_PYTHON -B launcher/verify.py --exe build/launcher-dist/NoNo.exe --output build/launcher-dist/launcher-build.json
+        if ($LASTEXITCODE -ne 0) { throw '新版启动器身份核验失败。' }
+        "exe-path=$([IO.Path]::GetFullPath('build/launcher-dist/NoNo.exe'))" >> $env:GITHUB_OUTPUT
+        "proof-path=$([IO.Path]::GetFullPath('build/launcher-dist/launcher-build.json'))" >> $env:GITHUB_OUTPUT

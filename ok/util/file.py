@@ -5,25 +5,48 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 
-def read_json_file(file_path) -> dict | None:
-    if not os.path.exists(file_path):
-        return None
+def _reject_nonfinite_json(value):
+    # Python 默认接受非标准数值；用户配置须与启动器的严格 JSON 读取保持一致。
+    raise ValueError('配置 JSON 无效（CONFIG_JSON_INVALID）')
 
+
+def read_json_file(file_path, *, strict=False) -> dict | None:
+    """严格模式用于用户配置：只有文件不存在才能回退默认值。"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data
-    except json.JSONDecodeError:
+            data = json.load(f, parse_constant=_reject_nonfinite_json if strict else None)
+    except FileNotFoundError:
         return None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        if strict:
+            raise ValueError('配置 JSON 无效（CONFIG_JSON_INVALID）') from None
+        return None
+    if strict and not isinstance(data, dict):
+        raise ValueError('配置 JSON 必须是对象（CONFIG_JSON_OBJECT_REQUIRED）')
+    return data
 
 
 def write_json_file(file_path, data):
-    ensure_dir_for_file(file_path)
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    """在同目录完整写入后替换，序列化或落盘失败时保留原文件。"""
+    destination = os.path.abspath(os.fspath(file_path))
+    ensure_dir_for_file(destination)
+    handle, temporary = tempfile.mkstemp(prefix='.config-', suffix='.tmp', dir=os.path.dirname(destination))
+    try:
+        with os.fdopen(handle, 'w', encoding='utf-8', newline='\n') as f:
+            try:
+                json.dump(data, f, indent=4, ensure_ascii=False, allow_nan=False)
+            except ValueError:
+                raise ValueError('配置 JSON 无效（CONFIG_JSON_INVALID）') from None
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return True
 
 
@@ -74,6 +97,30 @@ def get_relative_path(*files):
     normalized_path = os.path.normpath(path)
 
     return normalized_path
+
+
+def get_user_data_path(*files, base_path=None):
+    """便携用户目录由启动器指定；源码开发及明确的外部路径保持原位置。"""
+    if any(file is None for file in files):
+        return None
+    legacy_path = get_relative_path(*files) if base_path is None else os.path.normpath(os.path.join(base_path, *files))
+    user_root = os.environ.get('NONO_USER_DATA_ROOT')
+    if legacy_path is None or not user_root:
+        return legacy_path
+    if not os.path.isabs(user_root):
+        raise ValueError('用户数据根目录必须是绝对路径（USER_DATA_ROOT_INVALID）')
+    relative = os.path.join(*files)
+    if os.path.isabs(relative):
+        return legacy_path
+    root = os.path.normpath(user_root)
+    candidate = os.path.normpath(os.path.join(root, relative))
+    # 用户显式指定的上级目录不属于便携数据，不跟随迁移或清理。
+    try:
+        if os.path.normcase(os.path.commonpath((root, candidate))) != os.path.normcase(root):
+            return legacy_path
+    except ValueError:
+        return legacy_path
+    return candidate
 
 
 def install_path_isascii():

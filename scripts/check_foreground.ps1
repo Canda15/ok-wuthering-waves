@@ -36,33 +36,25 @@ $testFiles = @(
     'tests/TestSkipDialogConfirm.py',
     'tests/TestBaseCombatTask.py',
     'tests/TestCombatCheck.py',
+    'tests/TestAbyssRestart.py',
+    'tests/TestChar.py',
+    'tests/TestLily.py',
+    'tests/TestHiyukiSkin.py',
     'tests/TestSelfhostSmoke.py'
 )
 
-# 图像测试仍会构造 OK；必须在构造前替换配置目录，防止读取开发机账号和通知设置。
-# 保留 run_test.py 的 OCR／翻译处理，每个文件独立进程，避免 Qt 和执行器状态串用。
-$testBootstrap = @'
-import runpy
-import sys
-import tempfile
-from config import config
-
-with tempfile.TemporaryDirectory(prefix="前台核心测试-") as directory:
-    config["config_folder"] = directory
-    sys.argv = ["run_test.py", sys.argv[1]]
-    runpy.run_path("run_test.py", run_name="__main__")
-'@
+# run_test.py 统一隔离配置、截图和日志；每个文件独立进程，避免 Qt 和执行器状态串用。
 
 Push-Location -LiteralPath $projectPath
 try {
     # 开发阶段可先验证正在编辑的源码；CI 始终使用默认完整门禁。
     if (-not $TestsOnly) {
-        & $pythonPath 'scripts/sync_ok.py' --check
+        & $pythonPath -X utf8 -B 'scripts/sync_ok.py' --check
         if ($LASTEXITCODE -ne 0) { throw "内联框架与逻辑差异校验失败，退出码 $LASTEXITCODE。" }
     }
     foreach ($testFile in $testFiles) {
         Write-Host "运行前台核心测试：$testFile"
-        & $pythonPath -u -c $testBootstrap $testFile
+        & $pythonPath -X utf8 -B -u 'run_test.py' $testFile
         if ($LASTEXITCODE -ne 0) { throw "前台核心测试失败：$testFile，退出码 $LASTEXITCODE。" }
     }
 } finally {

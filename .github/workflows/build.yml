@@ -1,5 +1,5 @@
-name: Windows Release
-run-name: Windows release · ${{ github.ref_name }}
+name: Windows 发布
+run-name: Windows 发布 · ${{ github.ref_name }}
 
 on:
   push:
@@ -26,7 +26,7 @@ env:
 
 jobs:
   validate:
-    name: 1 · Validate
+    name: 1 · 验证
     runs-on: windows-latest
 
     steps:
@@ -35,17 +35,17 @@ jobs:
       # `Invalid setup version tag 'master'` 失败,镜像仓库还会多一个同名 tag。
       # 所以第一件事就把 ref 钉死成发布用的版本 tag,后面所有步骤都能假设
       # RELEASE_TAG 形如 v3.7.17(与 pyappify 的标签正则一致)。
-      - name: Require a version tag
+      - name: 检查发布标签
         shell: pwsh
         run: |
           if ($env:GITHUB_REF_TYPE -ne 'tag') {
             throw "这个工作流必须以 tag 为 ref 运行(当前 $env:GITHUB_REF)。要在 Actions 里手动跑,请把 Branch 下拉切到某个 tag;要合并上游并发布新版本,请手动运行 'Sync upstream release'。"
           }
-          if ($env:GITHUB_REF_NAME -notmatch '^v?\d+\.\d+\.\d+$') {
-            throw "tag '$env:GITHUB_REF_NAME' 不是发布用的版本 tag(pyappify 只接受 vX.Y.Z)"
+          if ($env:GITHUB_REF_NAME -notmatch '^v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?$') {
+            throw "tag '$env:GITHUB_REF_NAME' 不是 PyAppify 支持的正式或 alpha/beta/rc 标签"
           }
 
-      - name: Configure runner
+      - name: 配置构建机
         shell: pwsh
         run: |
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -54,14 +54,14 @@ jobs:
           git config --global user.email "ok-oldking@users.noreply.github.com"
           git config --global user.name "Canda15"
 
-      - name: Check out source
+      - name: 检出源码
         uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: 准备 Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -70,19 +70,19 @@ jobs:
             requirements.txt
             pyproject.toml
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: python .github/scripts/install_dependencies.py
 
       - name: 核对内联框架与逻辑差异
         shell: pwsh
         run: python scripts/sync_ok.py --check
 
-      - name: Prepare release requirements
+      - name: 准备发布依赖
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python -m ok.update.inline_ok_requirements --tag "$env:RELEASE_TAG"
 
-      - name: Run tests
+      - name: 运行测试
         timeout-minutes: 20
         env:
           GITHUB_TOKEN: ''
@@ -121,7 +121,7 @@ jobs:
           }
 
   synchronize:
-    name: 2 · Synchronize repositories
+    name: 2 · 同步更新镜像
     needs: validate
     runs-on: windows-latest
     outputs:
@@ -131,7 +131,7 @@ jobs:
       changes: ${{ steps.sync.outputs.changes_with_asterisk }}
 
     steps:
-      - name: Configure runner
+      - name: 配置构建机
         shell: pwsh
         run: |
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -140,14 +140,14 @@ jobs:
           git config --global user.email "ok-oldking@users.noreply.github.com"
           git config --global user.name "Canda15"
 
-      - name: Check out source
+      - name: 检出源码
         uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: 准备 Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -156,15 +156,15 @@ jobs:
             requirements.txt
             pyproject.toml
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: python .github/scripts/install_dependencies.py
 
-      - name: Prepare release requirements
+      - name: 准备发布依赖
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python -m ok.update.inline_ok_requirements --tag "$env:RELEASE_TAG"
 
-      - name: Check release version
+      - name: 检查正式与预发布版本
         id: release_version
         shell: pwsh
         env:
@@ -191,7 +191,7 @@ jobs:
         shell: pwsh
         run: .\scripts\build_runtime.ps1
 
-      - name: Synchronize the update repository
+      - name: 同步更新镜像
         id: sync
         uses: ok-oldking/partial-sync-repo@master
         with:
@@ -203,12 +203,13 @@ jobs:
           show_author: true
 
   package:
-    name: 3 · Build portable bundle
+    name: 3 · 构建完整便携包
     needs: synchronize
+    timeout-minutes: 90
     runs-on: windows-latest
 
     steps:
-      - name: Configure runner
+      - name: 配置构建机
         shell: pwsh
         run: |
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -221,7 +222,7 @@ jobs:
           # 变长后又在 "path too long" 上失败。
           git config --global core.longpaths true
 
-      - name: Check out source
+      - name: 检出源码
         uses: actions/checkout@v4
         with:
           lfs: true
@@ -233,14 +234,21 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: 安装候选与来源验证依赖
+        run: python .github/scripts/install_dependencies.py
+
+      - name: 从固定源码构建新版启动器
+        id: launcher
+        uses: ./.github/actions/build-nono-launcher
+
       # 正式发布仍由 setup 克隆镜像的本次 tag，复用完整便携验证和归档入口。
       - name: 生成并验证正式便携包
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python -m selfhost.portable --release-tag "$env:RELEASE_TAG"
+        run: python -m selfhost.portable --release-tag "$env:RELEASE_TAG" --launcher-exe build/launcher-dist/NoNo.exe --launcher-proof build/launcher-dist/launcher-build.json
 
-      - name: Stage release assets
+      - name: 上传发布工件
         uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -251,23 +259,23 @@ jobs:
           retention-days: 7
 
   publish:
-    name: 4 · Publish
+    name: 4 · 发布
     needs: [ synchronize, package ]
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download release assets
+      - name: 下载发布工件
         uses: actions/download-artifact@v4
         with:
           name: release-assets
           path: pyappify_dist
 
-      - name: Get app version
+      - name: 读取应用版本
         id: app_version
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub release
+      - name: 创建 GitHub 发布
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -279,9 +287,9 @@ jobs:
             ### 便携版
               下载 `NoNo-win32-portable.zip`,解压到任意目录后双击 `NoNo\NoNo.exe`。
               Python 运行时、依赖、脚本、配置和日志都在解压出来的目录里,
-              整个目录可以直接搬走或做备份,不需要安装。
-            ### Install from source
-              See the [source installation guide](https://github.com/Canda15/ok-wuthering-waves/blob/master/docs/development/contributing.md).
+              整个目录可以直接搬走或做备份,不需要安装。升级时退出旧 NoNo,把新便携包解压覆盖原目录后启动,配置会自动保留并迁移。
+            ### 源码运行
+              参阅[源码开发说明](https://github.com/Canda15/ok-wuthering-waves/blob/master/docs/development/contributing.md).
           draft: false
           prerelease: ${{ needs.synchronize.outputs.is_release != 'true' }}
           files: pyappify_dist/*

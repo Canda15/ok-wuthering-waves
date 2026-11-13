@@ -20,6 +20,8 @@ from src.task.BaseWWTask import isolate_white_text_to_black, binarize_for_matchi
 
 logger = Logger.get_logger(__name__)
 cd_regex = re.compile(r'\d{1,2}\.\d')
+abyss_character_info_text = re.compile(
+    r'^\s*(?:战斗特色|戰鬥特色|Combat\s+(?:Features|Characteristics|Style))\s*$', re.I)
 
 
 class NotInCombatException(Exception):
@@ -466,82 +468,197 @@ class BaseCombatTask(CombatCheck):
         self._abyss_force_combat_until = (time.monotonic() if started_at is None else started_at) + 5
         return self.scene.set_in_combat()
 
-    def restart_combat_in_abyss(self):
-        """Restart the current Abyss challenge and return with combat active.
+    def find_abyss_character_info(self):
+        """只识别当前帧的可选角色介绍，空结果也必须属于当前前台代次。"""
+        epoch = getattr(self, '_foreground_epoch', 0)
+        header = self.ocr(
+            box=self.box_of_screen(0.38, 0.16, 0.85, 0.25),
+            match=abyss_character_info_text)
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('深塔介绍识别期间画面已刷新')
+        return header[0] if header else None
 
-        Call from an Abyss arena, its pause/result screen, or its selected floor.
-        Combat detection is forced true for five seconds after pressing F;
-        subsequent combat loops use the usual checks again.
-        """
-        rechallenge_text = re.compile(r'^\s*(?:重新挑战|重新挑戰|再次挑战|再次挑戰|Rechallenge)\s*$',
-                                      re.IGNORECASE)
-        confirm_text = re.compile(r'^\s*(?:确认|確認|确定|確定|Confirm)\s*$', re.IGNORECASE)
-        start_text = re.compile(r'^\s*(?:挑战开始|挑戰開始|开始挑战|開始挑戰|开启挑战|開啟挑戰|Start\s*Challenge)\s*$', re.I)
+    def _find_abyss_restart_state(self):
+        """按遮挡优先级识别导航页；背景标记不能证明弹窗操作已经完成。"""
+        if header := self.find_abyss_character_info():
+            return 'character_info', header
+        epoch = getattr(self, '_foreground_epoch', 0)
+        states = (
+            ('details', (0.02, 0.25, 0.35, 0.4),
+             r'^\s*(?:环境特性|環境特性|Environment(?:al)?\s*(?:Details|Features))\s*$'),
+            ('overwrite', (0.2, 0.3, 0.8, 0.6), r'是否覆盖|是否覆蓋|overwrite'),
+            ('results', (0.3, 0.7, 0.7, 0.95), r'^\s*(?:确认成绩|確認成績|Confirm\s*Results?)\s*$'),
+            ('confirm', (0.5, 0.5, 0.8, 0.75), r'^\s*(?:确认|確認|确定|確定|Confirm)\s*$'),
+            ('rechallenge', None, r'^\s*(?:重新挑战|重新挑戰|再次挑战|再次挑戰|Rechallenge)\s*$'),
+            ('start', (0.55, 0.75, 0.98, 0.98),
+             r'^\s*(?:挑战开始|挑戰開始|开始挑战|開始挑戰|开启挑战|開啟挑戰|Start\s*Challenge)\s*$'),
+            ('success', (0.3, 0.2, 0.7, 0.4), r'挑战成功|挑戰成功|Challenge\s*(?:Complete|Success)'),
+        )
+        for state, region, pattern in states:
+            kwargs = {'match': re.compile(pattern, re.I)}
+            if region is not None:
+                kwargs['box'] = self.box_of_screen(*region)
+            controls = self.ocr(**kwargs)
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('深塔导航识别期间画面已刷新')
+            if controls:
+                return state, controls[0]
+        marker = self.find_abyss_start_marker() or self.find_f_with_text()
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('深塔开始标记识别期间画面已刷新')
+        return ('arena', marker) if marker else ('unknown', None)
 
-        def dismiss_environment_details():
-            if self.ocr(box=self.box_of_screen(0.02, 0.25, 0.35, 0.4),
-                        match=re.compile(r'^\s*(?:环境特性|環境特性|Environment(?:al)?\s*(?:Details|Features))\s*$', re.I)):
-                self.send_key('esc', after_sleep=0.5)
+    def dismiss_abyss_character_info(self, time_out=5):
+        """发送一次关闭后只观察，直到新帧能证明介绍消失并进入已知页面。"""
+        deadline = self.business_time() + time_out
+        sent = False
+        while self.business_time() < deadline:
+            try:
+                if not sent:
+                    if not self.find_abyss_character_info():
+                        return False
+                    if self.business_time() >= deadline:
+                        break
+                    # 输入中断可能发生在点击已送达之后；先记录意图，恢复时不能盲目再点。
+                    sent = True
+                    self.click(0.942, 0.058, after_sleep=0)
+                    self.sleep(min(0.5, max(0, deadline - self.business_time())))
                 self.next_frame()
-                return True
-            return False
+                state, _ = self._find_abyss_restart_state()
+                if state not in ('character_info', 'unknown'):
+                    return True
+                self.sleep(min(0.1, max(0, deadline - self.business_time())))
+            except ForegroundInputInterrupted:
+                self._recover_foreground_input()
+        self.screenshot('深塔角色介绍关闭结果无法确认')
+        raise RuntimeError('深塔角色介绍关闭结果无法确认')
+
+    def restart_combat_in_abyss(self):
+        """按已发送阶段重开深塔；普通开始保留五秒强制战斗，恢复后先核对倒计时。"""
+        deadline = self.business_time() + 30
+        action = None
+        details_sent = False
+        can_open_pause = True
+        step = 'navigate'
+        # 只接受向下一页的转换。同一个确认仍显示时只等过渡，不重发已接受的动作。
+        transitions = {
+            None: {'overwrite', 'results', 'confirm', 'rechallenge', 'start', 'arena'},
+            'pause': {'overwrite', 'results', 'confirm', 'rechallenge', 'start', 'arena'},
+            'results': {'overwrite', 'rechallenge', 'start', 'confirm', 'arena'},
+            'overwrite': {'rechallenge', 'start', 'confirm', 'arena'},
+            'rechallenge': {'start', 'confirm', 'arena'},
+            'start': {'confirm', 'arena'},
+            'confirm': {'arena'},
+            'arena': {'arena'},
+        }
+
+        def fail(message):
+            self.screenshot('深塔重新挑战失败')
+            raise RuntimeError(message)
+
+        def remaining():
+            budget = deadline - self.business_time()
+            if budget <= 0:
+                fail('深塔重新挑战结果无法在规定时间内确认')
+            return budget
 
         def find_start_for_restart():
-            # This help overlay may appear after the arena has already loaded.
-            dismiss_environment_details()
-            marker = self.find_abyss_start_marker()
-            if not marker:
-                handle_restart_dialog()
-            return marker
+            nonlocal action, details_sent, can_open_pause
+            remaining()
+            state, control = self._find_abyss_restart_state()
+            if state != 'unknown':
+                # Esc 打开暂停菜单仅适用于最初的战斗／死亡页；已识别过导航页后不再猜测入口。
+                can_open_pause = False
+            if state == 'character_info':
+                self.dismiss_abyss_character_info(time_out=min(5, remaining()))
+                return None
+            if state == 'details':
+                if not details_sent:
+                    remaining()
+                    details_sent = True
+                    self.send_key('esc', after_sleep=0)
+                    self.sleep(min(0.5, remaining()))
+                return None
+            if state == 'unknown' and details_sent:
+                return None
+            details_sent = False
+            if state == 'unknown':
+                if action is None and can_open_pause:
+                    remaining()
+                    can_open_pause = False
+                    action = 'pause'
+                    self.send_key('esc', after_sleep=0)
+                    self.sleep(min(1, remaining()))
+                return None
+            if state not in transitions[action]:
+                return None
+            if state == 'arena':
+                # 已到达竞技场后，恢复中的未知画面只能等待，不能又以 Esc 重开整个导航。
+                action = 'arena'
+                return control
+            # 将动作和随后等待拆开；即使点击或 sleep 内恢复，阶段记录也不会被清掉。
+            remaining()
+            action = state
+            if state == 'overwrite':
+                self.send_key('esc', after_sleep=0)
+            else:
+                self.click(control, after_sleep=0)
+            self.sleep(min(0.5 if state == 'overwrite' else 1, remaining()))
+            return None
 
-        def handle_restart_dialog():
-            # Result screens ask whether to reuse the current team. A result
-            # can also replace the pause menu if its timer expires meanwhile.
-            if dismiss_environment_details():
-                return
-            if buttons := self.ocr(box=self.box_of_screen(0.5, 0.5, 0.8, 0.75), match=confirm_text):
-                self.click(buttons[0], after_sleep=1)
-            elif buttons := self.ocr(match=rechallenge_text):
-                self.click(buttons[0], after_sleep=1)
-            elif buttons := self.ocr(box=self.box_of_screen(0.55, 0.75, 0.98, 0.98), match=start_text):
-                # Tower success returns to the still-selected floor/team.
-                self.click(buttons[0], after_sleep=1)
+        def find_arena_f():
+            if not find_start_for_restart():
+                return None
+            epoch = getattr(self, '_foreground_epoch', 0)
+            prompt = self.find_f_with_text()
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('深塔交互提示识别期间画面已刷新')
+            return prompt
 
         previous_skip = self.skip_combat_check
-        self.reset_to_false(reason='restart Abyss challenge')
+        self.reset_to_false(reason='重新开始深塔挑战')
         self.skip_combat_check = True
         try:
-            result_confirm_text = re.compile(r'^\s*(?:确认成绩|確認成績|Confirm\s*Results?)\s*$', re.I)
-            result_button = self.ocr(box=self.box_of_screen(0.3, 0.7, 0.7, 0.95), match=result_confirm_text)
-            if not result_button and self.ocr(box=self.box_of_screen(0.3, 0.2, 0.7, 0.4),
-                                              match=re.compile(r'挑战成功|挑戰成功|Challenge\s*(?:Complete|Success)', re.I)):
-                result_button = self.wait_ocr(match=result_confirm_text, time_out=5)
-            if result_button:
-                self.click(result_button[0], after_sleep=1)
-                if self.ocr(box=self.box_of_screen(0.2, 0.3, 0.8, 0.6),
-                            match=re.compile(r'是否覆盖|是否覆蓋|overwrite', re.I)):
-                    self.send_key('esc', after_sleep=0.5)
-            rechallenge = self.ocr(match=rechallenge_text)
-            if not rechallenge and not self.find_abyss_start_marker():
-                if start_buttons := self.ocr(box=self.box_of_screen(0.55, 0.75, 0.98, 0.98), match=start_text):
-                    self.click(start_buttons[0], after_sleep=1)
-                    self.wait_until(self.find_abyss_start_marker, time_out=30,
-                                    raise_if_not_found=True, post_action=handle_restart_dialog)
-                else:
-                    # Active combat and dead characters both use the pause menu.
-                    self.send_key('esc', after_sleep=1)
-                    rechallenge = self.wait_ocr(match=rechallenge_text, time_out=5)
-            if rechallenge:
-                self.click(rechallenge[0], after_sleep=1)
-                self.wait_until(self.find_abyss_start_marker, time_out=30,
-                                raise_if_not_found=True, post_action=handle_restart_dialog)
-            if not self.walk_to_box(find_start_for_restart,
-                                    end_condition=self.find_f_with_text, time_out=30):
-                raise RuntimeError(self.tr('Could not reach the Abyss challenge start'))
-            if not self.load_chars():
-                raise RuntimeError(self.tr('Could not load the Abyss team'))
-            self.send_key('f')
-            return self.force_abyss_combat()
+            while self.business_time() < deadline:
+                try:
+                    self.next_frame()
+                    if step == 'start_sent':
+                        # F 内中断不能证明挑战已开始，恢复只观察实际倒计时，不再次 F 或 Esc。
+                        if self.find_abyss_character_info():
+                            self.dismiss_abyss_character_info(time_out=min(5, remaining()))
+                            continue
+                        epoch = getattr(self, '_foreground_epoch', 0)
+                        in_team = self.in_team()[0]
+                        timer = self.get_abyss_remaining_time(force=True) if in_team else None
+                        loaded = self.load_chars() if timer is not None and timer > 0 else False
+                        if epoch != getattr(self, '_foreground_epoch', 0):
+                            raise ForegroundInputInterrupted('深塔开始结果识别期间画面已刷新')
+                        if loaded:
+                            return self.force_abyss_combat()
+                        self.sleep(min(0.1, remaining()))
+                        continue
+                    if not self.wait_until(find_start_for_restart, time_out=remaining()):
+                        fail('无法确认深塔重新挑战的当前页面')
+                    if not self.walk_to_box(find_start_for_restart,
+                                            end_condition=find_arena_f, time_out=remaining()):
+                        fail('无法到达深塔挑战开始位置')
+                    epoch = getattr(self, '_foreground_epoch', 0)
+                    loaded = self.load_chars()
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('深塔队伍识别期间画面已刷新')
+                    if not loaded:
+                        fail('无法识别深塔挑战队伍')
+                    if not find_arena_f():
+                        continue
+                    remaining()
+                    step = 'start_sent'
+                    self.send_key('f')
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('深塔开始动作期间画面已刷新')
+                    return self.force_abyss_combat()
+                except ForegroundInputInterrupted:
+                    self._recover_foreground_input()
+            fail('深塔重新挑战结果无法在规定时间内确认')
         finally:
             self.skip_combat_check = previous_skip
 

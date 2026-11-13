@@ -34,19 +34,27 @@ Read `references/character-patterns.md` for the detailed API, templates, and val
    - `click` = 普通攻击
    - `heavy` = 重击
 4. Create or update `src/char/<CharacterName>.py`.
-   Implement a `BaseChar` or `Healer` subclass with `do_perform()` as the primary rotation.
+   实现 `BaseChar` 子类，以 `do_perform()` 作为主要循环。
+   复制循环或切换优先级钩子前，先核对当前源码签名。
 5. Register the character in `src/char/CharFactory.py`.
-   Add the import and `_char_dict_raw` entry with `Labels.<char_label>`, cooldowns, `liberation_cd` if non-default, and `ring_index`.
+   添加导入和 `_char_dict_raw` 项，包含 `Labels.<char_label>`、
+   `char_type`、`ring_index`，按角色机制设置 `buff_time`。
+   仅使用当前工厂实际读取的字段。冷却由 HUD 识别，不添加未使用的
+   `res_cd`、`echo_cd` 或 `liberation_cd`。
 6. If the rotation needs new image/template detections, follow the library's
    `generate-templates` skill with real screenshots and the project's annotations
    and exporter. Preserve exact `Labels` names and verify the resulting detection.
+   头像裁剪应围绕有辨识度的面部区域，技能裁剪应围绕内部符号，排除周围
+   场景像素。收紧裁剪后重新验证相近状态；相同符号可能需要额外状态线索。
    If source images are unavailable, report the required feature and evidence gap
    rather than fabricating labels or annotations.
-7. Add or update tests only when screenshots exist or the change touches recognition/availability logic.
-   Use existing `tests/TestChar.py` patterns.
+7. 识别修改补截图测试；循环或输入释放问题补有实际价值的回归测试。
+   使用 `run_test.py` 及现有 `tests/TestChar.py`、`tests/TestLily.py` 模式。
 8. Exercise the changed character through its consuming combat task using MCP,
    following the library's recovery, starting-state checks, and visible success
-   assertions. Report any game state that could not be tested.
+   assertions. 检查相关入口，尤其是共鸣解放不可用时带变奏返回的情况；
+   单次开场循环不能证明延奏交接可靠。已获授权的深塔重置应复用
+   `restart_combat_in_abyss()` 及其可选角色介绍关闭逻辑，并报告未测状态。
 
 ## Bilingual Rules
 
@@ -66,6 +74,8 @@ When a page such as `https://ww.nanoka.cc/character/1210/` is provided, use it a
 - Does liberation cause animation freeze or a long alternate state?
 
 Always verify the implementation against this repo's helpers and available labels.
+若页面没有可读技能文本，按 [角色开发参考](references/character-patterns.md#skill-page-extraction)
+检查其数据请求载荷。
 
 ## Essential Rules
 
@@ -77,4 +87,11 @@ Always verify the implementation against this repo's helpers and available label
 - Use `self.time_elapsed_accounting_for_freeze(...)` for rotation timing when liberation or intro animation can freeze time.
 - Prefer `click_resonance`, `click_liberation`, `click_echo`, `heavy_attack`, `continues_normal_attack`, `heavy_click_forte`, `is_forte_full`, `has_long_action`, and `f_break` over raw key calls.
 - Keep loops bounded by timeouts and call `self.task.next_frame()` or `self.sleep(...)` inside polling loops.
-- Use `Priority` overrides only when switching behavior truly depends on intro, cooldown, healer timing, or a long buff window.
+- 手动长按键鼠必须在 `finally` 中释放，包含取消和识别超时路径。
+  共鸣回路消耗提示消失，不能单独证明多阶段重击收尾已经完成。
+- 按角色机制安排动作顺序。持续共鸣解放状态可能隐藏常规按钮，或将解放
+  按钮改为结束按钮；通用可用性识别不能单独证明此时适合按下。
+- 依赖延奏的辅助角色应在交接时确认满协奏。如果最后一段能量通常来自
+  共鸣解放，要为冷却和失败路径提供符合增益窗口的有界补能。
+- 仅在切换确实依赖变奏、冷却、治疗时机或长增益窗口时，使用
+  `get_switch_priority()` 和 `SwitchPriority` 定制优先级。

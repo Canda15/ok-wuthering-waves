@@ -19,6 +19,7 @@ from PIL.PngImagePlugin import PngInfo
 from ok.feature.Box import Box, sort_boxes
 from ok.feature.Feature import Feature
 from ok.core.events import communicate
+from ok.core.script_packager import get_ok_import_folder, get_ok_tasks_folder
 from ok.util.file import get_path_relative_to_exe
 from ok.util.logger import Logger
 
@@ -143,8 +144,9 @@ class FeatureSet:
 
     def _feature_sources(self):
         yield self.coco_json, self.template_folder, None
-        yield os.path.join('ok_tasks', 'assets', 'coco_annotations.json'), os.path.join('ok_tasks', 'assets', 'templates'), None
-        import_dir = os.path.join(os.getcwd(), 'ok_import')
+        task_assets = os.path.join(get_ok_tasks_folder(), 'assets')
+        yield os.path.join(task_assets, 'coco_annotations.json'), os.path.join(task_assets, 'templates'), None
+        import_dir = get_ok_import_folder()
         if os.path.isdir(import_dir):
             for entry in sorted(os.listdir(import_dir)):
                 yield (os.path.join(import_dir, entry, 'assets', 'coco_annotations.json'),

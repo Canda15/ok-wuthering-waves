@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('main_debug.py', 'main.py')]
+    [ValidateSet('main_debug.py', 'main.py', 'main_updater.py')]
     [string]$EntryPoint = 'main_debug.py',
     [string]$LogPath
 )
@@ -10,10 +10,10 @@ $projectPath = Split-Path -Parent $PSScriptRoot
 $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
 Set-Location -LiteralPath $projectPath
 if (-not (Test-Path -LiteralPath $pythonPath)) {
-    throw "Project Python was not found: $pythonPath"
+    throw "未找到项目虚拟环境的 Python：$pythonPath"
 }
 
-# The elevated launcher merges stdout and stderr into a file the terminal can read.
+# 提权后的辅助进程将标准输出和错误合并到日志，当前终端继续显示它们。
 if ($LogPath) {
     $captureCode = @'
 import os
@@ -55,12 +55,12 @@ $reader = $null
 $elevatedProcess = $null
 $exitCode = 1
 try {
-    # Encode the command so paths with spaces and quotes survive UAC relaunch.
+    # 编码命令，确保路径中的空格和引号在 UAC 重新启动后保持原样。
     $quotedScript = $PSCommandPath.Replace("'", "''")
     $quotedOutput = $outputPath.Replace("'", "''")
     $command = "& '$quotedScript' -EntryPoint '$EntryPoint' -LogPath '$quotedOutput'; exit `$LASTEXITCODE"
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-    Write-Host 'Requesting administrator access; app logs will appear here.'
+    Write-Host '正在请求管理员权限，程序日志将在此终端显示。'
     $powershellPath = (Get-Command powershell.exe -CommandType Application).Source
     $elevatedProcess = Start-Process -FilePath $powershellPath `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand `
@@ -78,7 +78,7 @@ try {
     $exitCode = $elevatedProcess.ExitCode
 }
 finally {
-    # Let the elevated wrapper stop its own child when Ctrl+C stops this launcher.
+    # 当前终端被 Ctrl+C 停止时，让提权辅助进程负责终止它自己的子进程。
     if ($elevatedProcess -and -not $elevatedProcess.HasExited) {
         [IO.File]::WriteAllText("$outputPath.stop", '')
         $null = $elevatedProcess.WaitForExit(5000)

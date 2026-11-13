@@ -7,6 +7,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
+from ok.util.file import get_user_data_path
 
 
 TEMPLATE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
@@ -21,7 +22,7 @@ class CocoTemplateStore:
     """Own filesystem and COCO mutations used by the desktop UI."""
 
     def __init__(self, folder="ok_templates", coco_name="coco_annotations.json"):
-        self.folder = Path(folder).resolve()
+        self.folder = Path(get_user_data_path(folder)).resolve()
         self.folder.mkdir(parents=True, exist_ok=True)
         self.coco_path = self.folder / coco_name
         self._lock = threading.RLock()

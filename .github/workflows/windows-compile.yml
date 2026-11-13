@@ -24,7 +24,7 @@ jobs:
   compile:
     name: 前台核心、原生 EXE 与便携包
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: 配置源码换行
         shell: pwsh
@@ -59,17 +59,21 @@ jobs:
         shell: pwsh
         run: .\scripts\check_foreground.ps1
 
-      # 普通分支编译直接复用宿主脚本；该脚本包含六项原生进程验证，不创建发布版本。
+      # 普通分支编译直接复用宿主脚本；该脚本包含七项原生进程验证，不创建发布版本。
       - name: 编译并验证原生业务 EXE
         shell: pwsh
         run: |
           .\scripts\build_runtime.ps1
 
+      - name: 编译并核验本次新版启动器
+        id: launcher
+        uses: ./.github/actions/build-nono-launcher
+
       - name: 生成并验证本次 SHA 的完整便携包
         shell: pwsh
         env:
           BUILD_SHA: ${{ github.sha }}
-        run: python -m selfhost.portable --source-sha "$env:BUILD_SHA"
+        run: python -m selfhost.portable --source-sha "$env:BUILD_SHA" --launcher-exe build/launcher-dist/NoNo.exe --launcher-proof build/launcher-dist/launcher-build.json
 
       - name: 上传本次 SHA 的完整便携包
         id: portable_artifact
@@ -79,6 +83,7 @@ jobs:
           path: |
             build/portable-dist/NoNo-win32-portable.zip
             build/portable-dist/NoNo-win32-sha256.txt
+            build/launcher-dist/launcher-build.json
           if-no-files-found: error
           retention-days: 14
 

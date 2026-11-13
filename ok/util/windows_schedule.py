@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable
 
 from ok.util.config import Config
+from ok.util.file import get_user_data_path, write_json_file
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ class WindowsScheduleCache:
             cache_dir: 缓存目录，默认使用 Config.config_folder
         """
         self.config = config or Config()
-        default_cache_dir = self.config.get("config_folder", "configs")
+        default_cache_dir = self.config.get("config_folder", get_user_data_path('configs'))
         self.cache_dir = Path(default_cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "schedule_tasks_cache.json"
@@ -215,16 +216,12 @@ class WindowsScheduleCache:
         try:
             if self.cache_file.exists():
                 return
-            legacy_cache_file = Path(".ok_cache") / "schedule_tasks_cache.json"
+            legacy_cache_file = Path(get_user_data_path('.ok_cache')) / 'schedule_tasks_cache.json'
             if legacy_cache_file.exists():
-                self.cache_file.write_text(
-                    legacy_cache_file.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-                logger.info(
-                    f"Migrated schedule cache from {legacy_cache_file} to {self.cache_file}"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to migrate legacy schedule cache: {e}")
+                write_json_file(self.cache_file, json.loads(legacy_cache_file.read_text(encoding='utf-8')))
+                logger.info('计划任务缓存已迁入用户配置目录')
+        except Exception:
+            logger.warning('旧计划任务缓存迁移失败（SCHEDULE_CACHE_MIGRATION_FAILED）')
 
     def load_cache(self):
         """从文件加载缓存"""
@@ -249,11 +246,10 @@ class WindowsScheduleCache:
         with self.lock:
             try:
                 data = {self._cache_key(task): task.to_dict() for task in self.cache.values()}
-                with open(self.cache_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                logger.info(f"Saved {len(self.cache)} tasks to cache")
-            except Exception as e:
-                logger.error(f"Failed to save cache: {e}")
+                write_json_file(self.cache_file, data)
+                logger.info(f'计划任务缓存已保存，条目数：{len(self.cache)}')
+            except Exception:
+                logger.error('计划任务缓存保存失败（SCHEDULE_CACHE_WRITE_FAILED）')
 
     def get(self, task_name: str) -> Optional[ScheduleTaskInfo]:
         """获取任务信息"""

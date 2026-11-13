@@ -1253,14 +1253,6 @@
     <context>
         <name>app</name>
         <message>
-            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
-            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
-        </message>
-        <message>
-            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
-            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
-        </message>
-        <message>
             <source>Diagnosis</source>
             <translation>診断</translation>
         </message>
@@ -2016,7 +2008,15 @@
             <source>Created or updated shortcuts: {paths}</source>
             <translation>ショートカットを作成または更新しました: {paths}</translation>
         </message>
-    </context>
+    <message>
+            <source>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        <message>
+            <source>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</source>
+            <translation>需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后</translation>
+        </message>
+        </context>
     <context>
         <name>ScheduleTaskTable</name>
         <message>
@@ -3337,14 +3337,6 @@
     <context>
         <name>SelectInteractionListView</name>
         <message>
-            <source>前台系统键鼠</source>
-            <translation>前台系统键鼠</translation>
-        </message>
-        <message>
-            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
-            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
-        </message>
-        <message>
             <source>ADBInteraction</source>
             <translation>ADBInteraction - バックグラウンド</translation>
         </message>
@@ -3356,7 +3348,15 @@
             <source>Default Interaction</source>
             <translation>既定の操作</translation>
         </message>
-    </context>
+    <message>
+            <source>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</source>
+            <translation>使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续</translation>
+        </message>
+        <message>
+            <source>前台系统键鼠</source>
+            <translation>前台系统键鼠</translation>
+        </message>
+        </context>
     <context>
         <name>ImportWarningDialog</name>
         <message>
@@ -3529,42 +3529,6 @@
         <message>
             <source>Switch</source>
             <translation>切り替え</translation>
-        </message>
-        <message>
-            <source>Pip source</source>
-            <translation>Pip ソース</translation>
-        </message>
-        <message>
-            <source>System default</source>
-            <translation>システムの既定</translation>
-        </message>
-        <message>
-            <source>PyPI</source>
-            <translation>PyPI</translation>
-        </message>
-        <message>
-            <source>Tsinghua</source>
-            <translation>清華大学</translation>
-        </message>
-        <message>
-            <source>Aliyun</source>
-            <translation>阿里雲</translation>
-        </message>
-        <message>
-            <source>USTC</source>
-            <translation>中国科学技術大学</translation>
-        </message>
-        <message>
-            <source>Huawei Cloud</source>
-            <translation>Huawei Cloud</translation>
-        </message>
-        <message>
-            <source>Tencent Cloud</source>
-            <translation>Tencent Cloud</translation>
-        </message>
-        <message>
-            <source>Failed to change pip source: {error}</source>
-            <translation>pip ソースの変更に失敗しました: {error}</translation>
         </message>
     </context>
     <context>

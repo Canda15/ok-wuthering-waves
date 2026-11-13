@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication
 
 from ok.util.explorer import open_explorer_folder, reveal_in_explorer
+from ok.util.file import get_user_data_path
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
@@ -27,13 +28,13 @@ def open_screenshot_folder() -> None:
     screenshot = getattr(og.ok, 'screenshot', None)
     folder = getattr(screenshot, 'screenshot_folder', None)
     if folder is None:
-        folder = Path.cwd() / "screenshots"
-        logger.info(f'screenshot folder was not initialized; using fallback={str(folder)!r}')
+        folder = get_user_data_path('screenshots')
+        logger.info('截图目录尚未初始化，使用默认用户目录')
     open_explorer_folder(folder)
 
 
 def open_log_folder() -> None:
-    open_explorer_folder(Path.cwd() / "logs")
+    open_explorer_folder(get_user_data_path('logs'))
 
 
 def export_logs() -> None:
@@ -47,12 +48,12 @@ def export_logs() -> None:
         downloads_path.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
             for folder in ("screenshots", "logs"):
-                source_dir = Path.cwd() / folder
+                source_dir = Path(get_user_data_path(folder))
                 if not source_dir.is_dir():
                     continue
                 for file_path in source_dir.rglob("*"):
                     if file_path.is_file():
-                        archive.write(file_path, file_path.relative_to(Path.cwd()))
+                        archive.write(file_path, Path(folder) / file_path.relative_to(source_dir))
         reveal_in_explorer(zip_path)
     except Exception as e:
         alert_error(f"{og.app.tr('Export failed')}: {e}", tray=True)

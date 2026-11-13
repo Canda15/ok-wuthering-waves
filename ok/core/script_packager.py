@@ -6,7 +6,7 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from ok.util.file import get_downloads_folder
+from ok.util.file import get_downloads_folder, get_user_data_path
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
@@ -19,11 +19,11 @@ MAX_ARCHIVE_MEMBERS = 10_000
 
 
 def get_ok_tasks_folder():
-    return os.path.join(os.getcwd(), OK_TASKS_FOLDER)
+    return get_user_data_path(OK_TASKS_FOLDER)
 
 
 def get_ok_import_folder():
-    return os.path.join(os.getcwd(), OK_IMPORT_FOLDER)
+    return get_user_data_path(OK_IMPORT_FOLDER)
 
 
 def load_manifest(folder=None):

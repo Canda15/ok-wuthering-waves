@@ -1,6 +1,6 @@
+import inspect
 import os
 import threading
-from urllib.parse import urlparse
 
 from PySide6.QtCore import QUrl, Signal, Qt
 from PySide6.QtGui import QDesktopServices, QFontMetrics
@@ -23,6 +23,25 @@ def _is_numeric_version(version):
         return bool(version) and all(part.isdigit() for part in version.lstrip("v").split("."))
     except AttributeError:
         return False
+
+
+def _accepts_language(function):
+    """Whether ``function`` takes a ``language`` argument (newer pyappify versions)."""
+    try:
+        return "language" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _ui_locale():
+    """The app's UI locale, such as ``zh_CN``, for update notes from the app's changelogs."""
+    try:
+        from ok.ui.qt.common.config import cfg
+
+        return cfg.language.value.name()
+    except Exception as error:
+        logger.warning(f"could not read the UI language for update notes: {error}")
+        return None
 
 
 def _is_local_checkout(pyappify_module):
@@ -75,8 +94,6 @@ class UpdateCard(QWidget):
     check_started = Signal()
     _versions_loaded = Signal(object)
     _update_finished = Signal(object)
-    _pip_config_loaded = Signal(object)
-    _pip_save_finished = Signal(object)
     VERSION_COMBO_MIN_WIDTH = 120
     VERSION_COMBO_MAX_WIDTH = 240
 
@@ -93,7 +110,6 @@ class UpdateCard(QWidget):
         self.versions = []
         self._busy = False
         self._automatic_check = False
-        self._pip_config = None
         logger.info(
             f"initialized current_version={self.current_version!r}, "
             f"pyappify_module={getattr(pyappify_module, '__file__', type(pyappify_module).__name__)!r}, "
@@ -143,28 +159,14 @@ class UpdateCard(QWidget):
         self.notes_edit = ChangeLogView("", self)
         self.notes_edit.hide()
 
-        self.pip_row = QWidget(self)
-        pip_layout = QHBoxLayout(self.pip_row)
-        pip_layout.setContentsMargins(0, 0, 0, 0)
-        pip_layout.setSpacing(10)
-        pip_layout.addWidget(Label(self.tr("Pip source"), "secondary", self.pip_row))
-        self.pip_combo = ComboBox(parent=self.pip_row)
-        self.pip_combo.currentIndexChanged.connect(self._pip_selection_changed)
-        pip_layout.addWidget(self.pip_combo)
-        pip_layout.addStretch()
-        self.pip_row.hide()
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
         layout.addLayout(self.controls_layout)
-        layout.addWidget(self.pip_row)
         layout.addWidget(self.notes_edit)
 
         self._versions_loaded.connect(self._apply_versions)
         self._update_finished.connect(self._apply_update_result)
-        self._pip_config_loaded.connect(self._apply_pip_config)
-        self._pip_save_finished.connect(self._apply_pip_save)
 
     def check_for_updates(self, automatic=False):
         """Load the version list; ``automatic`` checks announce a newer version."""
@@ -179,22 +181,8 @@ class UpdateCard(QWidget):
         self.check_started.emit()
         self._set_status(self.tr("Checking for updates…"))
         release_only = not self.test_version_checkbox.isChecked()
-        def load_versions():
-            versions = get_versions(release_only=release_only, exit_event=self.exit_event)
-            get_config = getattr(self.pyappify_module, "get_pip_index_config", None)
-            set_url = getattr(self.pyappify_module, "set_pip_index_url", None)
-            if callable(get_config) and callable(set_url):
-                # Keep launcher calls sequential and the card busy until both finish.
-                try:
-                    config = get_config(exit_event=self.exit_event)
-                    self._pip_config_loaded.emit((True, config))
-                except Exception as error:
-                    logger.error(f"pyappify.get_pip_index_config failed: {error}", error)
-                    self._pip_config_loaded.emit((False, str(error)))
-            return versions
-
         self._run_in_background(
-            load_versions,
+            lambda: get_versions(release_only=release_only, exit_event=self.exit_event),
             self._versions_loaded,
             f"pyappify.get_version_list(release_only={release_only})",
         )
@@ -224,8 +212,11 @@ class UpdateCard(QWidget):
         self._set_status(
             self.tr("Starting change to {version}…").format(version=self._title(self.versions[index]))
         )
+        kwargs = {"exit_event": self.exit_event}
+        if _accepts_language(update_to_version):
+            kwargs["language"] = _ui_locale()
         self._run_in_background(
-            lambda: update_to_version(version, exit_event=self.exit_event),
+            lambda: update_to_version(version, **kwargs),
             self._update_finished,
             f"pyappify.update_to_version({version!r})",
         )
@@ -242,62 +233,6 @@ class UpdateCard(QWidget):
                 signal.emit((False, str(error)))
 
         threading.Thread(target=run, daemon=True, name="pyappify-update").start()
-
-    def _pip_title(self, url):
-        names = {
-            "": self.tr("System default"),
-            "pypi.org": self.tr("PyPI"),
-            "pypi.tuna.tsinghua.edu.cn": self.tr("Tsinghua"),
-            "mirrors.aliyun.com": self.tr("Aliyun"),
-            "mirrors.ustc.edu.cn": self.tr("USTC"),
-            "repo.huaweicloud.com": self.tr("Huawei Cloud"),
-            "mirrors.cloud.tencent.com": self.tr("Tencent Cloud"),
-        }
-        host = urlparse(url).hostname or url
-        return names.get(host, host)
-
-    def _apply_pip_config(self, result):
-        successful, config = result
-        if not successful:
-            self.pip_row.hide()
-            return
-        self._pip_config = config
-        current = config["pip_index_url"]
-        urls = list(dict.fromkeys(["", *config["options"], current]))
-        blocked = self.pip_combo.blockSignals(True)
-        self.pip_combo.clear()
-        for url in urls:
-            self.pip_combo.addItem(self._pip_title(url), url)
-        self.pip_combo.setCurrentIndex(urls.index(current))
-        self.pip_combo.setToolTip(current)
-        self.pip_combo.blockSignals(blocked)
-        self.pip_row.show()
-
-    def _pip_selection_changed(self, index):
-        if self._busy or self._pip_config is None or index < 0:
-            return
-        set_url = getattr(self.pyappify_module, "set_pip_index_url", None)
-        if not callable(set_url):
-            return
-        url = self.pip_combo.itemData(index)
-        self._set_busy(True)
-        self._run_in_background(
-            lambda: set_url(url, exit_event=self.exit_event),
-            self._pip_save_finished,
-            f"pyappify.set_pip_index_url({url!r})",
-        )
-
-    def _apply_pip_save(self, result):
-        successful, value = result
-        self._apply_pip_config((True, value if successful else self._pip_config))
-        # Saving a source must preserve the selected version's release notes.
-        self._set_busy(False, refresh_selection=False)
-        index = self.version_combo.currentIndex()
-        self.update_button.setEnabled(
-            0 <= index < len(self.versions) and self._direction(self.versions[index]) != 0
-        )
-        if not successful:
-            self._set_status(self.tr("Failed to change pip source: {error}").format(error=value), error=True)
 
     def _apply_versions(self, result):
         self._set_busy(False, refresh_selection=False)
@@ -367,8 +302,7 @@ class UpdateCard(QWidget):
         if selected.get("kind") not in _TAG_KINDS:
             # A branch or pull request carries its own notes: what it adds to
             # the checked-out commit. Notes between versions are for tags.
-            notes = selected.get("update_note") or []
-            notes = notes if isinstance(notes, list) else [notes]
+            notes = self._entry_notes(selected)
             self._set_notes("\n".join(f"• {note}" for note in notes) or self.tr("No release notes."))
             return
 
@@ -379,7 +313,10 @@ class UpdateCard(QWidget):
             return
         try:
             tagged = [item for item in self.versions if item.get("kind") in _TAG_KINDS]
-            notes = calculate_notes(tagged, self.current_version, target)
+            if _accepts_language(calculate_notes):
+                notes = calculate_notes(tagged, self.current_version, target, language=_ui_locale())
+            else:
+                notes = calculate_notes(tagged, self.current_version, target)
             self._set_notes(
                 "\n".join(f"• {note}" for note in notes) or self.tr("No release notes.")
             )
@@ -387,6 +324,17 @@ class UpdateCard(QWidget):
             logger.error(f"pyappify.calculate_update_notes failed: {error}", error)
             self._set_notes("")
             self._set_status(self.tr("Failed to calculate update notes: {error}").format(error=error), error=True)
+
+    def _entry_notes(self, entry):
+        """``entry``'s notes in the UI language when the app's changelogs have them."""
+        entry_notes = getattr(self.pyappify_module, "entry_notes", None)
+        if callable(entry_notes):
+            try:
+                return entry_notes(entry, _ui_locale())
+            except Exception as error:
+                logger.error(f"pyappify.entry_notes failed: {error}", error)
+        notes = entry.get("update_note") or []
+        return notes if isinstance(notes, list) else [notes]
 
     def _resize_version_combo(self):
         font_metrics = QFontMetrics(self.version_combo.font())
@@ -429,7 +377,6 @@ class UpdateCard(QWidget):
         self._set_check_loading(busy and checking)
         self.test_version_checkbox.setEnabled(not busy)
         self.version_combo.setEnabled(not busy)
-        self.pip_combo.setEnabled(not busy)
         if busy:
             self.update_button.setEnabled(False)
         elif refresh_selection:
