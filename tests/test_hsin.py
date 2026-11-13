@@ -34,6 +34,12 @@ class _Task(TaskExecutor):
 
     def __init__(self, clock: _Clock):
         self.clock = clock
+        # 轮转测试在调用线程运行，使用无输入设备的任务环境，保留真实执行器等待逻辑。
+        self.thread = None
+        self.current_task = None
+        self.current_job = None
+        self.device_manager = SimpleNamespace(interaction=None)
+        self._frame = np.zeros((1, 1, 3), dtype=np.uint8)
         self.exit_event = Event()
         self.wait_scene_timeout = 1
         self.wait_until_settle_time = 0
@@ -48,13 +54,14 @@ class _Task(TaskExecutor):
     def reset_scene(self, check_enabled=True):
         pass
 
-    def next_frame(self, time_out=6):
+    def next_frame(self, time_out=6, deadline=None):
         self.frames += 1
         if self.frames >= 3000:
             raise AssertionError('unbounded rotation')
         if self.fail_frame:
             raise RuntimeError('combat ended')
         self.clock.advance(0.05)
+        return self._frame
 
     def wait_until(self, condition, **kwargs):
         return TaskExecutor.wait_condition(self, condition, **kwargs)
@@ -145,6 +152,10 @@ class HsinRotationTest(unittest.TestCase):
         timer = patch('src.char.Hsin.time.time', self.clock.time)
         timer.start()
         self.addCleanup(timer.stop)
+        # 新执行器使用单调业务时钟，须与角色轮转共用测试时钟，避免真实时间忙等。
+        monotonic_timer = patch('ok.task.TaskExecutor.time.monotonic', self.clock.time)
+        monotonic_timer.start()
+        self.addCleanup(monotonic_timer.stop)
         self.char = _Hsin(self.clock)
 
     def finishing(self):
