@@ -18,6 +18,8 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
     CLAIM_PATTERN = re.compile(r'领取|領取|Claim', re.I)
     CLAIMED_PATTERN = re.compile(r'已领取|已領取|Claimed', re.I)
     REWARD_PATTERN = re.compile(r'获得奖励|獲得獎勵|获得物品|獲得物品|Rewards? Obtained', re.I)
+    WEEKLY_PAGE_TITLE_PATTERN = re.compile(r'周度[游遊][历歷]|Weekly\s+Activity', re.I)
+    WEEKLY_GARDEN_ENTRY_PATTERN = re.compile(r'幻[梦夢][游遊][园園]|Phantasma\s+Dreamland', re.I)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -71,7 +73,7 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
                         self._garden_phase = 'enter'
                     if self._garden_phase == 'enter':
                         if not self.find_best_garden_feature():
-                            if not self.ocr(.102, .793, .284, .956, match=re.compile(r'\d')):
+                            if not self._is_weekly_garden_page():
                                 self._garden_unknown('恢复后未找到乐园入口或周常页面，已停止旧坐标操作')
                             self._garden_phase = 'enter_wait'
                             self.click(.246, .486, after_sleep=1)
@@ -246,8 +248,7 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
                 continue
             button = self.ocr(.8, .76, .99, .97, match=self.WEEKLY_BUTTON_PATTERN)
             if not button:
-                # 积分区域已有文字表示周常页已就绪；不再盲点同一位置，避免重复领取。
-                if self.ocr(.102, .793, .284, .956, match=re.compile(r'\d')):
+                if self._is_weekly_garden_page():
                     return
                 self._garden_unknown('无法确认乐园周常页面的导航或领取按钮')
             if self.CLAIMED_PATTERN.search(button[0].name):
@@ -260,6 +261,17 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
                 self._garden_weekly_claim_pending = False
                 return
             self.click(button, after_sleep=2)
+
+    def _is_weekly_garden_page(self):
+        epoch = getattr(self, '_foreground_epoch', 0)
+        frame = self.frame
+        # 零分可能被 OCR 读成字母 O；用同一帧的标题和玩法入口确认页面，积分另行判断。
+        title = self.ocr(.09, .08, .41, .17, frame=frame)
+        weekly_title = bool(self.WEEKLY_PAGE_TITLE_PATTERN.search(' '.join(box.name for box in title)))
+        entry = self.ocr(.11, .36, .38, .44, frame=frame) if weekly_title else []
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('乐园周常画面已更新，需要重新确认页面')
+        return bool(weekly_title and self.WEEKLY_GARDEN_ENTRY_PATTERN.search(' '.join(box.name for box in entry)))
 
     def _confirm_weekly_claim(self):
         if getattr(self, '_garden_weekly_claim_confirmed', False):
@@ -278,13 +290,29 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
         self._garden_unknown('无法确认乐园周常奖励领取结果，已停止以避免重复领取')
 
     def is_weekly_garden_completed(self):
-        current = self.ocr(0.102, 0.793, 0.284, 0.956, match=self.GARDEN_TARGET_POINTS)
-        self.log_info(self.tr('Garden current: {current}').format(current=current))
-        text = ' '.join(str(getattr(box, 'name', box)) for box in current)
-        progress = re.search(r'(\d[\d,]*)\s*/\s*6000', text)
-        if progress:
-            return int(progress.group(1).replace(',', '')) >= 6000
-        return bool(current)
+        # Daily 读取积分时导航上下文已经退出，单独注册才能收到 OCR 等待期间的恢复通知。
+        with self.executor.task_context(self):
+            epoch = getattr(self, '_foreground_epoch', 0)
+            frame = self.frame
+            height, width = frame.shape[:2]
+            # 保留整张截图的文字上下文，避免局部裁剪把 0 读成 O；只接受当前游历值区域的数字。
+            # 卡片说明和右侧奖励刻度也有 6000，不能用全屏命中直接判定完成。
+            current = [
+                box for box in self.ocr(frame=frame, match=re.compile(r'\d'))
+                if .102 * width <= box.x and box.x + box.width <= .284 * width
+                and .793 * height <= box.y and box.y + box.height <= .956 * height
+            ]
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('乐园周常画面已更新，需要重新读取积分')
+            self.log_info(self.tr('Garden current: {current}').format(current=current))
+            points = {
+                int(progress.group(1).replace(',', ''))
+                for box in current
+                if (progress := re.fullmatch(r'(\d[\d,]*)(?:\s*/\s*6,?000)?', box.name.strip()))
+            }
+            if len(points) != 1:
+                self._garden_unknown('无法确认乐园当前游历值，已停止以避免重复运行')
+            return points.pop() >= 6000
 
     def is_garden_done(self, texts):
         text = " ".join(str(getattr(box, "name", box)) for box in texts)

@@ -1,12 +1,18 @@
 import unittest
 from contextlib import nullcontext
+from copy import deepcopy
 from itertools import count
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
+from config import config
 from ok import TaskDisabledException, ForegroundInputError, ForegroundInputInterrupted
 from ok.feature.Box import Box
+from ok.task.TaskExecutor import TaskExecutor
+from ok.test.TaskTestCase import TaskTestCase
 from src.char.BaseChar import BaseChar
 from src.scene.WWScene import WWScene
+from src.task.DailyTask import DailyTask
 from src.task.FarmEchoTask import FarmEchoTask
 from src.task.GardenTask import GardenTask
 from src.task.WWOneTimeTask import WWOneTimeTask
@@ -92,7 +98,8 @@ class TestGardenForegroundRecovery(unittest.TestCase):
     def make_task(self):
         task = GardenTask.__new__(GardenTask)
         task.tr = str
-        task._executor = Mock()
+        task._executor = Mock(frame=Mock(shape=(1440, 2560, 3)))
+        task._foreground_epoch = 0
         task.executor.task_context.side_effect = lambda inner: nullcontext()
         task._garden_phase = 'play'
         task._garden_needs_refresh = False
@@ -119,7 +126,7 @@ class TestGardenForegroundRecovery(unittest.TestCase):
     def test_weekly_limit_preserves_noop_without_starting_garden(self):
         task = self.make_task()
         task.open_garden_weekly_page = Mock()
-        task.ocr.return_value = [Box(1, 1, 1, 1, name='6000')]
+        task.ocr.return_value = [Box(496, 1210, 160, 55, name='6000')]
 
         task.run()
 
@@ -128,15 +135,113 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         task.click.assert_not_called()
         self.assertEqual('completed', task._garden_phase)
 
-    def test_goal_number_alone_does_not_mark_partial_weekly_progress_completed(self):
+    def test_current_weekly_points_ignore_reward_scale_and_progress_target(self):
         task = self.make_task()
-        task.ocr.return_value = [Box(1, 1, 1, 1, name='3500/6000')]
+        for text, completed in (
+            ('0', False), ('3500', False), ('5999', False), ('6000', True),
+            ('6,000', True), ('3500/6000', False), ('6000/6000', True),
+        ):
+            with self.subTest(text=text):
+                task.ocr.return_value = [
+                    Box(496, 1210, 180, 55, name=text),
+                    Box(1557, 969, 120, 45, name='6000'),
+                    Box(2219, 1286, 104, 45, name='6000'),
+                ]
+                self.assertEqual(completed, task.is_weekly_garden_completed())
 
-        self.assertFalse(task.is_weekly_garden_completed())
         self.assertFalse(task.is_garden_done([]))
         self.assertFalse(task.is_garden_done(['3500/6000']))
         self.assertTrue(task.is_garden_done(['6000/6000']))
         self.assertTrue(task.is_garden_done(['已达到上限']))
+
+    def test_missing_or_ambiguous_current_points_stops(self):
+        for current in (
+            [Box(2219, 1286, 104, 45, name='6000')],
+            [Box(496, 1210, 40, 55, name='O')],
+            [Box(496, 1210, 40, 55, name='0'), Box(550, 1210, 160, 55, name='6000')],
+        ):
+            with self.subTest(current=current):
+                task = self.make_task()
+                task.ocr.return_value = current
+                with self.assertRaisesRegex(ForegroundInputError, '当前游历值'):
+                    task.is_weekly_garden_completed()
+                task.click.assert_not_called()
+                task.screenshot.assert_called_once_with('garden_result_unknown')
+
+    def test_weekly_page_requires_both_localized_anchors(self):
+        for title, entry, ready in (
+            (['周度游历'], ['幻梦游园', '·狂想'], True),
+            (['周度遊歷'], ['幻夢遊園'], True),
+            (['Weekly', 'Activity'], ['Phantasma', 'Dreamland: Rhapsody'], True),
+            (['周度游历'], ['千道门扉的异想'], False),
+            (['活跃度'], ['幻梦游园'], False),
+            (['6000'], ['0'], False),
+        ):
+            with self.subTest(title=title, entry=entry):
+                task = self.make_task()
+                task.ocr.side_effect = [
+                    [Box(1, 1, 1, 1, name=text) for text in title],
+                    [Box(1, 1, 1, 1, name=text) for text in entry],
+                ]
+                self.assertEqual(ready, task._is_weekly_garden_page())
+
+    def test_foreground_change_discards_weekly_page_and_points(self):
+        for method in ('_is_weekly_garden_page', 'is_weekly_garden_completed'):
+            with self.subTest(method=method):
+                task = self.make_task()
+
+                def changed_frame(*args, **kwargs):
+                    task._foreground_epoch += 1
+                    return [Box(496, 1210, 160, 55, name='6000')]
+
+                task.ocr.side_effect = changed_frame
+                with self.assertRaises(ForegroundInputInterrupted):
+                    getattr(task, method)()
+                task.click.assert_not_called()
+                task.screenshot.assert_not_called()
+
+    def test_daily_points_read_receives_nested_foreground_resume(self):
+        for points, resumed in (('0', False), ('6000', False), ('0', True), ('6000', True)):
+            with self.subTest(points=points, resumed=resumed):
+                task = self.make_task()
+                executor = task.executor
+                daily = DailyTask.__new__(DailyTask)
+                daily.tr = str
+                daily.info_set = Mock()
+                daily.log_info = Mock()
+                daily.on_foreground_resume = Mock()
+                daily.get_task_by_class = Mock(return_value=task)
+                daily.run_task_by_class = Mock()
+                task.open_garden_weekly_page = Mock()
+                executor.current_task = daily
+                executor._task_context_stack = []
+                executor.task_context.side_effect = lambda inner: TaskExecutor.task_context(executor, inner)
+
+                def read_points(*args, **kwargs):
+                    if resumed:
+                        # 导航上下文已退出，积分读取仍需注册内层实例，才能丢弃恢复前的 OCR 结果。
+                        executor.frame = Mock(shape=(1440, 2560, 3))
+                        TaskExecutor._notify_tasks_resumed(executor)
+                    return [Box(496, 1210, 160, 55, name=points)]
+
+                task.ocr.side_effect = read_points
+                if resumed:
+                    with self.assertRaises(ForegroundInputInterrupted):
+                        daily.check_weekly_garden()
+                    daily.on_foreground_resume.assert_called_once()
+                    self.assertEqual(1, task._foreground_epoch)
+                else:
+                    daily.check_weekly_garden()
+                    daily.on_foreground_resume.assert_not_called()
+                    self.assertEqual(0, task._foreground_epoch)
+
+                if not resumed and points == '0':
+                    daily.run_task_by_class.assert_called_once_with(GardenTask)
+                else:
+                    daily.run_task_by_class.assert_not_called()
+                self.assertEqual([], executor._task_context_stack)
+                self.assertIs(daily, executor.current_task)
+                task.screenshot.assert_not_called()
 
     def test_action_is_identified_after_wait_before_click(self):
         task = self.make_task()
@@ -276,6 +381,61 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         task.ensure_main.assert_called_once()
         task.open_garden_weekly_page.assert_called_once()
         self.assertEqual('completed', task._garden_phase)
+
+
+class TestGardenWeeklyPage(TaskTestCase):
+    task_class = GardenTask
+    config = deepcopy(config)
+
+    def setUp(self):
+        self.set_image(str(Path(__file__).resolve().parent / 'images' / 'garden_weekly_zero.webp'))
+        self.task._garden_phase = 'prepare'
+        self.task._garden_needs_refresh = False
+        self.task._garden_pending_source = None
+        self.task._garden_weekly_claim_pending = False
+        self.task._garden_weekly_claim_confirmed = False
+
+    def test_daily_zero_progress_reaches_garden_dispatch(self):
+        daily = DailyTask.__new__(DailyTask)
+        daily.tr = str
+        daily.info_set = Mock()
+        daily.log_info = Mock()
+        daily.get_task_by_class = Mock(return_value=self.task)
+        daily.run_task_by_class = Mock()
+
+        # 回放真实零分页面；旧代码把 0 读成 O，在调度乐园前就会抛出异常。
+        with patch.object(self.task, 'openF2Book'), patch.object(self.task, 'sleep'), \
+                patch.object(self.task, 'click') as click, patch.object(self.task, 'back') as back, \
+                patch.object(self.task, 'screenshot'):
+            daily.check_weekly_garden()
+
+        daily.run_task_by_class.assert_called_once_with(GardenTask)
+        click.assert_called_once_with(.343, .129, after_sleep=1)
+        back.assert_not_called()
+
+    def test_zero_progress_allows_garden_entry(self):
+        self.task._garden_phase = 'enter'
+        with patch.object(self.task, 'find_best_garden_feature', return_value=None), \
+                patch.object(self.task, 'wait_until', return_value=True), \
+                patch.object(self.task, '_play_garden_step', side_effect=TaskDisabledException), \
+                patch.object(self.task, 'click') as click, patch.object(self.task, 'screenshot'):
+            # 只验证入口决策，到达游玩阶段即取消，不能把替身点击当作实机通关。
+            with self.assertRaises(TaskDisabledException):
+                self.task.resume_after_foreground()
+
+        click.assert_called_once_with(.246, .486, after_sleep=1)
+        self.assertEqual('play', self.task._garden_phase)
+
+    def test_unknown_page_stops_without_clicking(self):
+        blank = self.task.frame.copy()
+        blank[:] = 0
+        with patch.object(self.task.executor, '_frame', blank), \
+                patch.object(self.task, 'click') as click, patch.object(self.task, 'screenshot') as screenshot:
+            with self.assertRaises(ForegroundInputError):
+                self.task._advance_weekly_page()
+
+        click.assert_not_called()
+        screenshot.assert_called_once_with('garden_result_unknown')
 
 
 if __name__ == '__main__':
