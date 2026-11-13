@@ -52,7 +52,8 @@ class TestSelfhostSmoke(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.user_root = Path(self.temp_dir.name) / 'user'
+        # Windows runner 的 TEMP 可能使用 RUNNER~1；同一夹具统一规范根，避免解析接口间误判。
+        self.user_root = Path(self.temp_dir.name).resolve() / 'user'
         # 路径消费者导入前隔离便携环境，不能加载继承环境里的用户脚本或诊断内容。
         self.user_data_patch = patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(self.user_root),
                                                       'OK_DISABLE_FILE_LOG': '1'})
