@@ -406,12 +406,12 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(sources[0], ('assets/coco.json', 'assets/templates', None))
         self.assertEqual(Path(sources[1][0]), self.user_root / 'ok_tasks/assets/coco_annotations.json')
         self.assertEqual(Path(sources[2][1]), plugin / 'assets/templates')
-        self.assertEqual(CocoTemplateStore().folder, self.user_root / 'ok_templates')
+        self.assertEqual(CocoTemplateStore().folder, (self.user_root / 'ok_templates').resolve())
         self.assertEqual(Path(get_coco_path()), self.user_root / 'ok_templates/coco_annotations.json')
         generate_label_enum('ok_tasks.SyntheticLabels', ['synthetic_feature'])
         self.assertTrue((self.user_root / 'ok_tasks/SyntheticLabels.py').is_file())
         external = Path(self.temp_dir.name) / 'external'
-        self.assertEqual(CocoTemplateStore(external).folder, external)
+        self.assertEqual(CocoTemplateStore(external).folder, external.resolve())
         signals = SimpleNamespace(draw_box=Mock(), clear_box=Mock(), screenshot=Mock())
         for configured in (None, str(external)):
             with patch.object(og, 'ok', SimpleNamespace(config={'screenshots_folder': configured})), \
