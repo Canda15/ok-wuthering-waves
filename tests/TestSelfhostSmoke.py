@@ -85,6 +85,102 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(apply(config), list(CUSTOM_TABS))
         self.assertEqual(len(config['custom_tabs']), len(CUSTOM_TABS))
 
+    def test_upstream_sync_retries_missing_release_and_rejects_query_errors(self):
+        import yaml
+        from selfhost.portable import process_environment
+
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1]
+                                   / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
+        step = next(item for item in workflow['jobs']['sync']['steps'] if item.get('id') == 'check')
+        assets = [{'name': name, 'state': 'uploaded', 'size': 100}
+                  for name in ('NoNo-win32-portable.zip', 'NoNo-win32-sha256.txt')]
+        scenarios = (
+            (True, False, 404, {}, True),
+            (True, False, 200, {'draft': False, 'assets': assets}, False),
+            (True, False, 200, {'draft': True, 'assets': assets}, True),
+            (True, False, 200, {'draft': False, 'assets': assets[:1]}, True),
+            (False, False, 200, {'draft': False, 'assets': assets}, True),
+            (True, True, 200, {'draft': False, 'assets': assets}, True),
+            (True, False, 503, {}, None),
+        )
+        # 执行工作流本身的分支，只替换外部 Git 查询和 HTTP，禁止测试真的推送或联网。
+        bootstrap = '''
+$ErrorActionPreference = 'Stop'
+function git {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'merge-base') { $global:LASTEXITCODE = [int]$env:TEST_MERGE_EXIT }
+}
+function Invoke-WebRequest {
+    [pscustomobject]@{StatusCode=[int]$env:TEST_HTTP_STATUS; Content=$env:TEST_RELEASE_JSON}
+}
+'''
+        script_path = Path(self.temp_dir.name) / 'sync-decision.ps1'
+        output_path = Path(self.temp_dir.name) / 'outputs.txt'
+        for merged, force, status, release, expected in scenarios:
+            with self.subTest(merged=merged, force=force, status=status, expected=expected):
+                script = step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.0')
+                script = script.replace('${{ inputs.force }}', str(force).lower())
+                script_path.write_text(bootstrap + script, encoding='utf-8')
+                output_path.write_bytes(b'')
+                environment = {**process_environment(), 'GITHUB_OUTPUT': str(output_path),
+                               'GITHUB_REPOSITORY': 'synthetic/repository',
+                               'UPSTREAM_REPO': 'synthetic/upstream', 'TEST_MERGE_EXIT': str(int(not merged)),
+                               'TEST_HTTP_STATUS': str(status), 'TEST_RELEASE_JSON': json.dumps(release)}
+                result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script_path)],
+                                        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=20)
+                output = output_path.read_text(encoding='utf-8-sig')
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('needed=', output)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.splitlines(), [f'needed={str(expected).lower()}'])
+
+    def test_upstream_publish_creates_annotated_tag_and_preserves_it_on_retry(self):
+        import yaml
+        from selfhost.portable import process_environment
+
+        root = Path(self.temp_dir.name).resolve()
+        checkout, remote = root / 'checkout', root / 'remote.git'
+        checkout.mkdir()
+        environment = process_environment()
+
+        def git(*arguments, cwd=checkout):
+            result = subprocess.run(['git', *arguments], cwd=cwd, env=environment, capture_output=True,
+                                    text=True, encoding='utf-8', timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git('init', '--bare', str(remote), cwd=root)
+        git('init', '-b', 'master')
+        git('config', 'user.name', '发布测试')
+        git('config', 'user.email', 'release-test@example.invalid')
+        git('remote', 'add', 'origin', str(remote))
+        tracked = checkout / 'source.txt'
+        tracked.write_text('初始版本\n', encoding='utf-8')
+        git('add', 'source.txt')
+        git('commit', '-m', '初始版本')
+        initial = git('rev-parse', 'HEAD')
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1]
+                                   / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
+        step = next(item for item in workflow['jobs']['sync']['steps'] if item.get('name') == 'Push and tag')
+        script_path = root / 'publish.ps1'
+        # 仅替换远端工作流派发；标签创建、推送和重试都使用实际的隔离 Git 仓库。
+        script_path.write_text("$ErrorActionPreference = 'Stop'\nfunction gh { $global:LASTEXITCODE = 0 }\n"
+                               + step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.0'), encoding='utf-8')
+        for retry in (False, True):
+            if retry:
+                tracked.write_text('后续代码\n', encoding='utf-8')
+                git('add', 'source.txt')
+                git('commit', '-m', '后续代码')
+            result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script_path)],
+                                    cwd=checkout, env=environment, capture_output=True,
+                                    text=True, encoding='utf-8', timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(git('cat-file', '-t', 'refs/tags/v3.8.0'), 'tag')
+            self.assertEqual(git('rev-parse', 'refs/tags/v3.8.0^{commit}', cwd=remote), initial)
+            self.assertEqual(git('rev-parse', 'refs/heads/master', cwd=remote), git('rev-parse', 'HEAD'))
+
     def test_main_window_still_consumes_custom_tabs(self):
         """上游换掉注册机制时会静默失效——这是最该被拦住的一种漂移。"""
         from ok.ui.qt.MainWindow import MainWindow

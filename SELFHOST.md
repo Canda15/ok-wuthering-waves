@@ -215,16 +215,19 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 `.github/workflows/sync-upstream.yml` 每 12 小时轮询上游最新 release（也可手动
 `workflow_dispatch`，可指定 tag）：
 
-1. tag 已在 master 里 → 什么都不做；
-2. `git merge --no-ff <tag>`；
+1. 检出前固定 Git 为 LF，防止 Windows 将严格校验的补丁头和载荷改成 CRLF；
+2. 上游标签保存在独立 `refs/upstream-tags/<tag>`。仅当其已合并、正式 Release 和完整 ZIP／校验附件均存在时跳过；缺发布或缺附件则继续，查询失败明确停止。需要合并时使用该独立引用；
 3. 冲突只允许出现在 `pyproject.toml` / `requirements.txt`——我们删过那里的 ok-script pin，上游每次
    bump 版本都会改那两行，属于必然冲突且完全可脚本复现：取上游版本后由 `sync_ok.py --reapply` 重新删掉。
    其他文件冲突一律失败退出，交给人；
 4. `python scripts/sync_ok.py --reapply`：在隔离树重放品牌与逻辑差异，成功后重建 `ok/`、重写依赖块；
 5. 复用 `.github/scripts/install_dependencies.py` 安装依赖，再运行 `scripts/check_foreground.ps1`：
    同时核对完整框架来源和前台输入、通知、多账号、无音消除、公共恢复及自维护冒烟；
-6. 全绿才 `git push origin HEAD:master`，再把上游 tag 改指到本次合并提交并强推，然后
-   `gh workflow run build.yml --ref <tag> --repo <本仓库>` 显式派发打包。
+6. 全绿才 `git push origin HEAD:master`。首次创建指向适配提交的注释标签；重试复用已有标签，
+   不强推或移动历史版本，再用 `gh workflow run build.yml --ref <tag> --repo <本仓库>` 显式派发打包。
+
+`force` 只强制重跑检查及已有版本发布，不改变已有标签的提交。人工合并后缺少 Release 时，
+默认运行也会补发，不再要求勾选 `force`。需要发布新代码时应使用尚未发布的新版本标签。
 
 第 6 步的 `--repo` 不是可省的啰嗦：本仓库是 fork，`gh` 在 checkout 里会把"这个仓库"解析成**基仓库**
 （上游），于是拿着只能访问自己仓库的 token 去派发上游的 `build.yml`，报
@@ -240,7 +243,8 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 `ok/util/version.py`：当前 PyAppify 支持 `v?数字.数字.数字` 及可选 `[-.](alpha|beta|rc)[.数字]`，
 `NoNo.exe -c setup --setup-version v3.7.17+xmod` 会直接报版本标签无效，便携包
 在 setup 这一步就失败；而客户端拉版本列表用同一个正则，带后缀的标签也进不了列表，等于自更新
-永远看不到新版本。所以 fork 里同名标签被改指到自己的合并提交，语义是"同一版本号 + 我们的补丁"。
+永远看不到新版本。因此 fork 首次创建同名标签时指向自己的适配提交，语义是"同一版本号 + 我们的补丁"；
+上游原标签使用独立引用，不能覆盖本仓库已经发布的标签。
 
 第 6 步的显式派发同样不是可选项：用 `GITHUB_TOKEN` 推的 tag 不会触发 push 类工作流
 （GitHub 禁止 token 递归触发），不派发就会出现"源码合了、包没编译"。
@@ -249,8 +253,8 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 
 | 想做的事 | 点哪个工作流 | 说明 |
 | --- | --- | --- |
-| 现在就要跟上上游最新 release | **Sync upstream release** | 自己取上游 `releases/latest`，合并、重建 `ok/`、跑冒烟、推 master、改 tag、派发打包，一条龙。该 tag 已合并时直接退出，勾 `force` 才会重来一遍 |
-| 只是重新打一次已有的版本 | **Windows Release** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
+| 现在就要跟上上游最新 release | **Sync upstream release** | 自动合并、校验并发布；已合并但缺 Release／完整附件时仍会补发，已完整发布才跳过。`force` 可强制重跑 |
+| 只是重新打一次已有的版本 | **Windows 发布** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
 | 编译普通源码提交并下载便携包 | **Windows 编译检查** | master 推送自动运行，也可手动派发；生成完整 NoNo-win32-portable.zip，不要求发布 tag |
 | 重新编启动器 | **构建 NoNo 启动器** | 固定官方来源并应用 NoNo 差异；先产出候选，发布需显式授权 |
 

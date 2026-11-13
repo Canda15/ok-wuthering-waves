@@ -39,6 +39,15 @@ jobs:
   sync:
     runs-on: windows-latest
     steps:
+      - name: 固定源码换行与路径
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          # 补丁头和来源摘要按原始 LF 字节校验，必须在 checkout 前禁用 CRLF 转换。
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -54,32 +63,56 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
         run: |
-          $tag = "${{ inputs.upstream_tag }}"
+          $tag = $env:UPSTREAM_TAG
           if (-not $tag) {
             $tag = gh api "repos/$env:UPSTREAM_REPO/releases/latest" --jq .tag_name
+            if ($LASTEXITCODE -ne 0) { throw '读取上游版本失败' }
           }
-          if (-not $tag) { throw '未能取得上游 tag' }
+          if ($tag -notmatch '^v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?$') {
+            throw '上游标签不是支持的版本格式'
+          }
           Write-Host "upstream tag: $tag"
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Skip when already merged
         id: check
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ steps.resolve.outputs.tag }}"
           $force = "${{ inputs.force }}"
           git remote add upstream "https://github.com/$env:UPSTREAM_REPO.git"
-          # 必须用 ${tag}:直接写 $tag:refs 会被 PowerShell 当成作用域变量
-          # ($tag 的 "refs" 作用域,解析为空),refspec 变成 refs/tags//tags/...
-          git fetch --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
-          git merge-base --is-ancestor $tag HEAD
+          # 上游提交与本仓库的同名发布标签不同，用独立引用防止抓取覆盖已发布标签。
+          $upstreamRef = "refs/upstream-tags/$tag"
+          git fetch --no-tags upstream "refs/tags/${tag}:${upstreamRef}"
+          if ($LASTEXITCODE -ne 0) { throw '抓取上游标签失败' }
+          git merge-base --is-ancestor $upstreamRef HEAD
+          if ($LASTEXITCODE -notin @(0, 1)) { throw '检查上游合并状态失败' }
           $merged = $LASTEXITCODE -eq 0
+          $released = $false
           if ($merged -and $force -ne 'true') {
-            Write-Host "$tag 已在 master 中,无需同步"
+            # 人工合并或发布失败后仍要补发；只有正式 Release 和完整附件齐全才能跳过。
+            $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+            $headers = @{Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'}
+            $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
+            if ($response.StatusCode -eq 200) {
+              $release = $response.Content | ConvertFrom-Json
+              $assets = @($release.assets | Where-Object { $_.state -eq 'uploaded' -and $_.size -gt 0 } |
+                ForEach-Object { $_.name })
+              $released = -not $release.draft -and $assets -contains 'NoNo-win32-portable.zip' -and
+                $assets -contains 'NoNo-win32-sha256.txt'
+            } elseif ($response.StatusCode -ne 404) {
+              throw "查询发布状态失败（HTTP $($response.StatusCode)），停止本次同步"
+            }
+          }
+          if ($merged -and $released -and $force -ne 'true') {
+            Write-Host "$tag 已合并且便携版本已发布，无需同步"
             "needed=false" >> $env:GITHUB_OUTPUT
           } else {
-            if ($merged) { Write-Host "$tag 已合并,按 force 要求继续执行" }
+            if ($merged) { Write-Host "$tag 已合并，继续验证并补发或重试发布" }
             "needed=true" >> $env:GITHUB_OUTPUT
           }
           # merge-base 用 1 表示"不是祖先",这是正常分支,不能让步骤判失败
@@ -93,7 +126,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git merge --no-ff --no-edit $tag
+          git merge --no-ff --no-edit "refs/upstream-tags/$tag"
           if ($LASTEXITCODE -eq 0) { exit 0 }
 
           # 我们删掉过 pyproject.toml / requirements.txt 里的 ok-script pin,上游每次
@@ -148,16 +181,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ steps.resolve.outputs.tag }}"
-          # 标签沿用上游版本号本身,而不是加后缀。原因不是审美:
-          # 1) 打包器只认 ^v?\d+\.\d+\.\d+(-alpha|beta|rc\.\d+)?$,
-          #    带 +xmod 的标签会让 `ok-ww.exe -c setup --setup-version` 直接报
-          #    "Invalid setup version tag",构建在打包 China profile 时崩掉;
-          # 2) 客户端拉版本列表也走同一个正则,带后缀的标签根本进不了列表,
-          #    等于自更新永远看不到新版本。
-          # 同名标签在我们的 fork 里改指自己的合并提交,语义是"同一版本号 + 我们的补丁"。
+          # 沿用上游版本号，但首次发布指向本仓库适配提交；重试复用原标签，不移动历史版本。
           git push origin HEAD:master
-          git tag -f $tag
-          git push --force origin $tag
+          if ($LASTEXITCODE -ne 0) { throw '推送适配代码失败' }
+          git show-ref --verify --quiet "refs/tags/$tag"
+          if ($LASTEXITCODE -eq 1) {
+            git tag -a $tag -m $tag
+            if ($LASTEXITCODE -ne 0) { throw '创建发布标签失败' }
+          } elseif ($LASTEXITCODE -ne 0) {
+            throw '检查发布标签失败'
+          }
+          git push origin "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw '推送发布标签失败，未覆盖已有标签' }
           # 用 GITHUB_TOKEN 推的 tag 不会触发 build.yml(GitHub 禁止 token 递归
           # 触发 push 类事件),所以必须显式派发一次,否则源码合了、包没编译。
           # --repo 不能省:本仓库是 fork,gh 会把"仓库"解析成基仓库(上游),
@@ -165,4 +200,4 @@ jobs:
           # "Resource not accessible by integration",而源码和标签已经推上去了。
           gh workflow run build.yml --ref $tag --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw "派发 build.yml 失败(退出码 $LASTEXITCODE)" }
-          Write-Host "已把 $tag 指到本次合并提交并派发 build.yml"
+          Write-Host "已推送 $tag 并派发 build.yml"
