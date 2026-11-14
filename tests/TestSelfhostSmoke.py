@@ -579,7 +579,7 @@ function Invoke-WebRequest {
                 inliner.inline_site_packages(destination, ('pyappify',))
             copier.assert_not_called()
 
-    def test_b7_resources_keep_foreground_messages_and_removed_update_source_keys(self):
+    def test_framework_resources_keep_foreground_messages_and_removed_update_source_keys(self):
         from PySide6 import QtCore
         repo = Path(__file__).resolve().parents[1]
         qt_folder = repo / 'ok/ui/qt'
@@ -646,7 +646,9 @@ function Invoke-WebRequest {
         finally:
             self.assertTrue(QtCore.qUnregisterResourceData(*arguments))
         manifest = json.loads((repo / 'selfhost/logic_patches.json').read_bytes())
-        self.assertEqual(manifest['framework_version'], '3.0.5b7')
+        pin = json.loads((repo / 'selfhost/ok_pin.json').read_bytes())
+        # 资源约束跟随已登记的框架来源，升级补丁版本不应被旧版本常量误报阻断。
+        self.assertEqual(manifest['framework_version'], pin['version'])
         paths = {entry['path'] for entry in manifest['entries']}
         self.assertNotIn('ui/qt/MainWindow.py', paths)
         self.assertNotIn('ui/qt/about/UpdateCard.py', paths)

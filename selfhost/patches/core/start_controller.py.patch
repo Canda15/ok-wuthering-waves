@@ -25,7 +25,7 @@
              task.info_clear()
              task.executor.enqueue_onetime_task(task)
              logger.info(f"enabled task {task}")
-@@ -160,6 +171,7 @@
+@@ -183,6 +194,7 @@
  
              if task and task.enabled and task.paused:
                  logger.info(f"resume paused task {task}")
@@ -33,7 +33,7 @@
                  if exit_after:
                      task.exit_after_task = True
                      communicate.task.emit(task)
-@@ -173,6 +185,7 @@
+@@ -196,6 +208,7 @@
                      task.exit_after_task = True
                  self._mark_task_enabled(task)
                  if og.executor.paused:
@@ -41,7 +41,7 @@
                      og.executor.start()
                  communicate.starting_emulator.emit(True, None, 0)
                  return True
-@@ -223,6 +236,8 @@
+@@ -246,6 +259,8 @@
              for waiting_task in waiting:
                  add_task_to_enable(waiting_task)
  
@@ -50,7 +50,7 @@
              for task in tasks_to_enable:
                  self._mark_task_enabled(task)
  
-@@ -441,7 +456,7 @@
+@@ -464,7 +479,7 @@
                  return self.tr("Emulator is not connected, start the emulator first!")
              if isinstance(og.device_manager.capture_method,
                            BrowserCaptureMethod) and not og.device_manager.capture_method.connected():
@@ -59,7 +59,7 @@
                  og.device_manager.capture_method.start_browser()
              if not og.device_manager.capture_method.connected():
                  logger.error(f'Game window is not connected {og.device_manager.capture_method}')
-@@ -461,19 +476,19 @@
+@@ -484,19 +499,19 @@
                              'Window is minimized or out of screen, and don\'t use full-screen exclusive mode!')
              frame = self.try_capture_a_frame()
              if frame is None:
@@ -85,7 +85,7 @@
              resolution_error = self.check_resolution()
              if resolution_error:
                  logger.error(f'check_device_error: resolution_error: {resolution_error}')
-@@ -498,8 +513,8 @@
+@@ -521,8 +536,8 @@
              frame = og.device_manager.capture_method.get_frame(busy_wait=1)
              if frame is not None:
                  return frame

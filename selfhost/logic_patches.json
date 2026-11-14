@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "framework_version": "3.0.5b7",
-  "baseline_tree_sha256": "111bd118e3df7dcf1be15c8283c413937c30860525dba6c9610a57a75eed7d2a",
+  "framework_version": "3.0.5b8",
+  "baseline_tree_sha256": "0d6dd964a7ed456940952518fc62dfa4e9ed5db230aef4544eef9b5d5bbdc846",
   "entries": [
     {
       "path": "__init__.py",
@@ -80,8 +80,8 @@
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/core/start_controller.py.patch",
-      "before_sha256": "3c4eb2176bdb1faf6ba91a1e82f36a2dcfe1540ce0d98768afde26b3606d6521",
-      "after_sha256": "a39b762affa7ba7f0f90cf2d7dc6d28cf5e8cf4fccb9e774d044fe1ca39177d6"
+      "before_sha256": "97c58ae890e8591246958f7d268734ba119056f0fe6ad4fe723c653fe6bd59c2",
+      "after_sha256": "194ba58fe89d87a137914689c3e64e8b45ba6cc34b2107526e259241c6042eeb"
     },
     {
       "path": "core/task_manager.py",

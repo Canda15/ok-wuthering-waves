@@ -1,8 +1,8 @@
 {
   "package": "ok-script",
-  "version": "3.0.5b7",
-  "wheel_sha256": "3ddb003bb62bb3e80e7ada0c7261067773f0c0b1ce5784829cc3844a7bc59fb3",
-  "tree_sha256": "a5be81ac46400738f73488759db562cf17fc053d4b779deb857da7354db4a88e",
-  "logic_patches_sha256": "ada483f0339267b1359a18a041aaa4ac681e52b1dbf8d1d6a126f4fe001292e5",
-  "source_url": "https://files.pythonhosted.org/packages/dc/a1/e833222c89c6ed2d82c097fe6e0b93b43e17578151769e7b7f24affbb484/ok_script-3.0.5b7-py3-none-any.whl"
+  "version": "3.0.5b8",
+  "wheel_sha256": "81bcecf0078378a0b6138a4487e53e2db0bc0ba58243ec26381093c8a198cf1e",
+  "tree_sha256": "06e0b54dbd1e03b3f080cbd45c8f59fff2edbca70771ceafbf8774cc93624b92",
+  "logic_patches_sha256": "0f0b4a41d39fa891cde5d9938695c467b4b7a4fe2ecfe5a3d8365e40c88ea58c",
+  "source_url": "https://files.pythonhosted.org/packages/35/6d/8257e693588701fdfe12dfe90faa51d86a200fe2caf1f038adb67fdc8316/ok_script-3.0.5b8-py3-none-any.whl"
 }

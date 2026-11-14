@@ -1215,6 +1215,104 @@ class TestForegroundLifecycle(InputFixture):
             self.assertTrue(controller._do_start(self.task))
         self.assertEqual(order, ['绑定', '置前', '继续'])
 
+    def test_CLI索引启动在前台准备完成后只入队一次(self):
+        controller = self.make_start_controller()
+        posted = []
+        controller.handler = SimpleNamespace(post=posted.append)
+        self.task._enabled = self.task.running = False
+        self.task._foreground_resume_pending = True
+        self.executor.current_task = None
+        order = []
+        self.executor.device_manager.wait_for_binding.side_effect = lambda **kwargs: order.append('绑定')
+        self.window.bring_to_front.side_effect = lambda **kwargs: order.append('置前') or True
+        self.executor.start.side_effect = lambda: order.append('开始')
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+
+        # 保留 CLI 索引到真实任务队列的完整路径，避免把启动成功误当作任务已入队。
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            controller.start(0, exit_after=True)
+            self.assertTrue(controller.is_task_pending(self.task))
+            self.assertFalse(self.task.enabled)
+            self.assertTrue(posted[0]())
+            self.assertFalse(controller.is_task_pending(self.task))
+
+        self.assertEqual(order, ['绑定', '置前', '开始'])
+        self.assertEqual(self.executor.onetime_task_queue, [self.task])
+        self.assertTrue(self.task.enabled)
+        self.assertTrue(self.task.exit_after_task)
+        self.assertFalse(self.task._foreground_resume_pending)
+        self.assertFalse(controller.starting)
+        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertFalse(self.native.inserted)
+
+    def test_直接启动任务也保留前台准备和入队请求(self):
+        controller = self.make_start_controller()
+        self.task._enabled = self.task.running = False
+        self.task._foreground_resume_pending = True
+        self.executor.current_task = None
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            self.assertTrue(controller.do_start(self.task, exit_after=True))
+            self.assertFalse(controller.is_task_pending(self.task))
+
+        self.executor.device_manager.wait_for_binding.assert_called_once()
+        self.window.bring_to_front.assert_called_once()
+        self.executor.start.assert_called_once()
+        self.assertEqual(self.executor.onetime_task_queue, [self.task])
+        self.assertTrue(self.task.enabled)
+        self.assertTrue(self.task.exit_after_task)
+        self.assertFalse(self.task._foreground_resume_pending)
+        self.assertFalse(controller.starting)
+        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertFalse(self.native.inserted)
+
+    def test_CLI排队请求取消后不刷新设备或抢焦点(self):
+        controller = self.make_start_controller()
+        posted = []
+        controller.handler = SimpleNamespace(post=posted.append)
+        self.task._enabled = self.task.running = False
+        self.executor.current_task = None
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            controller.start(0)
+            self.assertTrue(controller.cancel_task(self.task))
+            self.assertFalse(posted[0]())
+            self.assertFalse(controller.is_task_pending(self.task))
+
+        self.executor.device_manager.do_refresh.assert_not_called()
+        self.executor.device_manager.wait_for_binding.assert_not_called()
+        self.window.bring_to_front.assert_not_called()
+        self.executor.start.assert_not_called()
+        self.assertFalse(self.executor.onetime_task_queue)
+        self.assertFalse(self.task.enabled)
+        self.assertFalse(self.native.inserted)
+
+    def test_CLI绑定期间取消不启用任务或发出输入(self):
+        controller = self.make_start_controller()
+        posted = []
+        controller.handler = SimpleNamespace(post=posted.append)
+        self.task._enabled = self.task.running = False
+        self.executor.current_task = None
+        self.executor.device_manager.wait_for_binding.side_effect = lambda **kwargs: controller.cancel_start()
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+
+        # 取消可能发生在 pending 已移入待启用列表之后，前台准备仍须再次检查。
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            controller.start(0)
+            self.assertFalse(posted[0]())
+            self.assertFalse(controller.is_task_pending(self.task))
+
+        self.executor.device_manager.wait_for_binding.assert_called_once()
+        self.window.bring_to_front.assert_not_called()
+        self.executor.start.assert_not_called()
+        self.assertFalse(self.executor.onetime_task_queue)
+        self.assertFalse(self.task.enabled)
+        self.assertFalse(controller.starting)
+        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertFalse(self.native.inserted)
+
     def test_通知作业失焦延期但不阻塞只读作业(self):
         notification = ExecutorJob(self.executor, lambda: None, defer_while_unfocused=True)
         readonly = ExecutorJob(self.executor, lambda: None)
