@@ -2363,6 +2363,12 @@
       "file_name": "hiyuki-skin-inactive.png",
       "width": 3840,
       "height": 2160
+    },
+    {
+      "id": 309,
+      "file_name": "weekly_garden_zero.webp",
+      "width": 2560,
+      "height": 1440
     }
   ],
   "annotations": [
@@ -6634,6 +6640,19 @@
       ],
       "area": 3968.0,
       "iscrowd": 0
+    },
+    {
+      "id": 463,
+      "image_id": 309,
+      "category_id": 302,
+      "bbox": [
+        144.0,
+        226.0,
+        27.0,
+        29.0
+      ],
+      "area": 783.0,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -8140,6 +8159,11 @@
     {
       "id": 301,
       "name": "char_hiyuki2",
+      "supercategory": ""
+    },
+    {
+      "id": 302,
+      "name": "weekly_garden_reward_hint",
       "supercategory": ""
     }
   ]

@@ -298,6 +298,7 @@ class Labels(str, Enum):
     the_garden_max = 'the_garden_max'
     tool_teleport = 'tool_teleport'
     treasure_icon = 'treasure_icon'
+    weekly_garden_reward_hint = 'weekly_garden_reward_hint'
     wheel_levitator = 'wheel_levitator'
     world_earth_icon = 'world_earth_icon'
     ww = 'ww'

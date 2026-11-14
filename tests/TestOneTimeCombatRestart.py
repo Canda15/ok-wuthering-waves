@@ -5,6 +5,8 @@ from itertools import count
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import cv2
+
 from config import config
 from ok import TaskDisabledException, ForegroundInputError, ForegroundInputInterrupted
 from ok.feature.Box import Box
@@ -105,6 +107,7 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         task._garden_needs_refresh = False
         task._garden_pending_source = None
         task.sleep = Mock()
+        task.next_frame = Mock(return_value=task.frame)
         task.wait_foreground_frame = Mock()
         task.find_best_garden_feature = Mock(return_value=None)
         task.find_one = Mock(return_value=None)
@@ -122,6 +125,280 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         clock = count(0, .1)
         task.business_time = lambda: next(clock)
         return task
+
+    def prepare_weekly_rewards(self, task, available=(1000, 6000), points=6000, batch=False):
+        centers = (948, 1232, 1516, 1800, 2084, 2369)
+        page = {'available': set(available), 'popup': False, 'submitted': []}
+        reward = Box(800, 300, 200, 60, name='获得物品')
+        numbers = [Box(496, 1210, 180, 55, name=str(points))]
+        numbers.extend(Box(x - 145, 1288, 100, 44, name=str((index + 1) * 1000))
+                       for index, x in enumerate(centers))
+
+        def read_page(*args, **kwargs):
+            match = kwargs.get('match')
+            if match is task.REWARD_PATTERN:
+                return [reward] if page['popup'] else []
+            if page['popup'] or match in (task.WEEKLY_BUTTON_PATTERN, task.CLAIMED_PATTERN):
+                return []
+            if args == (.09, .08, .41, .17):
+                return [Box(776, 161, 149, 48, name='周度游历')]
+            if args == (.11, .36, .38, .44):
+                return [Box(339, 556, 192, 45, name='幻梦游园')]
+            return numbers
+
+        def find_hint(feature_name=None, *, box=None, **kwargs):
+            if feature_name != 'weekly_garden_reward_hint' or page['popup']:
+                return None
+            for threshold in sorted(page['available'], reverse=True):
+                hint = Box(centers[threshold // 1000 - 1] + 30, 1214, 27, 29,
+                           name='weekly_garden_reward_hint')
+                if box is None or (box.x <= hint.x and box.y <= hint.y
+                                   and hint.x + hint.width <= box.x + box.width
+                                   and hint.y + hint.height <= box.y + box.height):
+                    return hint
+            return None
+
+        def click_page(target, *args, **kwargs):
+            if not isinstance(target, Box):
+                return
+            center = target.x + target.width / 2
+            index = min(range(6), key=lambda value: abs(centers[value] - center))
+            self.assertLess(abs(centers[index] - center), 25, '应点击宝箱中央，而不是提示菱形')
+            threshold = (index + 1) * 1000
+            self.assertIn(threshold, page['available'])
+            page['submitted'].append(threshold)
+            page['available'].difference_update(page['available'] if batch else {threshold})
+            page['popup'] = True
+
+        task.ocr.side_effect = read_page
+        task.find_one.side_effect = find_hint
+        task.next_frame = Mock(return_value=task.frame)
+        task.wait_ocr.side_effect = lambda *args, **kwargs: read_page(*args, **kwargs)
+        task.click.side_effect = click_page
+        task.back.side_effect = lambda *args, **kwargs: page.update(popup=False)
+        return page
+
+    def test_daily_full_points_claims_icon_rewards_before_skipping_play(self):
+        task = self.make_task()
+        page = self.prepare_weekly_rewards(task)
+        daily = DailyTask.__new__(DailyTask)
+        daily.tr = str
+        daily.info_set = Mock()
+        daily.log_info = Mock()
+        daily.get_task_by_class = Mock(return_value=task)
+        daily.run_task_by_class = Mock()
+
+        daily.check_weekly_garden()
+
+        self.assertEqual([6000, 1000], page['submitted'])
+        self.assertFalse(page['available'])
+        self.assertFalse(page['popup'])
+        daily.run_task_by_class.assert_not_called()
+
+    def test_weekly_return_rescans_after_single_or_batch_claim(self):
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                task = self.make_task()
+                task._garden_phase = 'weekly'
+                page = self.prepare_weekly_rewards(task, available=(1000, 3000, 6000), batch=batch)
+
+                task.resume_after_foreground()
+
+                self.assertEqual([6000] if batch else [6000, 3000, 1000], page['submitted'])
+                self.assertFalse(page['available'])
+                self.assertFalse(page['popup'])
+                self.assertEqual('completed', task._garden_phase)
+
+    def test_weekly_claim_state_does_not_leak_to_later_checks(self):
+        task = self.make_task()
+        page = self.prepare_weekly_rewards(task, available=(6000,))
+
+        task.open_garden_weekly_page()
+        task.open_garden_weekly_page()
+        self.assertEqual([6000], page['submitted'])
+        self.assertFalse(task._garden_weekly_claim_pending)
+        self.assertFalse(task._garden_weekly_claim_confirmed)
+        page['available'].add(5000)
+        task.open_garden_weekly_page()
+
+        self.assertEqual([6000, 5000], page['submitted'])
+
+    def test_reward_popup_resets_empty_page_stability(self):
+        task = self.make_task()
+        page = self.prepare_weekly_rewards(task, available=())
+        page['time'] = 0.0
+        task.business_time = lambda: page['time']
+        frames = iter((
+            (0.0, False, set()),
+            (1.0, True, set()),
+            (1.1, False, set()),
+            (1.3, False, {6000}),
+            (1.6, False, set()),
+            (2.2, False, set()),
+        ))
+
+        def next_page():
+            instant, popup, available = next(frames)
+            page.update(time=instant, popup=popup, available=available)
+            return task.frame
+
+        task.next_frame.side_effect = next_page
+        task.open_garden_weekly_page()
+
+        # 弹窗已打断空页观察，关闭后的暂空帧不能沿用弹窗前的稳定计时。
+        self.assertEqual([6000], page['submitted'])
+        self.assertFalse(page['popup'])
+
+    def test_pending_icon_without_reward_result_never_replays(self):
+        task = self.make_task()
+        page = self.prepare_weekly_rewards(task, available=(6000,))
+        submit = task.click.side_effect
+
+        def missing_result(target, *args, **kwargs):
+            submit(target, *args, **kwargs)
+            page['popup'] = False
+
+        task.click.side_effect = missing_result
+        for _ in range(2):
+            with self.assertRaisesRegex(ForegroundInputError, '避免重复领取'):
+                task.open_garden_weekly_page()
+        self.assertEqual([6000], page['submitted'])
+        self.assertTrue(task._garden_weekly_claim_pending)
+        task.wait_foreground_frame.assert_not_called()
+
+    def test_weekly_input_failure_and_cancellation_are_not_retried(self):
+        for error in (ForegroundInputError('输入失败'), TaskDisabledException()):
+            with self.subTest(error=type(error).__name__):
+                task = self.make_task()
+                self.prepare_weekly_rewards(task, available=(1000,))
+
+                def stop_on_reward(target, *args, **kwargs):
+                    if isinstance(target, Box):
+                        raise error
+
+                task.click.side_effect = stop_on_reward
+                with self.assertRaises(type(error)):
+                    task.open_garden_weekly_page()
+                self.assertEqual(1, sum(isinstance(call.args[0], Box) for call in task.click.call_args_list))
+                task.wait_foreground_frame.assert_not_called()
+
+    def bind_weekly_foreground_context(self, task):
+        executor = task.executor
+        outer = Mock()
+        executor.current_task = outer
+        executor._task_context_stack = []
+        executor.task_context.side_effect = lambda inner: TaskExecutor.task_context(executor, inner)
+        return executor, outer
+
+    def test_icon_claim_and_close_resume_without_duplicate_submission(self):
+        for interrupt_at in ('submitted', 'before_close', 'after_close'):
+            with self.subTest(interrupt_at=interrupt_at):
+                task = self.make_task()
+                page = self.prepare_weekly_rewards(task)
+                executor, outer = self.bind_weekly_foreground_context(task)
+                submit, close = task.click.side_effect, task.back.side_effect
+                interrupted = False
+
+                def submit_then_interrupt(target, *args, **kwargs):
+                    nonlocal interrupted
+                    submit(target, *args, **kwargs)
+                    if isinstance(target, Box) and interrupt_at == 'submitted' and not interrupted:
+                        interrupted = True
+                        TaskExecutor._notify_tasks_resumed(executor)
+
+                def close_then_interrupt(*args, **kwargs):
+                    nonlocal interrupted
+                    if interrupt_at == 'before_close' and not interrupted:
+                        interrupted = True
+                        TaskExecutor._notify_tasks_resumed(executor)
+                    close(*args, **kwargs)
+                    if interrupt_at == 'after_close' and not interrupted:
+                        interrupted = True
+                        TaskExecutor._notify_tasks_resumed(executor)
+
+                task.click.side_effect = submit_then_interrupt
+                task.back.side_effect = close_then_interrupt
+                # 等待阶段再次失焦也应仍由同一个导航恢复边界处理。
+                task.wait_foreground_frame.side_effect = [ForegroundInputInterrupted('等待时再次失焦'), None]
+                task.open_garden_weekly_page()
+
+                self.assertEqual([6000, 1000], page['submitted'])
+                self.assertFalse(page['popup'])
+                self.assertFalse(task._garden_weekly_claim_pending)
+                self.assertFalse(task._garden_weekly_claim_confirmed)
+                self.assertEqual([], executor._task_context_stack)
+                self.assertIs(outer, executor.current_task)
+                self.assertEqual(2, task.wait_foreground_frame.call_count)
+                outer.on_foreground_resume.assert_called_once()
+
+    def test_scan_resume_discards_old_hint_and_restarts_empty_stability(self):
+        for start_empty in (False, True):
+            with self.subTest(start_empty=start_empty):
+                task = self.make_task()
+                page = self.prepare_weekly_rewards(task, available=() if start_empty else (6000,))
+                executor, outer = self.bind_weekly_foreground_context(task)
+                find_hint = task.find_one.side_effect
+                interrupted = False
+
+                def interrupt_hint(*args, **kwargs):
+                    nonlocal interrupted
+                    hint = find_hint(*args, **kwargs)
+                    if hint is not None and not interrupted:
+                        interrupted = True
+                        page['available'] = {1000}
+                        TaskExecutor._notify_tasks_resumed(executor)
+                    return hint
+
+                def interrupt_empty_wait(seconds):
+                    nonlocal interrupted
+                    if seconds == .2 and not interrupted:
+                        interrupted = True
+                        page['available'] = {1000}
+                        TaskExecutor._notify_tasks_resumed(executor)
+
+                if start_empty:
+                    task.sleep.side_effect = interrupt_empty_wait
+                else:
+                    task.find_one.side_effect = interrupt_hint
+                task.open_garden_weekly_page()
+
+                self.assertEqual([1000], page['submitted'])
+                self.assertEqual([], executor._task_context_stack)
+                self.assertIs(outer, executor.current_task)
+
+    def test_incomplete_or_locked_reward_row_never_clicks(self):
+        for locked, resumed in ((True, False), (False, False), (False, True)):
+            with self.subTest(locked=locked, resumed=resumed):
+                task = self.make_task()
+                self.prepare_weekly_rewards(task, available=(6000,) if locked else (), points=0)
+                if not locked:
+                    def incomplete_numbers(*args, **kwargs):
+                        if resumed:
+                            task._foreground_epoch += 1
+                        return []
+                    task.ocr.side_effect = incomplete_numbers
+                error = ForegroundInputInterrupted if resumed else ForegroundInputError
+                with self.assertRaises(error):
+                    task._find_weekly_reward(task.frame)
+                task.click.assert_not_called()
+                if resumed:
+                    task.screenshot.assert_not_called()
+                else:
+                    task.screenshot.assert_called_once_with('garden_result_unknown')
+
+    def test_confirmed_reward_text_from_old_frame_is_not_accepted(self):
+        task = self.make_task()
+        task._garden_weekly_claim_target = 6000
+
+        def stale_reward(*args, **kwargs):
+            task._foreground_epoch += 1
+            return [Box(800, 300, 200, 60, name='获得物品')]
+
+        task.wait_ocr.side_effect = stale_reward
+        with self.assertRaises(ForegroundInputInterrupted):
+            task._confirm_weekly_claim()
+        self.assertFalse(getattr(task, '_garden_weekly_claim_confirmed', False))
+        task.back.assert_not_called()
 
     def test_weekly_limit_preserves_noop_without_starting_garden(self):
         task = self.make_task()
@@ -312,18 +589,21 @@ class TestGardenForegroundRecovery(unittest.TestCase):
                 task = self.make_task()
                 reward = Box(1, 1, 1, 1, name='获得物品')
                 claim = [Box(1, 1, 1, 1, name='领取')]
-                popup = {'open': False}
+                popup = {'open': False, 'claimed': False}
+                page = self.prepare_weekly_rewards(task, available=())
+                read_weekly_page = task.ocr.side_effect
 
                 def read_page(*args, **kwargs):
                     if kwargs.get('match') is task.REWARD_PATTERN:
                         return [reward] if popup['open'] else []
                     if kwargs.get('match') is task.WEEKLY_BUTTON_PATTERN:
-                        return claim
-                    return []
+                        return [] if popup['claimed'] else claim
+                    return read_weekly_page(*args, **kwargs)
 
                 def click_page(target, *args, **kwargs):
-                    if target is claim:
+                    if target is claim[0]:
                         popup['open'] = True
+                        popup['claimed'] = True
 
                 def close_result(*args, **kwargs):
                     if task.back.call_count == 1:
@@ -333,17 +613,18 @@ class TestGardenForegroundRecovery(unittest.TestCase):
                     popup['open'] = False
 
                 task.ocr.side_effect = read_page
-                task.wait_ocr.return_value = [reward]
+                task.wait_ocr.side_effect = read_page
                 task.click.side_effect = click_page
                 task.back.side_effect = close_result
 
                 task.open_garden_weekly_page()
 
                 task.executor.task_context.assert_called_once_with(task)
-                self.assertEqual(1, sum(args.args[0] is claim for args in task.click.call_args_list))
+                self.assertEqual(1, sum(args.args[0] is claim[0] for args in task.click.call_args_list))
                 task.wait_foreground_frame.assert_called_once()
                 self.assertFalse(popup['open'])
                 self.assertFalse(task._garden_weekly_claim_pending)
+                self.assertFalse(page['submitted'])
 
     def test_unknown_weekly_claim_saves_evidence_and_does_not_retry(self):
         task = self.make_task()
@@ -353,7 +634,7 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         with self.assertRaisesRegex(ForegroundInputError, '避免重复领取'):
             task.open_garden_weekly_page()
 
-        self.assertEqual(1, sum(args.args[0] is claim for args in task.click.call_args_list))
+        self.assertEqual(1, sum(args.args[0] is claim[0] for args in task.click.call_args_list))
         task.screenshot.assert_called_once_with('garden_result_unknown')
         task.wait_foreground_frame.assert_not_called()
 
@@ -388,7 +669,7 @@ class TestGardenWeeklyPage(TaskTestCase):
     config = deepcopy(config)
 
     def setUp(self):
-        self.set_image(str(Path(__file__).resolve().parent / 'images' / 'garden_weekly_zero.webp'))
+        self.set_image(str(Path(__file__).resolve().parents[1] / 'ok_templates' / 'weekly_garden_zero.webp'))
         self.task._garden_phase = 'prepare'
         self.task._garden_needs_refresh = False
         self.task._garden_pending_source = None
@@ -426,10 +707,49 @@ class TestGardenWeeklyPage(TaskTestCase):
         click.assert_called_once_with(.246, .486, after_sleep=1)
         self.assertEqual('play', self.task._garden_phase)
 
+    def test_reward_hint_template_does_not_join_play_features(self):
+        self.assertNotIn('weekly_garden_reward_hint', self.task.garden_features)
+        feature = self.task.find_one('weekly_garden_reward_hint', threshold=.99)
+        self.assertIsNotNone(feature)
+        self.assertLessEqual(abs(feature.x - 144), 1)
+        self.assertLessEqual(abs(feature.y - 226), 1)
+
+    def test_original_zero_page_and_unrelated_hints_have_no_reward_candidate(self):
+        original = self.task.frame.copy()
+        for scale in (.5, .75, 1):
+            with self.subTest(scale=scale):
+                frame = cv2.resize(original, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                self.task.executor.feature_set.check_size(frame)
+                self.assertIsNone(self.task._find_weekly_reward(frame))
+
+    def test_synthetic_reward_hints_keep_slot_and_scale_geometry(self):
+        original = self.task.frame.copy()
+        cases = [(source_y, scale, index) for source_y in (766, 947)
+                 for scale, index in ((.5, 0), (.75, 2), (1, 5))]
+        for source_y, scale, index in cases:
+            with self.subTest(source_y=source_y, scale=scale, slot=index):
+                frame = original.copy()
+                # 合成状态仅验证图标几何和真实 OCR，不代表已取得实机可领取截图。
+                # 提示取自同一原图另外两个位置，避免复制模板自身造成自匹配假象。
+                hint = original[source_y:source_y + 29, 144:171].copy()
+                frame[1200:1265, 490:650] = original[960:1025, 1545:1705]
+                x = round(self.task.WEEKLY_REWARD_CENTERS[index]) + 30
+                frame[1214:1243, x:x + 27] = hint
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                self.task.executor.feature_set.check_size(frame)
+
+                candidate = self.task._find_weekly_reward(frame)
+
+                self.assertIsNotNone(candidate)
+                threshold, box = candidate
+                self.assertEqual((index + 1) * 1000, threshold)
+                self.assertLess(abs(box.x + box.width / 2 - self.task.WEEKLY_REWARD_CENTERS[index] * scale), 2)
+                self.assertLess(abs(box.y + box.height / 2 - 1278.5 * scale), 2)
+
     def test_unknown_page_stops_without_clicking(self):
         blank = self.task.frame.copy()
         blank[:] = 0
-        with patch.object(self.task.executor, '_frame', blank), \
+        with patch.object(self.task, 'next_frame', return_value=blank), \
                 patch.object(self.task, 'click') as click, patch.object(self.task, 'screenshot') as screenshot:
             with self.assertRaises(ForegroundInputError):
                 self.task._advance_weekly_page()
