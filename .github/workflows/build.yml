@@ -191,6 +191,16 @@ jobs:
         shell: pwsh
         run: .\scripts\build_runtime.ps1
 
+      - name: 记录镜像对应的源码
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          UPDATE_MIRROR: https://github.com/Canda15/nono-update.git
+        # 镜像提交与源码提交不同；保存来源供同号补发核对，文件随 selfhost 部署白名单同步。
+        run: |
+          python scripts/upstream_release.py record --upstream-tag "$env:RELEASE_TAG" --mirror "$env:UPDATE_MIRROR"
+          if ($LASTEXITCODE -ne 0) { throw '镜像来源核对或记录失败' }
+
       - name: 同步更新镜像
         id: sync
         uses: ok-oldking/partial-sync-repo@master

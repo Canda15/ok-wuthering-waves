@@ -31,13 +31,14 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-def load_sync_script():
-    script = Path(__file__).resolve().parents[1] / 'scripts' / 'sync_ok.py'
-    spec = importlib_util.spec_from_file_location('selfhost_sync_ok', script)
+def load_sync_script(filename='sync_ok.py'):
+    script = Path(__file__).resolve().parents[1] / 'scripts' / filename
+    spec = importlib_util.spec_from_file_location(f'selfhost_{script.stem}', script)
     sync_ok = importlib_util.module_from_spec(spec)
     spec.loader.exec_module(sync_ok)
     return sync_ok
@@ -85,65 +86,17 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(apply(config), list(CUSTOM_TABS))
         self.assertEqual(len(config['custom_tabs']), len(CUSTOM_TABS))
 
-    def test_upstream_sync_retries_missing_release_and_rejects_query_errors(self):
-        import yaml
+    def make_upstream_release_fixture(self):
         from selfhost.portable import process_environment
 
-        workflow = yaml.safe_load((Path(__file__).resolve().parents[1]
-                                   / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
-        step = next(item for item in workflow['jobs']['sync']['steps'] if item.get('id') == 'check')
-        assets = [{'name': name, 'state': 'uploaded', 'size': 100}
-                  for name in ('NoNo-win32-portable.zip', 'NoNo-win32-sha256.txt')]
-        scenarios = (
-            (True, False, 404, {}, True),
-            (True, False, 200, {'draft': False, 'assets': assets}, False),
-            (True, False, 200, {'draft': True, 'assets': assets}, True),
-            (True, False, 200, {'draft': False, 'assets': assets[:1]}, True),
-            (False, False, 200, {'draft': False, 'assets': assets}, True),
-            (True, True, 200, {'draft': False, 'assets': assets}, True),
-            (True, False, 503, {}, None),
-        )
-        # 执行工作流本身的分支，只替换外部 Git 查询和 HTTP，禁止测试真的推送或联网。
-        bootstrap = '''
-$ErrorActionPreference = 'Stop'
-function git {
-    $global:LASTEXITCODE = 0
-    if ($args[0] -eq 'merge-base') { $global:LASTEXITCODE = [int]$env:TEST_MERGE_EXIT }
-}
-function Invoke-WebRequest {
-    [pscustomobject]@{StatusCode=[int]$env:TEST_HTTP_STATUS; Content=$env:TEST_RELEASE_JSON}
-}
-'''
-        script_path = Path(self.temp_dir.name) / 'sync-decision.ps1'
-        output_path = Path(self.temp_dir.name) / 'outputs.txt'
-        for merged, force, status, release, expected in scenarios:
-            with self.subTest(merged=merged, force=force, status=status, expected=expected):
-                script = step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.0')
-                script = script.replace('${{ inputs.force }}', str(force).lower())
-                script_path.write_text(bootstrap + script, encoding='utf-8')
-                output_path.write_bytes(b'')
-                environment = {**process_environment(), 'GITHUB_OUTPUT': str(output_path),
-                               'GITHUB_REPOSITORY': 'synthetic/repository',
-                               'UPSTREAM_REPO': 'synthetic/upstream', 'TEST_MERGE_EXIT': str(int(not merged)),
-                               'TEST_HTTP_STATUS': str(status), 'TEST_RELEASE_JSON': json.dumps(release)}
-                result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script_path)],
-                                        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=20)
-                output = output_path.read_text(encoding='utf-8-sig')
-                if expected is None:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertNotIn('needed=', output)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(output.splitlines(), [f'needed={str(expected).lower()}'])
-
-    def test_upstream_publish_creates_annotated_tag_and_preserves_it_on_retry(self):
-        import yaml
-        from selfhost.portable import process_environment
-
-        root = Path(self.temp_dir.name).resolve()
-        checkout, remote = root / 'checkout', root / 'remote.git'
+        root = Path(self.temp_dir.name).resolve() / 'upstream-release'
+        root.mkdir()
+        checkout, remote, mirror = root / 'checkout', root / 'remote.git', root / 'mirror.git'
         checkout.mkdir()
-        environment = process_environment()
+        environment = {key: value for key, value in process_environment().items()
+                       if not key.upper().startswith('GIT_')}
+        environment.update({'GIT_CONFIG_GLOBAL': str(root / 'empty-git-config'), 'GIT_CONFIG_NOSYSTEM': '1',
+                            'NONO_USER_DATA_ROOT': str(self.user_root), 'OK_DISABLE_FILE_LOG': '1'})
 
         def git(*arguments, cwd=checkout):
             result = subprocess.run(['git', *arguments], cwd=cwd, env=environment, capture_output=True,
@@ -151,35 +104,252 @@ function Invoke-WebRequest {
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
 
+        def commit(message):
+            (checkout / 'source.txt').write_text(message + '\n', encoding='utf-8')
+            git('add', 'source.txt')
+            git('commit', '-m', message)
+            return git('rev-parse', 'HEAD')
+
         git('init', '--bare', str(remote), cwd=root)
+        git('init', '--bare', str(mirror), cwd=root)
         git('init', '-b', 'master')
         git('config', 'user.name', '发布测试')
         git('config', 'user.email', 'release-test@example.invalid')
         git('remote', 'add', 'origin', str(remote))
-        tracked = checkout / 'source.txt'
-        tracked.write_text('初始版本\n', encoding='utf-8')
-        git('add', 'source.txt')
-        git('commit', '-m', '初始版本')
-        initial = git('rev-parse', 'HEAD')
-        workflow = yaml.safe_load((Path(__file__).resolve().parents[1]
-                                   / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
+        base = commit('已有本地版本')
+        git('tag', '-a', 'v3.8.0', '-m', '已有正式发布')
+        git('push', 'origin', 'HEAD:master', 'refs/tags/v3.8.0')
+        upstream = commit('新上游版本')
+        git('update-ref', 'refs/upstream-tags/v3.8.1', upstream)
+        head = commit('保留本地适配')
+        (checkout / 'scripts').mkdir()
+        shutil.copy2(Path(__file__).resolve().parents[1] / 'scripts/upstream_release.py', checkout / 'scripts')
+        return SimpleNamespace(root=root, checkout=checkout, remote=remote, mirror=mirror,
+                               environment=environment, git=git, commit=commit, base=base,
+                               upstream=upstream, head=head)
+
+    def set_mirror_release_record(self, fixture, content):
+        # 镜像必须有独立提交历史；用源码仓库自己的 tag 充当镜像会掩盖跨仓库身份错误。
+        checkout = fixture.root / 'mirror-checkout'
+        if not checkout.exists():
+            checkout.mkdir()
+            fixture.git('init', '-b', 'master', cwd=checkout)
+            fixture.git('config', 'user.name', '镜像测试', cwd=checkout)
+            fixture.git('config', 'user.email', 'mirror-test@example.invalid', cwd=checkout)
+        marker = checkout / 'selfhost/build-source.json'
+        marker.parent.mkdir(exist_ok=True)
+        if content is None:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(content, encoding='utf-8')
+        fixture.git('add', '-A', cwd=checkout)
+        fixture.git('commit', '--allow-empty', '-m', '独立部署镜像', cwd=checkout)
+        fixture.git('tag', '-af', 'v3.8.1', '-m', '测试镜像标签', cwd=checkout)
+        fixture.git('push', '--force', str(fixture.mirror), 'HEAD:master', 'refs/tags/v3.8.1', cwd=checkout)
+        return fixture.git('rev-parse', 'HEAD', cwd=checkout)
+
+    def test_upstream_sync_retries_missing_release_and_rejects_query_errors(self):
+        release_script = load_sync_script('upstream_release.py')
+        fixture = self.make_upstream_release_fixture()
+        fixture.git('tag', '-a', 'v3.8.1', '-m', '已包含上游')
+        fixture.git('push', 'origin', 'refs/tags/v3.8.1')
+        assets = [{'name': name, 'state': 'uploaded', 'size': 100}
+                  for name in ('NoNo-win32-portable.zip', 'NoNo-win32-sha256.txt')]
+        complete = {'tag_name': 'v3.8.1', 'draft': False, 'prerelease': False, 'assets': assets}
+        scenarios = (
+            ('尚未发布', HTTPError('https://example.invalid', 404, '不存在', {}, None), True),
+            ('完整发布', complete, False),
+            ('仍是草稿', {**complete, 'draft': True}, True),
+            ('缺少校验文件', {**complete, 'assets': assets[:1]}, True),
+            ('附件为空', {**complete, 'assets': [assets[0], {**assets[1], 'size': 0}]}, True),
+            ('附件上传中', {**complete, 'assets': [assets[0], {**assets[1], 'state': 'new'}]}, True),
+            ('正式号误标为预发布', {**complete, 'prerelease': True}, True),
+            ('服务错误', HTTPError('https://example.invalid', 503, '暂不可用', {}, None), None),
+            ('连接错误', URLError('连接中断'), None),
+            ('损坏 JSON', '{', None),
+            ('错误响应结构', [], None),
+            ('返回了另一版本', {**complete, 'tag_name': 'v3.8.0'}, None),
+        )
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            for label, payload, expected in scenarios:
+                with self.subTest(label=label), patch.object(release_script, 'urlopen') as request:
+                    if isinstance(payload, Exception):
+                        request.side_effect = payload
+                    else:
+                        request.return_value = BytesIO((payload if isinstance(payload, str)
+                                                        else json.dumps(payload)).encode('utf-8'))
+                    if expected is None:
+                        with self.assertRaises(RuntimeError):
+                            release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
+                    else:
+                        result = release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
+                        self.assertEqual(result['needed'], expected)
+                    self.assertTrue(request.call_args.args[0].full_url.endswith('/releases/tags/v3.8.1'))
+
+            with patch.object(release_script, 'urlopen', side_effect=AssertionError('强制模式无需查询附件')) as request:
+                self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1',
+                                                              'synthetic/repository', force=True), {'needed': True})
+                request.assert_not_called()
+            # 发布后新增本地文档提交不等于有新的上游，计划同步仍应幂等跳过。
+            fixture.commit('发布后的本地说明')
+            with patch.object(release_script, 'urlopen', return_value=BytesIO(json.dumps(complete).encode())):
+                self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository'),
+                                 {'needed': False, 'covered_tag': 'v3.8.1'})
+
+    def test_upstream_sync_checks_real_tag_ancestry_and_identity(self):
+        release_script = load_sync_script('upstream_release.py')
+        fixture = self.make_upstream_release_fixture()
+        with patch.dict(os.environ, fixture.environment, clear=True), patch.object(release_script, 'urlopen') as request:
+            fixture.git('tag', '-a', 'v3.8.1', fixture.base, '-m', '旧同号版本')
+            fixture.git('push', 'origin', 'refs/tags/v3.8.1')
+            for force in (False, True):
+                with self.subTest(force=force), self.assertRaisesRegex(RuntimeError, '不包含目标上游'):
+                    release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository', force=force)
+
+            tree = fixture.git('rev-parse', 'HEAD^{tree}')
+            later = fixture.git('commit-tree', tree, '-p', fixture.head, '-m', '尚未检出的后续发布')
+            fixture.git('tag', '-af', 'v3.8.1', later, '-m', '远端较新版本')
+            fixture.git('push', '--force', 'origin', 'refs/tags/v3.8.1')
+            with self.assertRaisesRegex(RuntimeError, '不在当前 HEAD 历史'):
+                release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
+
+            fixture.git('update-ref', 'refs/tags/v3.8.1', fixture.base, cwd=fixture.remote)
+            with self.assertRaisesRegex(RuntimeError, '远端与本地'):
+                release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
+            request.assert_not_called()
+
+            fixture.git('tag', '-d', 'v3.8.1')
+            fixture.git('push', 'origin', ':refs/tags/v3.8.1')
+            fixture.git('reset', '--hard', fixture.base)
+            self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository'),
+                             {'needed': True})
+            with self.assertRaisesRegex(RuntimeError, '尚未包含目标上游'):
+                release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            request.assert_not_called()
+
+    def test_upstream_release_mirror_requires_matching_build_source(self):
+        release_script = load_sync_script('upstream_release.py')
+        fixture = self.make_upstream_release_fixture()
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            plan = release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            self.assertEqual(plan, {'release_tag': 'v3.8.1', 'source_commit': fixture.head,
+                                    'upstream_commit': fixture.upstream, 'reuse': False})
+            # 源仓库没有标签也不能覆盖镜像留下的旧同号发布。
+            self.set_mirror_release_record(fixture, None)
+            with self.assertRaisesRegex(RuntimeError, '缺少源码来源记录'):
+                release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+
+            fixture.git('tag', '-a', 'v3.8.1', '-m', '本次验证提交')
+            fixture.git('push', 'origin', 'refs/tags/v3.8.1')
+            fixture.git('update-ref', '-d', 'refs/tags/v3.8.1', cwd=fixture.mirror)
+            record = release_script.record_source(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            marker_path = fixture.checkout / 'selfhost/build-source.json'
+            marker = marker_path.read_text(encoding='utf-8')
+            self.assertEqual(record, {'schema_version': 1, 'release_tag': 'v3.8.1', 'source_commit': fixture.head})
+            self.assertFalse(marker_path.read_bytes().startswith(b'\xef\xbb\xbf'))
+            mirror_commit = self.set_mirror_release_record(fixture, marker)
+            self.assertNotEqual(mirror_commit, fixture.head)
+            self.assertEqual(release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror)),
+                             {**plan, 'reuse': True})
+
+            for label, content in (
+                ('缺少记录', None), ('损坏记录', '{'),
+                ('错误源码', json.dumps({**record, 'source_commit': fixture.base})),
+                ('错误版本', json.dumps({**record, 'release_tag': 'v3.8.0'})),
+                ('错误格式版本', json.dumps({**record, 'schema_version': True})),
+            ):
+                with self.subTest(label=label):
+                    self.set_mirror_release_record(fixture, content)
+                    old_tag = fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.mirror)
+                    with self.assertRaisesRegex(RuntimeError, '更新镜像'):
+                        release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+                    self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.mirror), old_tag)
+                    self.assertEqual(fixture.git('tag', '--list', 'v3.8.2'), '')
+
+            with self.assertRaisesRegex(RuntimeError, 'Git ls-remote'):
+                release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.root / 'missing.git'))
+            fixture.commit('验证后新增改动')
+            with self.assertRaisesRegex(RuntimeError, '没有指向本次验证 HEAD'):
+                release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            with self.assertRaisesRegex(RuntimeError, '当前检出'):
+                release_script.record_source(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            self.assertEqual(marker_path.read_text(encoding='utf-8'), marker)
+
+    def test_upstream_publish_creates_annotated_tag_and_preserves_it_on_retry(self):
+        import yaml
+
+        fixture = self.make_upstream_release_fixture()
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = yaml.safe_load((repo_root / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
         step = next(item for item in workflow['jobs']['sync']['steps'] if item.get('name') == 'Push and tag')
-        script_path = root / 'publish.ps1'
-        # 仅替换远端工作流派发；标签创建、推送和重试都使用实际的隔离 Git 仓库。
-        script_path.write_text("$ErrorActionPreference = 'Stop'\nfunction gh { $global:LASTEXITCODE = 0 }\n"
-                               + step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.0'), encoding='utf-8')
-        for retry in (False, True):
-            if retry:
-                tracked.write_text('后续代码\n', encoding='utf-8')
-                git('add', 'source.txt')
-                git('commit', '-m', '后续代码')
-            result = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script_path)],
-                                    cwd=checkout, env=environment, capture_output=True,
-                                    text=True, encoding='utf-8', timeout=20)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(git('cat-file', '-t', 'refs/tags/v3.8.0'), 'tag')
-            self.assertEqual(git('rev-parse', 'refs/tags/v3.8.0^{commit}', cwd=remote), initial)
-            self.assertEqual(git('rev-parse', 'refs/heads/master', cwd=remote), git('rev-parse', 'HEAD'))
+        script_path = fixture.root / 'publish.ps1'
+        dispatches = fixture.root / 'dispatches.jsonl'
+        # 仅替换实际远端派发；发布决策、CLI、标签与推送均经过真实临时 Git 仓库。
+        bootstrap = '''
+$ErrorActionPreference = 'Stop'
+function python { & $env:TEST_PYTHON -B -X utf8 @args }
+function gh {
+    ConvertTo-Json -InputObject @($args) -Compress | Add-Content -LiteralPath $env:TEST_DISPATCH_FILE
+    $global:LASTEXITCODE = [int]$env:TEST_DISPATCH_EXIT
+}
+'''
+        script_path.write_text(bootstrap + step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.1'),
+                               encoding='utf-8')
+        environment = {**fixture.environment, 'TEST_PYTHON': sys.executable, 'UPDATE_MIRROR': str(fixture.mirror),
+                       'GITHUB_REPOSITORY': 'synthetic/repository', 'TEST_DISPATCH_FILE': str(dispatches),
+                       'TEST_DISPATCH_EXIT': '23', 'RELEASE_TAG': 'v3.8.1'}
+
+        def run(script=script_path):
+            return subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script)],
+                                  cwd=fixture.checkout, env=environment, capture_output=True,
+                                  text=True, encoding='utf-8', timeout=30)
+
+        result = run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('派发 build.yml 失败', result.stderr)
+        tag_object = fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote)
+        self.assertEqual(fixture.git('cat-file', '-t', tag_object, cwd=fixture.remote), 'tag')
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1^{commit}', cwd=fixture.remote), fixture.head)
+
+        environment['TEST_DISPATCH_EXIT'] = '0'
+        fixture.git('merge', '--no-ff', '--no-edit', 'refs/upstream-tags/v3.8.1')
+        self.assertEqual(fixture.git('rev-parse', 'HEAD'), fixture.head)
+        result = run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
+
+        build = yaml.safe_load((repo_root / '.github/workflows/build.yml').read_text(encoding='utf-8'))
+        marker_step = next(item for item in build['jobs']['synchronize']['steps']
+                           if item.get('name') == '记录镜像对应的源码')
+        marker_script = fixture.root / 'record-source.ps1'
+        marker_script.write_text(bootstrap + marker_step['run'], encoding='utf-8')
+        result = run(marker_script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = (fixture.checkout / 'selfhost/build-source.json').read_text(encoding='utf-8')
+        self.set_mirror_release_record(fixture, marker)
+        result = run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
+        self.assertEqual(fixture.git('rev-parse', 'refs/heads/master', cwd=fixture.remote), fixture.head)
+        calls = [json.loads(line) for line in dispatches.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(calls, [['workflow', 'run', 'build.yml', '--ref', 'v3.8.1',
+                                 '--repo', 'synthetic/repository']] * 3)
+
+        self.set_mirror_release_record(fixture, json.dumps({**json.loads(marker), 'source_commit': fixture.base}))
+        for script in (marker_script, script_path):
+            with self.subTest(script=script.name):
+                result = run(script)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('源码来源与本次发布不一致', result.stderr)
+        self.assertEqual((fixture.checkout / 'selfhost/build-source.json').read_text(encoding='utf-8'), marker)
+        fixture.commit('待发布的新修复')
+        result = run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('没有指向本次验证 HEAD', result.stderr)
+        self.assertEqual(fixture.git('rev-parse', 'refs/heads/master', cwd=fixture.remote), fixture.head)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
+        self.assertEqual(len(dispatches.read_text(encoding='utf-8').splitlines()), 3)
+        self.assertEqual(fixture.git('tag', '--list', 'v3.8.2'), '')
 
     def test_main_window_still_consumes_custom_tabs(self):
         """上游换掉注册机制时会静默失效——这是最该被拦住的一种漂移。"""

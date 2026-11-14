@@ -31,6 +31,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: ok-oldking/ok-wuthering-waves
+  UPDATE_MIRROR: https://github.com/Canda15/nono-update.git
   PYTHON_VERSION: '3.12'
   # runner 的控制台是 cp1252,不设这个变量时打印中文会 UnicodeEncodeError
   PYTHONIOENCODING: 'UTF-8'
@@ -89,33 +90,20 @@ jobs:
           $upstreamRef = "refs/upstream-tags/$tag"
           git fetch --no-tags upstream "refs/tags/${tag}:${upstreamRef}"
           if ($LASTEXITCODE -ne 0) { throw '抓取上游标签失败' }
-          git merge-base --is-ancestor $upstreamRef HEAD
-          if ($LASTEXITCODE -notin @(0, 1)) { throw '检查上游合并状态失败' }
-          $merged = $LASTEXITCODE -eq 0
-          $released = $false
-          if ($merged -and $force -ne 'true') {
-            # 人工合并或发布失败后仍要补发；只有正式 Release 和完整附件齐全才能跳过。
-            $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
-            $headers = @{Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'}
-            $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
-            if ($response.StatusCode -eq 200) {
-              $release = $response.Content | ConvertFrom-Json
-              $assets = @($release.assets | Where-Object { $_.state -eq 'uploaded' -and $_.size -gt 0 } |
-                ForEach-Object { $_.name })
-              $released = -not $release.draft -and $assets -contains 'NoNo-win32-portable.zip' -and
-                $assets -contains 'NoNo-win32-sha256.txt'
-            } elseif ($response.StatusCode -ne 404) {
-              throw "查询发布状态失败（HTTP $($response.StatusCode)），停止本次同步"
-            }
-          }
-          if ($merged -and $released -and $force -ne 'true') {
-            Write-Host "$tag 已合并且便携版本已发布，无需同步"
-            "needed=false" >> $env:GITHUB_OUTPUT
+          # 版本号沿用上游，但同号 Release 还必须由实际包含上游的源码标签和完整附件证明。
+          $parameters = @('scripts/upstream_release.py', 'check', '--upstream-tag', $tag,
+            '--repository', $env:GITHUB_REPOSITORY)
+          if ($force -eq 'true') { $parameters += '--force' }
+          $decisionJson = python @parameters
+          if ($LASTEXITCODE -ne 0) { throw '检查上游发布覆盖失败' }
+          $decision = $decisionJson | ConvertFrom-Json
+          if ($decision.needed -isnot [bool]) { throw '发布覆盖结果格式不正确' }
+          "needed=$($decision.needed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($decision.needed) {
+            Write-Host "$tag 需要合并、验证或补发"
           } else {
-            if ($merged) { Write-Host "$tag 已合并，继续验证并补发或重试发布" }
-            "needed=true" >> $env:GITHUB_OUTPUT
+            Write-Host "$tag 已由 $($decision.covered_tag) 的完整便携版本覆盖，无需同步"
           }
-          # merge-base 用 1 表示"不是祖先",这是正常分支,不能让步骤判失败
           exit 0
 
       - name: Merge upstream
@@ -180,19 +168,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ steps.resolve.outputs.tag }}"
-          # 沿用上游版本号，但首次发布指向本仓库适配提交；重试复用原标签，不移动历史版本。
-          git push origin HEAD:master
-          if ($LASTEXITCODE -ne 0) { throw '推送适配代码失败' }
+          # 版本号始终沿用上游；旧标签冲突须人工处理，不能自动改号或派发旧源码。
+          $planJson = python scripts/upstream_release.py plan --upstream-tag "${{ steps.resolve.outputs.tag }}" --mirror "$env:UPDATE_MIRROR"
+          if ($LASTEXITCODE -ne 0) { throw '核对本仓库同号发布失败' }
+          $plan = $planJson | ConvertFrom-Json
+          $tag = $plan.release_tag
+          if ($tag -ne "${{ steps.resolve.outputs.tag }}") { throw '发布版本号必须与上游一致' }
+          $validatedCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $validatedCommit -ne $plan.source_commit) {
+            throw '待发布源码与已核对的验证提交不一致'
+          }
           git show-ref --verify --quiet "refs/tags/$tag"
           if ($LASTEXITCODE -eq 1) {
-            git tag -a $tag -m $tag
+            git tag -a $tag -m "同步上游 ${{ steps.resolve.outputs.tag }}，发布 $tag" $validatedCommit
             if ($LASTEXITCODE -ne 0) { throw '创建发布标签失败' }
           } elseif ($LASTEXITCODE -ne 0) {
             throw '检查发布标签失败'
           }
-          git push origin "refs/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw '推送发布标签失败，未覆盖已有标签' }
+          $tagCommit = git rev-parse "refs/tags/$tag^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $validatedCommit) {
+            throw '发布标签没有指向本次验证提交，拒绝构建旧版本'
+          }
+          git push --atomic origin HEAD:master "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw '原子推送源码与标签失败，未覆盖历史标签' }
           # 用 GITHUB_TOKEN 推的 tag 不会触发 build.yml(GitHub 禁止 token 递归
           # 触发 push 类事件),所以必须显式派发一次,否则源码合了、包没编译。
           # --repo 不能省:本仓库是 fork,gh 会把"仓库"解析成基仓库(上游),
