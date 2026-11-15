@@ -9,7 +9,7 @@
       "format": "unified_diff",
       "payload": "patches/__init__.py.patch",
       "before_sha256": "96afa8cb7f3093f99faf889de974569a5f8822888a7998593278e35765a151ea",
-      "after_sha256": "eaf7dd004904dae9ca9c5173965f252ddc8de9645d5d1e7e850674d2e224d350"
+      "after_sha256": "d542db3b011752d1c993552426cfbf7b8193d0726485954e1554c8f2097edb54"
     },
     {
       "path": "agent_resources/.agents/skills/develop/SKILL.md",
@@ -105,7 +105,7 @@
       "format": "unified_diff",
       "payload": "patches/device/DeviceManager.py.patch",
       "before_sha256": "b3ca3599a9570ea1aef62db8b4d97f1d8d2e6e119a721b1a40545ee90f62e5f1",
-      "after_sha256": "d6dc75bc6437d9c0fd46b9b091470e24b67944cd4bc03efb96088f6095a74702"
+      "after_sha256": "08141241737c88ad09210f5d7750a19ad920c0acc8f0e8202dc378fd5cadee58"
     },
     {
       "path": "device/capture_methods/hwnd_window.py",
@@ -121,7 +121,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/__init__.py.patch",
       "before_sha256": "8ce4ee2e4fea09a3929c8fe728a67403154b9a1e90b5dd6e61321eb45c8347c1",
-      "after_sha256": "ab959df8fa2e81c15cbcb42ab9f0c584be9f94e9e00c16c4b84b89e9953606f4"
+      "after_sha256": "92294d7bec060cb64ec37d8822aa3137a3391144ba7eda6e08cd05d2a6ab3c7a"
     },
     {
       "path": "device/interaction_methods/base.py",
@@ -164,6 +164,14 @@
       "after_sha256": "a25ab101cf1eabb7415a4f8b4b751b4f3b6b3620d6c428a238080c4835550aa0"
     },
     {
+      "path": "device/interaction_methods/nono.py",
+      "operation": "add",
+      "format": "unified_diff",
+      "payload": "patches/device/interaction_methods/nono.py.patch",
+      "before_sha256": null,
+      "after_sha256": "64808d1dfbc82dde5f7eab39b791ad709edec514688760e283d8d61690598532"
+    },
+    {
       "path": "device/interaction_methods/post_message.py",
       "operation": "delete",
       "format": "unified_diff",
@@ -185,7 +193,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/pynput.py.patch",
       "before_sha256": "5565b441cc955617bded36ea46234801bbc3aab27498f89412e4d0b7105b4dae",
-      "after_sha256": "f2e8b083bca2c25168d53fa7b037840b3edf404cc7f51b8b21e141b7fcac4ccd"
+      "after_sha256": "a43e58d94e769c92211c62c9c28aef31906988f49ecefebac4f436a6232b6c3e"
     },
     {
       "path": "feature/FeatureSet.py",
@@ -233,7 +241,7 @@
       "format": "unified_diff",
       "payload": "patches/task/TaskExecutor.py.patch",
       "before_sha256": "85862d681d2faaf40a9df4c419c765a6a8cdcc70b8e76efb53989ead8ab88814",
-      "after_sha256": "b9c62831f44979b98a8815d58da637794b40aa48c7fb69a20c7b9038cc13a0ee"
+      "after_sha256": "3483302c2c1caaa0557c8db5fe29f5df3935fef5cec422758c76e28d421dc65c"
     },
     {
       "path": "task/task.py",
@@ -369,7 +377,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/shell/connection.py.patch",
       "before_sha256": "47deae2fe5809cf96c5a134709176821ee30db98640dababa8a93144496d7708",
-      "after_sha256": "9c48fdfcfcfa2c5c7ea0d6ec1ac2241b4850d3c0b612d883fbae6a3edbb043c7"
+      "after_sha256": "5526697b9f926bd832ec144a437b8f2025c03753b674b863289947cda1203596"
     },
     {
       "path": "ui/qt/shell/diagnostics.py",

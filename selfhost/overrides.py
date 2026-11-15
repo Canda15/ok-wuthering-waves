@@ -57,7 +57,7 @@ def apply_input_policy(config):
     windows = config.get('windows')
     if windows is not None:
         # 与 DeviceManager 的历史配置迁移共同守住输入边界，不保留后台备选。
-        windows['interaction'] = 'Pynput'
+        windows['interaction'] = 'nono'
     if 'trigger_tasks' in config:
         config['trigger_tasks'] = [
             task for task in config['trigger_tasks']

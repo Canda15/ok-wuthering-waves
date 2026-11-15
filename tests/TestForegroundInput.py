@@ -1,6 +1,8 @@
 """前台输入状态机与跨层生命周期；全部原生输入及用户配置均使用替身。"""
 
 import ctypes
+import importlib
+import json
 import os
 import subprocess
 import sys
@@ -27,6 +29,7 @@ from ok.device.interaction_methods.foreground_input import (
     ForegroundInput, ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget,
     InputEvent, Win32InputBackend, _INPUT,
 )
+from ok.device.interaction_methods.nono import NonoInteraction
 from ok.device.interaction_methods.pynput import PynputInteraction
 from ok.feature.Box import Box
 from ok.task.TaskExecutor import ExecutorJob, TaskExecutor
@@ -506,7 +509,7 @@ class TestForegroundLifecycle(InputFixture):
         super().setUp()
         for scoped_patch in (
                 patch('ok.device.interaction_methods.foreground_input._shared_input', self.core),
-                patch('ok.device.interaction_methods.pynput.get_shared_foreground_input', return_value=self.core),
+                patch('ok.device.interaction_methods.nono.get_shared_foreground_input', return_value=self.core),
                 patch('ok.task.TaskExecutor.time.monotonic', self.clock),
                 patch('ok.task.TaskExecutor.time.time', self.clock),
                 patch('ok.task.TaskExecutor.communicate'),
@@ -515,6 +518,7 @@ class TestForegroundLifecycle(InputFixture):
             self.addCleanup(scoped_patch.stop)
         self.window = FakeWindow()
         self.capture = FakeCapture(self.window, self.clock)
+        # 沿用旧公开入口构造，整组生命周期回归也要保护已有外部脚本。
         self.adapter = PynputInteraction(self.capture, self.window)
         executor = self.executor = TaskExecutor.__new__(TaskExecutor)
         executor.__dict__.update(
@@ -1538,28 +1542,55 @@ class TestForegroundDeviceAndWindow(InputFixture):
                     with self.assertRaises(ForegroundInputInterrupted):
                         fresh.send_key('a', down_time=0)
 
+    def test_新旧公开入口保持同一前台类型(self):
+        for module_name in ('ok', 'ok.device.interaction', 'ok.device.intercation',
+                            'ok.device.interaction_methods'):
+            with self.subTest(module=module_name):
+                module = importlib.import_module(module_name)
+                self.assertIs(module.NonoInteraction, NonoInteraction)
+                self.assertIs(module.PynputInteraction, NonoInteraction)
+        self.assertIs(PynputInteraction, NonoInteraction)
+        self.assertEqual(NonoInteraction.__name__, 'NonoInteraction')
+        self.assertEqual(NonoInteraction.__module__, 'ok.device.interaction_methods.nono')
+
     def test_PC配置归一化覆盖旧名称旧类列表与未知拒绝(self):
-        known = ('PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect', 'Pynput')
+        known = ('nono', 'PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect', 'Pynput')
         for name in known:
             with self.subTest(name=name):
-                self.assertEqual(normalize_pc_interaction(name), 'Pynput')
-                self.assertEqual(normalize_pc_interaction(type(name + 'Interaction', (), {})), 'Pynput')
-        self.assertEqual(normalize_pc_interaction(list(known)), 'Pynput')
-        for value in ('未知方案', type('自定义后台', (), {}), ['Pynput', '未知方案']):
+                self.assertEqual(normalize_pc_interaction(name), 'nono')
+                self.assertEqual(normalize_pc_interaction(f' {name.swapcase()} '), 'nono')
+                self.assertEqual(normalize_pc_interaction(name + 'Interaction'), 'nono')
+                self.assertEqual(normalize_pc_interaction(type(name + 'Interaction', (), {})), 'nono')
+        for value in (None, '', [], NonoInteraction, PynputInteraction, list(known),
+                      ['nono', ['PynputInteraction', None]]):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_pc_interaction(value), 'nono')
+        for value in ('未知方案', ' ', 0, False, {}, ('nono',), type('自定义后台', (), {}), ['Pynput', '未知方案']):
             with self.assertRaises(ValueError):
                 normalize_pc_interaction(value)
 
     def test_构造保存迁移不会实例化旧后端或读写用户配置(self):
-        config = {'interaction': 'PostMessageInteraction'}
-        with patch('ok.device.DeviceManager.Config', return_value=config), \
-                patch('ok.device.DeviceManager.Handler', return_value=Mock()), \
-                patch('ok.device.DeviceManager.HwndWindow', return_value=Mock()), \
-                patch('ok.device.interaction_methods.foreground_input._shared_input', self.core):
-            manager = DeviceManager({'windows': {'interaction': ['PostMessage', 'PyDirect']}}, threading.Event())
-        self.assertIs(manager.win_interaction_class, PynputInteraction)
-        self.assertEqual(manager.windows_capture_config['interaction'], 'Pynput')
-        self.assertEqual(config['interaction'], 'Pynput')
-        self.assertEqual(manager.available_interaction_methods({'device': 'windows'}), ['Pynput'])
+        from ok.util.config import Config
+        original = {
+            'preferred': 'pc', 'pc_full_path': 'fixture.exe', 'capture': 'WGC',
+            'selected_exe': 'fixture.exe', 'selected_hwnd': 10,
+            'extension': {'enabled': False, 'count': 0, 'value': None},
+        }
+        for old_name in ('Pynput', 'PostMessageInteraction', 'nono'):
+            with self.subTest(old_name=old_name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'devices.json'
+                path.write_bytes(json.dumps({**original, 'interaction': old_name}).encode('utf-8'))
+                windows = {'interaction': ['PostMessage', 'PyDirect'], 'capture_method': ['WGC'], 'check_hdr': False}
+                with patch.object(Config, 'config_folder', directory), \
+                        patch('ok.device.DeviceManager.Handler', return_value=Mock()), \
+                        patch('ok.device.DeviceManager.HwndWindow', return_value=Mock()), \
+                        patch('ok.device.interaction_methods.foreground_input._shared_input', self.core):
+                    manager = DeviceManager({'windows': windows}, threading.Event())
+                self.assertIs(manager.win_interaction_class, NonoInteraction)
+                self.assertEqual(windows, {'interaction': 'nono', 'capture_method': ['WGC'], 'check_hdr': False})
+                self.assertEqual(manager.config, {**original, 'interaction': 'nono'})
+                self.assertEqual(json.loads(path.read_bytes()), {**original, 'interaction': 'nono'})
+                self.assertEqual(manager.available_interaction_methods({'device': 'windows'}), ['nono'])
 
     def test_setter与动态入口同样拒绝未知而不先改变设备(self):
         manager = DeviceManager.__new__(DeviceManager)
@@ -1571,8 +1602,9 @@ class TestForegroundDeviceAndWindow(InputFixture):
         old = Mock(spec=BaseInteraction)
         manager.interaction = old
         manager.set_interaction('GenshinInteraction')
-        self.assertIs(manager.win_interaction_class, PynputInteraction)
-        self.assertEqual(manager.config['interaction'], 'Pynput')
+        self.assertIs(manager.win_interaction_class, NonoInteraction)
+        self.assertEqual(manager.config, {'interaction': 'nono', 'preferred': 'pc'})
+        self.assertEqual(manager.windows_capture_config['interaction'], 'nono')
         old.release_all.assert_called_once()
         manager.clear_devices = Mock()
         for method in (manager.set_interaction,):
@@ -1688,9 +1720,9 @@ class TestMcpForegroundPreparation(InputFixture):
             _binding_lock=threading.RLock(), _binding_condition=threading.Condition(),
             _binding_requested=0, _binding_completed=0, _binding_error=None,
             exit_event=threading.Event(), global_config=None, executor=None, hwnd_window=FakeWindow(),
-            windows_capture_config={'interaction': 'Pynput', 'title': '受控窗口',
+            windows_capture_config={'interaction': 'nono', 'title': '受控窗口',
                                     'capture_method': ['WGC', 'BitBlt_RenderFull']},
-            config={'preferred': '', 'capture': 'WGC', 'interaction': 'Pynput'}, device_dict={},
+            config={'preferred': '', 'capture': 'WGC', 'interaction': 'nono'}, device_dict={},
         )
         manager.interaction = manager.capture_method = None
         capture = FakeCapture(manager.hwnd_window, self.clock)
@@ -1732,7 +1764,7 @@ class TestMcpForegroundPreparation(InputFixture):
         for scoped_patch in (
                 patch('ok.device.DeviceManager.communicate'),
                 patch('ok.device.interaction_methods.foreground_input._shared_input', self.core),
-                patch('ok.device.interaction_methods.pynput.get_shared_foreground_input', return_value=self.core),
+                patch('ok.device.interaction_methods.nono.get_shared_foreground_input', return_value=self.core),
                 patch('ok.device.capture_methods.update.get_win_graphics_capture', side_effect=wgc_attempt),
                 patch('ok.device.capture_methods.update.get_capture', return_value=capture if outcome == '回退成功' else None),
                 patch('ok.device.capture_methods.bitblt.render_full', False)):

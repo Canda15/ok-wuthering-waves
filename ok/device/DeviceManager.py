@@ -9,7 +9,7 @@ import numpy as np
 
 from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method, NemuIpcCaptureMethod, \
     ADBCaptureMethod
-from ok.device.interaction import PynputInteraction, BrowserInteraction, ADBInteraction
+from ok.device.interaction import NonoInteraction, BrowserInteraction, ADBInteraction
 from ok.task.exceptions import TaskDisabledException
 from ok.core.events import communicate
 from ok.util.collection import parse_ratio
@@ -44,21 +44,21 @@ def method_name(method):
 
 
 def normalize_pc_interaction(interaction):
-    """所有 PC 入口使用同一个迁移规则，旧标识永远不能恢复消息输入。"""
+    """所有 PC 入口统一为 nono，历史标识仅用于迁移到同一前台方案。"""
     if isinstance(interaction, list):
         for item in interaction:
             normalize_pc_interaction(item)
-        return 'Pynput'
+        return 'nono'
     if interaction is None or interaction == '':
-        return 'Pynput'
-    if interaction is PynputInteraction:
-        return 'Pynput'
+        return 'nono'
+    if interaction is NonoInteraction:
+        return 'nono'
     name = interaction.__name__ if isinstance(interaction, type) else interaction
-    accepted = {'pynput', 'pynputinteraction', 'postmessage', 'postmessageinteraction',
+    accepted = {'nono', 'nonointeraction', 'pynput', 'pynputinteraction', 'postmessage', 'postmessageinteraction',
                 'genshin', 'genshininteraction', 'foregroundpostmessage',
                 'foregroundpostmessageinteraction', 'pydirect', 'pydirectinteraction'}
     if isinstance(name, str) and name.strip().lower() in accepted:
-        return 'Pynput'
+        return 'nono'
     raise ValueError('不支持该 PC 输入方案，本应用仅使用前台系统键鼠')
 
 
@@ -105,7 +105,7 @@ class DeviceManager:
             self.windows_capture_config['interaction'] = normalize_pc_interaction(
                 self.windows_capture_config.get('interaction'))
             normalize_pc_interaction(self.config.get('interaction'))
-            self.win_interaction_class = PynputInteraction
+            self.win_interaction_class = NonoInteraction
             self._save_pc_interaction()
             if isinstance(self.windows_capture_config.get('exe'), str):
                 self.windows_capture_config['exe'] = [self.windows_capture_config.get('exe')]
@@ -122,7 +122,7 @@ class DeviceManager:
 
     def _save_pc_interaction(self):
         try:
-            self.config['interaction'] = 'Pynput'
+            self.config['interaction'] = 'nono'
         except Exception as error:
             # 保存失败也已经采用唯一前台类，不能降级到旧配置。
             logger.warning(f'前台输入配置保存失败：{error}')
@@ -606,7 +606,7 @@ class DeviceManager:
         kind = device.get('device')
         if kind == 'windows':
             normalize_pc_interaction((self.windows_capture_config or {}).get('interaction'))
-            return ['Pynput']
+            return ['nono']
         if kind == 'browser':
             return ['BrowserInteraction']
         if kind == 'adb':
@@ -637,12 +637,12 @@ class DeviceManager:
             self.config['interaction'] = expected.__name__
             return
         interaction = normalize_pc_interaction(interaction)
-        changed = self.config.get('interaction') != interaction or self.win_interaction_class is not PynputInteraction
-        self.win_interaction_class = PynputInteraction
+        changed = self.config.get('interaction') != interaction or self.win_interaction_class is not NonoInteraction
+        self.win_interaction_class = NonoInteraction
         if self.windows_capture_config is not None:
             self.windows_capture_config['interaction'] = interaction
         self._save_pc_interaction()
-        if changed or not isinstance(self.interaction, PynputInteraction):
+        if changed or not isinstance(self.interaction, NonoInteraction):
             self.release_input()
             self.start()
 
@@ -735,7 +735,7 @@ class DeviceManager:
         if preferred['device'] == 'windows':
             normalize_pc_interaction(self.windows_capture_config.get('interaction'))
             normalize_pc_interaction(self.config.get('interaction'))
-            self.win_interaction_class = PynputInteraction
+            self.win_interaction_class = NonoInteraction
             title = self.windows_capture_config.get('title')
             exe = self.windows_capture_config.get('exe')
             if not exe and not title and preferred.get('real_hwnd'):

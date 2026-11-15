@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from ok.device.interaction_methods.foreground_input import (
     ForegroundInputError, ForegroundInputInterrupted, release_shared_foreground_input,
 )
-from ok.device.interaction_methods.pynput import PynputInteraction
+from ok.device.interaction_methods.nono import NonoInteraction
 
 from ok.core.events import communicate
 from ok.core.notifications import alert_info
@@ -371,7 +371,7 @@ class TaskExecutor:
     def foreground_waiting(self):
         interaction = self.interaction
         scheduled = self.current_task is not None or any(task.enabled for task in self.get_all_tasks())
-        return (isinstance(interaction, PynputInteraction) and not interaction.should_capture()
+        return (isinstance(interaction, NonoInteraction) and not interaction.should_capture()
                 and (getattr(self, '_foreground_waiting', False) or not self.paused and scheduled))
 
     @property
@@ -386,7 +386,7 @@ class TaskExecutor:
 
     def _foreground_ready(self):
         interaction = self.interaction
-        needs_foreground = isinstance(interaction, PynputInteraction)
+        needs_foreground = isinstance(interaction, NonoInteraction)
         ready = not needs_foreground or interaction.should_capture()
         if not ready:
             if not getattr(self, '_foreground_waiting', False):
@@ -411,7 +411,7 @@ class TaskExecutor:
 
     def _capture_generation(self):
         interaction = self.interaction
-        generation = interaction.target_generation if isinstance(interaction, PynputInteraction) else None
+        generation = interaction.target_generation if isinstance(interaction, NonoInteraction) else None
         return id(self.method), generation
 
     @contextmanager
@@ -448,7 +448,7 @@ class TaskExecutor:
         if check():
             raise TaskDisabledException()
         interaction = self.interaction
-        if isinstance(interaction, PynputInteraction):
+        if isinstance(interaction, NonoInteraction):
             remaining = max(0, deadline - time.monotonic())
             if not interaction.prepare_foreground(request_focus=request_focus, time_out=remaining, cancel_check=check):
                 return False
@@ -957,7 +957,7 @@ class TaskExecutor:
         if callable(wait):
             wait(cancel_check=lambda: self.check_input_cancelled(allow_pause=True))
         interaction = self.interaction
-        if isinstance(interaction, PynputInteraction):
+        if isinstance(interaction, NonoInteraction):
             if request_focus and not is_trigger_task:
                 interaction.on_run()
             else:

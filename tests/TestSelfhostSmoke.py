@@ -394,8 +394,18 @@ function gh {
     def test_default_input_policy_and_mouse_reset_removal(self):
         """上游配置重新带回后台默认值或光标补救任务时必须在自维护门禁发现。"""
         from config import config
+        from ok.device.DeviceManager import DeviceManager
+        from ok.ui.qt.shell.connection import interaction_options
         repo_root = Path(__file__).resolve().parents[1]
-        self.assertEqual(config['windows']['interaction'], 'Pynput')
+        self.assertEqual(config['windows']['interaction'], 'nono')
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.windows_capture_config = config['windows']
+        options, index, names = interaction_options(manager, {'device': 'windows'})
+        self.assertEqual(names, manager.available_interaction_methods({'device': 'windows'}))
+        self.assertEqual(names, ['nono'])
+        self.assertEqual(index, 0)
+        self.assertEqual(options, [('nono（前台系统键鼠）',
+                                   '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续', None)])
         self.assertNotIn(('src.task.MouseResetTask', 'MouseResetTask'),
                          [tuple(task) for task in config['trigger_tasks']])
         self.assertFalse((repo_root / 'src' / 'task' / 'MouseResetTask.py').exists())
@@ -404,7 +414,7 @@ function gh {
         """覆盖入口同时守住前台默认值、旧注册和用户捕获参数，且可重复执行。"""
         from selfhost.overrides import apply
         kept_task = ['src.task.AutoPickTask', 'AutoPickTask']
-        for old_name in ('PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect'):
+        for old_name in ('PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect', 'Pynput', 'nono'):
             with self.subTest(old_name=old_name):
                 config = {
                     'windows': {'interaction': old_name, 'exe': 'fixture.exe', 'capture_method': ['WGC']},
@@ -413,7 +423,7 @@ function gh {
                 apply(config)
                 apply(config)
                 self.assertEqual(config['windows'], {
-                    'interaction': 'Pynput', 'exe': 'fixture.exe', 'capture_method': ['WGC'],
+                    'interaction': 'nono', 'exe': 'fixture.exe', 'capture_method': ['WGC'],
                 })
                 self.assertEqual(config['trigger_tasks'], [kept_task])
 
@@ -421,10 +431,14 @@ function gh {
         """部署白名单或导入来源漂移会让已通过的前台实现在用户包中消失。"""
         import ok
         from ok.device import interaction_methods
-        from ok.device.interaction_methods import foreground_input
+        from ok.device.interaction_methods import foreground_input, nono
+        from selfhost.portable import process_environment, hidden_process_options
         repo_root = Path(__file__).resolve().parents[1]
         self.assertTrue(Path(ok.__file__).resolve().is_relative_to(repo_root / 'ok'))
         self.assertTrue(Path(foreground_input.__file__).resolve().is_relative_to(repo_root / 'ok'))
+        self.assertTrue(Path(nono.__file__).resolve().is_relative_to(repo_root / 'ok'))
+        self.assertIs(ok.NonoInteraction, nono.NonoInteraction)
+        self.assertIs(ok.PynputInteraction, nono.NonoInteraction)
         deploy_entries = {
             line.strip() for line in (repo_root / 'deploy.txt').read_text(encoding='utf-8').splitlines()
             if line.strip() and not line.lstrip().startswith('#')
@@ -436,6 +450,37 @@ function gh {
         ):
             self.assertFalse((repo_root / 'ok' / 'device' / 'interaction_methods' / f'{old_module}.py').exists())
             self.assertFalse(hasattr(interaction_methods, old_class))
+
+        # 部署树缺失的新模块必须由已登记差异严格重放，不能借用源码目录补齐导入。
+        sync = load_sync_script()
+        pin = sync.load_pin()
+        patches = sync.load_logic_patches(pin, pin['version'])
+        deployment = Path(self.temp_dir.name) / 'deployment'
+        ignored = shutil.ignore_patterns('__pycache__', '*.pyc', 'NoNo.exe')
+        shutil.copytree(repo_root / 'ok', deployment / 'ok', ignore=ignored)
+        shutil.copytree(repo_root / 'selfhost', deployment / 'selfhost', ignore=ignored)
+        (deployment / 'ok/device/interaction_methods/nono.py').unlink()
+        applied, _already = patches.apply_to(deployment / 'ok')
+        self.assertEqual(applied, ['device/interaction_methods/nono.py'])
+        self.assertEqual(sync.hash_tree(deployment / 'ok'), sync.hash_tree(repo_root / 'ok'))
+        self.assertEqual(sync.do_check(deployment), 0)
+        code = (
+            'import importlib; from pathlib import Path; '
+            'from ok import NonoInteraction, PynputInteraction; '
+            'from ok.device.DeviceManager import normalize_pc_interaction; '
+            'assert NonoInteraction is PynputInteraction; '
+            'assert normalize_pc_interaction("Pynput") == "nono"; '
+            'assert normalize_pc_interaction(NonoInteraction) == "nono"; '
+            'module = importlib.import_module(NonoInteraction.__module__); '
+            'assert Path(module.__file__).resolve().is_relative_to((Path.cwd() / "ok").resolve()); '
+            'assert all(importlib.import_module(name).PynputInteraction is NonoInteraction '
+            'for name in ("ok.device.interaction", "ok.device.intercation", '
+            '"ok.device.interaction_methods", "ok.device.interaction_methods.pynput"))'
+        )
+        result = subprocess.run([sys.executable, '-B', '-X', 'utf8', '-c', code],
+                                cwd=deployment, env=process_environment(), capture_output=True, text=True,
+                                timeout=60, **hidden_process_options())
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_sync_script_keeps_pyproject_parseable(self):
         """上游的 dependencies 数组结尾不带逗号,把生成块插进去会让 pyproject 变成非法 TOML。

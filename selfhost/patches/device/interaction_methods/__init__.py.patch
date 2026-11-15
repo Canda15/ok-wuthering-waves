@@ -1,6 +1,6 @@
 --- a/device/interaction_methods/__init__.py
 +++ b/device/interaction_methods/__init__.py
-@@ -2,10 +2,15 @@
+@@ -2,10 +2,16 @@
  from ok.device.interaction_methods.base import BaseInteraction
  from ok.device.interaction_methods.browser import BrowserInteraction
  from ok.device.interaction_methods.do_nothing import DoNothingInteraction
@@ -13,11 +13,12 @@
 +    ForegroundInput, ForegroundInputError, ForegroundInputInterrupted, ForegroundTarget, get_shared_foreground_input,
 +)
 +from ok.device.interaction_methods.keys import ADB_KEY_MAP, vk_key_dict
++from ok.device.interaction_methods.nono import NonoInteraction
  from ok.device.interaction_methods.pynput import PynputInteraction
  from ok.device.interaction_methods.swipe import insert_swipe
 +
 +__all__ = [
 +    'ADBInteraction', 'BaseInteraction', 'BrowserInteraction', 'DoNothingInteraction',
 +    'ForegroundInput', 'ForegroundInputError', 'ForegroundInputInterrupted', 'ForegroundTarget',
-+    'get_shared_foreground_input', 'PynputInteraction', 'ADB_KEY_MAP', 'vk_key_dict', 'insert_swipe',
++    'get_shared_foreground_input', 'NonoInteraction', 'PynputInteraction', 'ADB_KEY_MAP', 'vk_key_dict', 'insert_swipe',
 +]

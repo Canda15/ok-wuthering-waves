@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         BaseInteraction,
         BrowserInteraction,
         DoNothingInteraction,
+        NonoInteraction as NonoInteraction,
         PynputInteraction as PynputInteraction,
     )
     from ok.feature.Box import (
@@ -113,6 +114,7 @@ _LAZY_IMPORTS = {
     'DoNothingInteraction': ('ok.device.interaction', 'DoNothingInteraction'),
     'BaseInteraction': ('ok.device.interaction', 'BaseInteraction'),
     'BrowserInteraction': ('ok.device.interaction', 'BrowserInteraction'),
+    'NonoInteraction': ('ok.device.interaction', 'NonoInteraction'),
     'PynputInteraction': ('ok.device.interaction', 'PynputInteraction'),
     'ForegroundInputInterrupted': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputInterrupted'),
     'ForegroundInputError': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputError'),

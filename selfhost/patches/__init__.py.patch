@@ -9,7 +9,7 @@
  from ok.core.ui_config import resolve_gui_icon, resolve_ui_config, resolve_window_size
  os.environ["PYTHONIOENCODING"] = "utf-8"
  
-@@ -35,10 +35,7 @@
+@@ -35,10 +35,8 @@
          BaseInteraction,
          BrowserInteraction,
          DoNothingInteraction,
@@ -17,11 +17,12 @@
 -        GenshinInteraction,
 -        PostMessageInteraction,
 -        PyDirectInteraction,
++        NonoInteraction as NonoInteraction,
 +        PynputInteraction as PynputInteraction,
      )
      from ok.feature.Box import (
          Box,
-@@ -116,10 +113,11 @@
+@@ -116,10 +114,12 @@
      'DoNothingInteraction': ('ok.device.interaction', 'DoNothingInteraction'),
      'BaseInteraction': ('ok.device.interaction', 'BaseInteraction'),
      'BrowserInteraction': ('ok.device.interaction', 'BrowserInteraction'),
@@ -29,6 +30,7 @@
 -    'GenshinInteraction': ('ok.device.interaction', 'GenshinInteraction'),
 -    'ForegroundPostMessageInteraction': ('ok.device.interaction', 'ForegroundPostMessageInteraction'),
 -    'PyDirectInteraction': ('ok.device.interaction', 'PyDirectInteraction'),
++    'NonoInteraction': ('ok.device.interaction', 'NonoInteraction'),
 +    'PynputInteraction': ('ok.device.interaction', 'PynputInteraction'),
 +    'ForegroundInputInterrupted': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputInterrupted'),
 +    'ForegroundInputError': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputError'),
@@ -37,7 +39,7 @@
      'ImageCaptureMethod': ('ok.device.capture', 'ImageCaptureMethod'),
      'BaseCaptureMethod': ('ok.device.capture', 'BaseCaptureMethod'),
      'BrowserCaptureMethod': ('ok.device.capture', 'BrowserCaptureMethod'),
-@@ -714,14 +712,14 @@
+@@ -714,14 +714,14 @@
          if pyappify.app_profile:
              config['profile'] = pyappify.app_profile
          og.config = config
@@ -54,7 +56,7 @@
          if self.debug:
              logger.debug(f"environment contains {len(os.environ)} entries")
          # pyappify logs printf-style (log.info("%s", value)), which ok's Logger does not accept.
-@@ -1203,6 +1201,11 @@
+@@ -1203,6 +1203,11 @@
  
      def quit(self):
          logger.info('quit app')

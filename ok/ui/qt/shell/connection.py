@@ -89,14 +89,14 @@ def capture_options(device_manager, device: dict):
 
 
 def interaction_options(device_manager, device: dict):
-    """返回输入选项；Windows 始终展示唯一的前台系统键鼠。"""
+    """返回输入选项；Windows 始终展示唯一的 nono 前台方案。"""
 
     if device['device'] == "windows":
-        title = _t("SelectInteractionListView", "前台系统键鼠")
+        title = f"nono（{_t('SelectInteractionListView', '前台系统键鼠')}）"
         description = _t(
             "SelectInteractionListView",
             "使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续")
-        return [(title, description, None)], 0, ["Pynput"]
+        return [(title, description, None)], 0, ["nono"]
     if device['device'] == "adb":
         return [(_t("SelectInteractionListView", "ADBInteraction"), "", None)], 0, [None]
     if device['device'] == "browser":
