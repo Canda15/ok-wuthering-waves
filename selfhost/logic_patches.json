@@ -425,7 +425,7 @@
       "format": "unified_diff",
       "payload": "patches/update/inline_ok_requirements.py.patch",
       "before_sha256": "e649519c9b82596f124f4d787f092c27cdf6c47b1967b34b655801d3affb41b9",
-      "after_sha256": "d892706faada040bdf0421be07f3a04863fa552d944467d23a59777223175d9a"
+      "after_sha256": "02d8dae701457eac29ef03628a52a943ff52077d914ab1da0affbdf7369e9fdf"
     },
     {
       "path": "util/GlobalConfig.py",
@@ -482,6 +482,14 @@
       "payload": "patches/util/shortcut.py.patch",
       "before_sha256": "e172c962b72d1516f8c8b172a2748090a356dbe073999b60fd4fd11f6296109c",
       "after_sha256": "6d086c0369a6e277ba7ef999dfb23c41350898c47bb038d73572075868ecd28a"
+    },
+    {
+      "path": "util/version.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/util/version.py.patch",
+      "before_sha256": "64d31afc9b940359d21ce69dbe50e5fcb5c17c71decd062378f2cf68e4fee543",
+      "after_sha256": "d78477a56c6d38d75e500d2ed8a9b22d1b5ceb7b955540d9698cf55e5083a49e"
     },
     {
       "path": "util/window.py",

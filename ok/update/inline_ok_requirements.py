@@ -18,6 +18,7 @@ INLINED_REQUIREMENTS = {
 
 PYAPPIFY_VERSION = '1.0.20'
 PYAPPIFY_UPDATE_MODULES = ('updater_ui.py', '_tk_updater.py', 'changelog.py', 'i18n.py')
+PYAPPIFY_VERSIONS_SHA256 = '13c7f1c624f557f59aa615b03eaf7c02f6accce86bd1b712a8e70a199cf5614e'
 
 
 def _pyappify_source():
@@ -43,12 +44,49 @@ def _package_digests(folder):
 
 
 def verify_inlined_pyappify(repo_dir):
-    """内联结果必须与本次构建源逐文件相同，已有旧目录不能靠跳过复制蒙混通过。"""
+    """完整包必须等于固定来源加已登记适配，额外或遗留文件同样拒绝。"""
     source = _pyappify_source()
     destination = Path(repo_dir) / 'pyappify'
-    if not destination.is_dir() or _package_digests(destination) != _package_digests(source):
+    expected = _package_digests(source)
+    expected.update({name: hashlib.sha256(data).hexdigest() for name, data in _pyappify_overrides(source).items()})
+    if not destination.is_dir() or _package_digests(destination) != expected:
         raise RuntimeError('PyAppify 内联来源不一致（PYAPPIFY_INLINE_MISMATCH）')
     return PYAPPIFY_VERSION
+
+
+def _pyappify_overrides(source):
+    from selfhost import versioning
+
+    original = (source / 'versions.py').read_bytes()
+    if (hashlib.sha256(original).hexdigest() != PYAPPIFY_VERSIONS_SHA256
+            or (source / '_nono_versions.py').exists()):
+        raise RuntimeError('PyAppify 版本模块固定基线不符（PYAPPIFY_VERSIONS_BASELINE_MISMATCH）')
+    text = original.decode('utf-8')
+    # 只有固定 1.0.20 的这两个实现区间被替换；更新说明等其它行为保留原始字节。
+    begin, end = text.index('import re\n'), text.index('def select_kept_tags(')
+    imports = ('from ._nono_versions import (\n'
+               '    version_tag_key, is_version_tag, is_release_version, sort_version_tags, is_greater_version,\n'
+               ')\n\n\n')
+    text = text[:begin] + imports + text[end:]
+    begin, end = text.index('def is_greater_version('), text.index('def is_supported_pyappify_version(')
+    text = text[:begin] + text[end:]
+    return {'versions.py': text.encode('utf-8'),
+            '_nono_versions.py': Path(versioning.__file__).read_bytes()}
+
+
+def _adapt_inlined_pyappify(repo_dir):
+    source = _pyappify_source()
+    destination = Path(repo_dir) / 'pyappify'
+    originals = _package_digests(source)
+    overrides = _pyappify_overrides(source)
+    expected = {**originals, **{name: hashlib.sha256(data).hexdigest() for name, data in overrides.items()}}
+    actual = _package_digests(destination)
+    if actual == expected:
+        return
+    if actual != originals:
+        raise RuntimeError('PyAppify 内联来源不一致（PYAPPIFY_INLINE_MISMATCH）')
+    for name, data in overrides.items():
+        (destination / name).write_bytes(data)
 
 
 def _read_deploy_entries(repo_dir):
@@ -113,6 +151,7 @@ def inline_site_packages(repo_dir, package_folders=None):
             _pyappify_source()
         if os.path.exists(os.path.join(repo_dir, package_folder)):
             if package_folder == 'pyappify':
+                _adapt_inlined_pyappify(repo_dir)
                 verify_inlined_pyappify(repo_dir)
             logger.info('内联目录已存在，来源检查完成')
             continue
@@ -120,6 +159,7 @@ def inline_site_packages(repo_dir, package_folders=None):
         if exit_code != 0:
             raise RuntimeError('从构建环境内联依赖失败（INLINE_COPY_FAILED）')
         if package_folder == 'pyappify':
+            _adapt_inlined_pyappify(repo_dir)
             verify_inlined_pyappify(repo_dir)
 
 

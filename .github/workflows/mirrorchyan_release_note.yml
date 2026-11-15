@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   mirrorchyan_release_note:
+    # 继承的服务标识属于上游，NoNo 发布不得向其写入。
+    if: github.repository == 'ok-oldking/ok-wuthering-waves'
     runs-on: macos-latest
 
     steps:

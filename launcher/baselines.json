@@ -31,6 +31,10 @@
     "src-tauri/Cargo.lock": {
       "before_sha256": "984622cfb2e36772011f8beecdaddcf1c36e3296be096ca2d4e32ab10a75dbda",
       "after_sha256": "0663c7354159b6cc4fa5bd6ccfcf7059055454995c8da5c54e56eadf288d9c85"
+    },
+    "src-tauri/src/git.rs": {
+      "before_sha256": "5575e165c164941ed67ddb463ad62acad01996e24d15dc17df1756612000c94f",
+      "after_sha256": "ccc8f93becab1a0a5ecafa9b79ed20f49c80e123534a06ccc0d52e22f1c60a37"
     }
   },
   "action_files": {

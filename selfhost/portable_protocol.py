@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from selfhost.user_data import FIXED_USER_ROOTS
+from selfhost.versioning import is_release_version, is_version_tag
 
 APP_NAME = "NoNo"
 ORIGIN = "https://github.com/Canda15/nono-update.git"
@@ -104,9 +105,8 @@ def validate_manifest(manifest: dict) -> None:
                         ("requirements_sha256", 64)):
         if not isinstance(manifest.get(key), str) or not re.fullmatch(f"[0-9a-f]{{{length}}}", manifest[key]):
             raise RuntimeError("便携载荷身份摘要无效。")
-    pattern = (r"v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?"
-               if manifest["build_kind"] == "release_tag" else r"v?\d+\.\d+\.\d+")
-    if not isinstance(manifest["base_update_version"], str) or not re.fullmatch(pattern, manifest["base_update_version"]):
+    valid_version = is_version_tag if manifest["build_kind"] == "release_tag" else is_release_version
+    if not valid_version(manifest["base_update_version"]):
         raise RuntimeError("便携载荷缺少正式版本锚点。")
     if seal_manifest(manifest) != manifest:
         raise RuntimeError("便携载荷内容身份不匹配。")

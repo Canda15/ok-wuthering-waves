@@ -87,6 +87,102 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(apply(config), list(CUSTOM_TABS))
         self.assertEqual(len(config['custom_tabs']), len(CUSTOM_TABS))
 
+    def test_xmod_versions_sort_as_branded_releases_in_both_python_consumers(self):
+        from ok.util.version import compare_versions
+        from ok.update import inline_ok_requirements as inliner
+        from types import ModuleType
+
+        ordered = ['v3.8.1-alpha.1-xmod', 'v3.8.1-beta.1-xmod', 'v3.8.1-rc.1-xmod',
+                   'v3.8.1', 'v3.8.1-xmod', 'v3.8.1-xmod.1', 'v3.8.1-xmod.2',
+                   'v3.8.1-xmod.10', 'v3.8.2-xmod']
+        for left, right in zip(ordered, ordered[1:]):
+            with self.subTest(left=left, right=right):
+                self.assertLess(compare_versions(left, right), 0)
+        # 应用品牌不能改变框架、插件已有的通用版本比较。
+        self.assertLess(compare_versions('3.0.5b8', '3.0.5b9'), 0)
+        self.assertLess(compare_versions('1.0.dev1', '1.0'), 0)
+        self.assertLess(compare_versions('v3.8.1-rc-xmod', 'v3.8.1-rc.0-xmod'), 0)
+        # 插件本地标签中出现品牌文字，也不能冒充应用的完整版本格式。
+        for local, base in (('1.2+team-xmod', '1.2'), ('3.0.5b8+local-xmod', '3.0.5b8')):
+            with self.subTest(local=local):
+                self.assertGreater(compare_versions(local, base), 0)
+
+        destination = Path(self.temp_dir.name) / 'xmod-inline'
+        destination.mkdir()
+        with redirect_stdout(StringIO()):
+            inliner.inline_site_packages(destination, ('pyappify',))
+        package = ModuleType('_xmod_pyappify_probe')
+        package.__path__ = [str(destination / 'pyappify')]
+        with patch.dict(sys.modules, {package.__name__: package}):
+            versions = importlib.import_module(f'{package.__name__}.versions')
+            self.assertEqual(versions.sort_version_tags(ordered), ordered[::-1])
+            for left, right in zip(ordered, ordered[1:]):
+                self.assertTrue(versions.is_greater_version(right, left))
+            for tag in ordered[3:]:
+                self.assertTrue(versions.is_release_version(tag), tag)
+            for tag in ordered[:3]:
+                self.assertFalse(versions.is_release_version(tag), tag)
+            for invalid in ('dev', 'v3.8.1-xmod.0', 'v3.8.1-xmod.bad', 'v3.8.1-other'):
+                self.assertFalse(versions.is_version_tag(invalid), invalid)
+
+        self.assertEqual(inliner.verify_inlined_pyappify(destination), '1.0.20')
+
+    def test_xmod_tag_generation_requires_integrated_base_and_ignores_future_cached_tags(self):
+        release_script = load_sync_script('upstream_release.py')
+        fixture = self.make_upstream_release_fixture()
+        from runpy import run_path
+        generator = run_path(str(Path(__file__).resolve().parents[1]
+                                / '.agents/skills/deploy/scripts/next_tag.py'))['next_tag']
+        with self.assertRaisesRegex(ValueError, '官方基础'):
+            generator('release', ['v3.8.1', 'v3.8.3'])
+        self.assertEqual(generator('release', ['v3.8.1', 'v3.8.3'], 'v3.8.1'), 'v3.8.1-xmod')
+        self.assertEqual(generator('release', ['v3.8.1-xmod.2', 'v3.8.1-xmod.10'], 'v3.8.1'),
+                         'v3.8.1-xmod.11')
+        self.assertEqual(generator('beta', ['v3.8.1-beta.2-xmod'], 'v3.8.1'), 'v3.8.1-beta.3-xmod')
+        with self.assertRaisesRegex(ValueError, '已发布正式版'):
+            generator('beta', ['v3.8.1-xmod'], 'v3.8.1')
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            # 新官方标签的对象已在本地，仍未合入 HEAD，不能把“能找到对象”当作已集成。
+            future = fixture.git('commit-tree', fixture.git('rev-parse', 'HEAD^{tree}'),
+                                 '-p', fixture.upstream, '-m', '未合入的未来上游')
+            fixture.git('tag', '-a', 'v3.8.3', future, '-m', '仅缓存的未来版本')
+            fixture.git('push', 'upstream', 'refs/tags/v3.8.3')
+            self.assertEqual(release_script.find_integrated_upstream(fixture.checkout),
+                             {'upstream_tag': 'v3.8.1', 'upstream_commit': fixture.upstream})
+            fixture.git('tag', '-a', 'v3.8.3-xmod', '-m', '错误基础标签')
+            with self.assertRaisesRegex(RuntimeError, '实际包含的官方基础版本'):
+                release_script.record_source(fixture.checkout, 'v3.8.3-xmod', str(fixture.mirror))
+
+    def test_xmod_inline_rejects_extra_or_changed_contract_and_altered_source(self):
+        from ok.update import inline_ok_requirements as inliner
+
+        destination = Path(self.temp_dir.name) / 'xmod-inline-protection'
+        destination.mkdir()
+        source = inliner._pyappify_source()
+        before = inliner._package_digests(source)
+        with redirect_stdout(StringIO()):
+            inliner.inline_site_packages(destination, ('pyappify',))
+            inliner.inline_site_packages(destination, ('pyappify',))
+        self.assertEqual(inliner._package_digests(source), before)
+        contract = destination / 'pyappify/_nono_versions.py'
+        original = contract.read_bytes()
+        contract.write_bytes(original + b'\naltered = True\n')
+        with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_INLINE_MISMATCH'):
+            inliner.verify_inlined_pyappify(destination)
+        contract.write_bytes(original)
+        extra = destination / 'pyappify/stale_module.py'
+        extra.write_bytes(b'stale = True\n')
+        with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_INLINE_MISMATCH'):
+            inliner.inline_site_packages(destination, ('pyappify',))
+        extra.unlink()
+        self.assertEqual(inliner.verify_inlined_pyappify(destination), '1.0.20')
+        altered = Path(self.temp_dir.name) / 'altered-source'
+        shutil.copytree(source, altered, ignore=shutil.ignore_patterns('__pycache__'))
+        (altered / 'versions.py').write_bytes(b'wrong = True\n')
+        with patch.object(inliner, '_pyappify_source', return_value=altered):
+            with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_VERSIONS_BASELINE_MISMATCH'):
+                inliner.verify_inlined_pyappify(destination)
+
     def make_upstream_release_fixture(self):
         from selfhost.portable import process_environment
 
@@ -125,7 +221,16 @@ class TestSelfhostSmoke(unittest.TestCase):
         head = commit('保留本地适配')
         (checkout / 'scripts').mkdir()
         shutil.copy2(Path(__file__).resolve().parents[1] / 'scripts/upstream_release.py', checkout / 'scripts')
+        (checkout / 'selfhost').mkdir()
+        for name in ('__init__.py', 'versioning.py'):
+            shutil.copy2(Path(__file__).resolve().parents[1] / 'selfhost' / name, checkout / 'selfhost' / name)
+        upstream_remote = root / 'upstream.git'
+        git('init', '--bare', str(upstream_remote), cwd=root)
+        git('remote', 'add', 'upstream', str(upstream_remote))
+        git('tag', '-a', 'v3.8.1', upstream, '-m', '真实官方基础')
+        git('push', 'upstream', 'refs/tags/v3.8.1')
         return SimpleNamespace(root=root, checkout=checkout, remote=remote, mirror=mirror,
+                               upstream_remote=upstream_remote,
                                environment=environment, git=git, commit=commit, base=base,
                                upstream=upstream, head=head)
 
@@ -145,18 +250,18 @@ class TestSelfhostSmoke(unittest.TestCase):
             marker.write_text(content, encoding='utf-8')
         fixture.git('add', '-A', cwd=checkout)
         fixture.git('commit', '--allow-empty', '-m', '独立部署镜像', cwd=checkout)
-        fixture.git('tag', '-af', 'v3.8.1', '-m', '测试镜像标签', cwd=checkout)
-        fixture.git('push', '--force', str(fixture.mirror), 'HEAD:master', 'refs/tags/v3.8.1', cwd=checkout)
+        fixture.git('tag', '-af', 'v3.8.1-xmod', '-m', '测试镜像标签', cwd=checkout)
+        fixture.git('push', '--force', str(fixture.mirror), 'HEAD:master', 'refs/tags/v3.8.1-xmod', cwd=checkout)
         return fixture.git('rev-parse', 'HEAD', cwd=checkout)
 
     def test_upstream_sync_retries_missing_release_and_rejects_query_errors(self):
         release_script = load_sync_script('upstream_release.py')
         fixture = self.make_upstream_release_fixture()
-        fixture.git('tag', '-a', 'v3.8.1', '-m', '已包含上游')
-        fixture.git('push', 'origin', 'refs/tags/v3.8.1')
+        fixture.git('tag', '-a', 'v3.8.1-xmod', '-m', '已包含上游')
+        fixture.git('push', 'origin', 'refs/tags/v3.8.1-xmod')
         assets = [{'name': name, 'state': 'uploaded', 'size': 100}
                   for name in ('NoNo-win32-portable.zip', 'NoNo-win32-sha256.txt')]
-        complete = {'tag_name': 'v3.8.1', 'draft': False, 'prerelease': False, 'assets': assets}
+        complete = {'tag_name': 'v3.8.1-xmod', 'draft': False, 'prerelease': False, 'assets': assets}
         scenarios = (
             ('尚未发布', HTTPError('https://example.invalid', 404, '不存在', {}, None), True),
             ('完整发布', complete, False),
@@ -185,7 +290,7 @@ class TestSelfhostSmoke(unittest.TestCase):
                     else:
                         result = release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
                         self.assertEqual(result['needed'], expected)
-                    self.assertTrue(request.call_args.args[0].full_url.endswith('/releases/tags/v3.8.1'))
+                    self.assertTrue(request.call_args.args[0].full_url.endswith('/releases/tags/v3.8.1-xmod'))
 
             with patch.object(release_script, 'urlopen', side_effect=AssertionError('强制模式无需查询附件')) as request:
                 self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1',
@@ -195,32 +300,32 @@ class TestSelfhostSmoke(unittest.TestCase):
             fixture.commit('发布后的本地说明')
             with patch.object(release_script, 'urlopen', return_value=BytesIO(json.dumps(complete).encode())):
                 self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository'),
-                                 {'needed': False, 'covered_tag': 'v3.8.1'})
+                                 {'needed': False, 'covered_tag': 'v3.8.1-xmod'})
 
     def test_upstream_sync_checks_real_tag_ancestry_and_identity(self):
         release_script = load_sync_script('upstream_release.py')
         fixture = self.make_upstream_release_fixture()
         with patch.dict(os.environ, fixture.environment, clear=True), patch.object(release_script, 'urlopen') as request:
-            fixture.git('tag', '-a', 'v3.8.1', fixture.base, '-m', '旧同号版本')
-            fixture.git('push', 'origin', 'refs/tags/v3.8.1')
+            fixture.git('tag', '-a', 'v3.8.1-xmod', fixture.base, '-m', '旧同号版本')
+            fixture.git('push', 'origin', 'refs/tags/v3.8.1-xmod')
             for force in (False, True):
                 with self.subTest(force=force), self.assertRaisesRegex(RuntimeError, '不包含目标上游'):
                     release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository', force=force)
 
             tree = fixture.git('rev-parse', 'HEAD^{tree}')
             later = fixture.git('commit-tree', tree, '-p', fixture.head, '-m', '尚未检出的后续发布')
-            fixture.git('tag', '-af', 'v3.8.1', later, '-m', '远端较新版本')
-            fixture.git('push', '--force', 'origin', 'refs/tags/v3.8.1')
+            fixture.git('tag', '-af', 'v3.8.1-xmod', later, '-m', '远端较新版本')
+            fixture.git('push', '--force', 'origin', 'refs/tags/v3.8.1-xmod')
             with self.assertRaisesRegex(RuntimeError, '不在当前 HEAD 历史'):
                 release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
 
-            fixture.git('update-ref', 'refs/tags/v3.8.1', fixture.base, cwd=fixture.remote)
+            fixture.git('update-ref', 'refs/tags/v3.8.1-xmod', fixture.base, cwd=fixture.remote)
             with self.assertRaisesRegex(RuntimeError, '远端与本地'):
                 release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository')
             request.assert_not_called()
 
-            fixture.git('tag', '-d', 'v3.8.1')
-            fixture.git('push', 'origin', ':refs/tags/v3.8.1')
+            fixture.git('tag', '-d', 'v3.8.1-xmod')
+            fixture.git('push', 'origin', ':refs/tags/v3.8.1-xmod')
             fixture.git('reset', '--hard', fixture.base)
             self.assertEqual(release_script.check_release(fixture.checkout, 'v3.8.1', 'synthetic/repository'),
                              {'needed': True})
@@ -233,20 +338,20 @@ class TestSelfhostSmoke(unittest.TestCase):
         fixture = self.make_upstream_release_fixture()
         with patch.dict(os.environ, fixture.environment, clear=True):
             plan = release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
-            self.assertEqual(plan, {'release_tag': 'v3.8.1', 'source_commit': fixture.head,
-                                    'upstream_commit': fixture.upstream, 'reuse': False})
+            self.assertEqual(plan, {'release_tag': 'v3.8.1-xmod', 'source_commit': fixture.head,
+                                    'upstream_tag': 'v3.8.1', 'upstream_commit': fixture.upstream, 'reuse': False})
             # 源仓库没有标签也不能覆盖镜像留下的旧同号发布。
             self.set_mirror_release_record(fixture, None)
             with self.assertRaisesRegex(RuntimeError, '缺少源码来源记录'):
                 release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
 
-            fixture.git('tag', '-a', 'v3.8.1', '-m', '本次验证提交')
-            fixture.git('push', 'origin', 'refs/tags/v3.8.1')
-            fixture.git('update-ref', '-d', 'refs/tags/v3.8.1', cwd=fixture.mirror)
-            record = release_script.record_source(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            fixture.git('tag', '-a', 'v3.8.1-xmod', '-m', '本次验证提交')
+            fixture.git('push', 'origin', 'refs/tags/v3.8.1-xmod')
+            fixture.git('update-ref', '-d', 'refs/tags/v3.8.1-xmod', cwd=fixture.mirror)
+            record = release_script.record_source(fixture.checkout, 'v3.8.1-xmod', str(fixture.mirror))
             marker_path = fixture.checkout / 'selfhost/build-source.json'
             marker = marker_path.read_text(encoding='utf-8')
-            self.assertEqual(record, {'schema_version': 1, 'release_tag': 'v3.8.1', 'source_commit': fixture.head})
+            self.assertEqual(record, {'schema_version': 1, 'release_tag': 'v3.8.1-xmod', 'source_commit': fixture.head})
             self.assertFalse(marker_path.read_bytes().startswith(b'\xef\xbb\xbf'))
             mirror_commit = self.set_mirror_release_record(fixture, marker)
             self.assertNotEqual(mirror_commit, fixture.head)
@@ -261,19 +366,21 @@ class TestSelfhostSmoke(unittest.TestCase):
             ):
                 with self.subTest(label=label):
                     self.set_mirror_release_record(fixture, content)
-                    old_tag = fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.mirror)
+                    old_tag = fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.mirror)
                     with self.assertRaisesRegex(RuntimeError, '更新镜像'):
                         release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
-                    self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.mirror), old_tag)
+                    self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.mirror), old_tag)
                     self.assertEqual(fixture.git('tag', '--list', 'v3.8.2'), '')
 
             with self.assertRaisesRegex(RuntimeError, 'Git ls-remote'):
                 release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.root / 'missing.git'))
-            fixture.commit('验证后新增改动')
-            with self.assertRaisesRegex(RuntimeError, '没有指向本次验证 HEAD'):
-                release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            changed = fixture.commit('验证后新增改动')
+            revision = release_script.plan_release(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+            self.assertEqual(revision['release_tag'], 'v3.8.1-xmod.1')
+            self.assertEqual(revision['source_commit'], changed)
+            self.assertFalse(revision['reuse'])
             with self.assertRaisesRegex(RuntimeError, '当前检出'):
-                release_script.record_source(fixture.checkout, 'v3.8.1', str(fixture.mirror))
+                release_script.record_source(fixture.checkout, 'v3.8.1-xmod', str(fixture.mirror))
             self.assertEqual(marker_path.read_text(encoding='utf-8'), marker)
 
     def test_upstream_publish_creates_annotated_tag_and_preserves_it_on_retry(self):
@@ -298,7 +405,7 @@ function gh {
                                encoding='utf-8')
         environment = {**fixture.environment, 'TEST_PYTHON': sys.executable, 'UPDATE_MIRROR': str(fixture.mirror),
                        'GITHUB_REPOSITORY': 'synthetic/repository', 'TEST_DISPATCH_FILE': str(dispatches),
-                       'TEST_DISPATCH_EXIT': '23', 'RELEASE_TAG': 'v3.8.1'}
+                       'TEST_DISPATCH_EXIT': '23', 'RELEASE_TAG': 'v3.8.1-xmod'}
 
         def run(script=script_path):
             return subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', str(script)],
@@ -308,16 +415,16 @@ function gh {
         result = run()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('派发 build.yml 失败', result.stderr)
-        tag_object = fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote)
+        tag_object = fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.remote)
         self.assertEqual(fixture.git('cat-file', '-t', tag_object, cwd=fixture.remote), 'tag')
-        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1^{commit}', cwd=fixture.remote), fixture.head)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod^{commit}', cwd=fixture.remote), fixture.head)
 
         environment['TEST_DISPATCH_EXIT'] = '0'
         fixture.git('merge', '--no-ff', '--no-edit', 'refs/upstream-tags/v3.8.1')
         self.assertEqual(fixture.git('rev-parse', 'HEAD'), fixture.head)
         result = run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.remote), tag_object)
 
         build = yaml.safe_load((repo_root / '.github/workflows/build.yml').read_text(encoding='utf-8'))
         marker_step = next(item for item in build['jobs']['synchronize']['steps']
@@ -330,10 +437,10 @@ function gh {
         self.set_mirror_release_record(fixture, marker)
         result = run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.remote), tag_object)
         self.assertEqual(fixture.git('rev-parse', 'refs/heads/master', cwd=fixture.remote), fixture.head)
         calls = [json.loads(line) for line in dispatches.read_text(encoding='utf-8').splitlines()]
-        self.assertEqual(calls, [['workflow', 'run', 'build.yml', '--ref', 'v3.8.1',
+        self.assertEqual(calls, [['workflow', 'run', 'build.yml', '--ref', 'v3.8.1-xmod',
                                  '--repo', 'synthetic/repository']] * 3)
 
         self.set_mirror_release_record(fixture, json.dumps({**json.loads(marker), 'source_commit': fixture.base}))
@@ -343,13 +450,14 @@ function gh {
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('源码来源与本次发布不一致', result.stderr)
         self.assertEqual((fixture.checkout / 'selfhost/build-source.json').read_text(encoding='utf-8'), marker)
-        fixture.commit('待发布的新修复')
+        revision_head = fixture.commit('待发布的新修复')
         result = run()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('没有指向本次验证 HEAD', result.stderr)
-        self.assertEqual(fixture.git('rev-parse', 'refs/heads/master', cwd=fixture.remote), fixture.head)
-        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1', cwd=fixture.remote), tag_object)
-        self.assertEqual(len(dispatches.read_text(encoding='utf-8').splitlines()), 3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fixture.git('rev-parse', 'refs/heads/master', cwd=fixture.remote), revision_head)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod', cwd=fixture.remote), tag_object)
+        self.assertEqual(fixture.git('rev-parse', 'refs/tags/v3.8.1-xmod.1^{commit}', cwd=fixture.remote),
+                         revision_head)
+        self.assertEqual(len(dispatches.read_text(encoding='utf-8').splitlines()), 4)
         self.assertEqual(fixture.git('tag', '--list', 'v3.8.2'), '')
 
     def test_main_window_still_consumes_custom_tabs(self):
@@ -1434,6 +1542,7 @@ class TestPortableBundle(unittest.TestCase):
             'selfhost/__init__.py': b'\n',
             'selfhost/ok_pin.json': b'{"package": "ok-script", "version": "test"}\n',
             'selfhost/user_data.py': (Path(__file__).resolve().parents[1] / 'selfhost/user_data.py').read_bytes(),
+            'selfhost/versioning.py': (Path(__file__).resolve().parents[1] / 'selfhost/versioning.py').read_bytes(),
             'assets/current.bin': b'current asset',
             '.update_repo_gitignore': b'__pycache__/\n*.pyc\nlogs/\n',
             'deploy.txt': b'src\nok\nselfhost\npyappify\nmain.py\nconfig.py\nrequirements.txt\npyappify.yml\nassets\n',
@@ -1475,6 +1584,7 @@ class TestPortableBundle(unittest.TestCase):
                                               self.launcher_proof, self.build_root)
 
     def test_snapshot_uses_current_checkout_and_explicit_host_without_private_or_developer_files(self):
+        self.version = 'v3.8.1-xmod.10'
         (self.source / 'main.py').write_text('TOKEN = "本次构建"\n', encoding='utf-8')
         snapshot, digests = self.prepare_snapshot()
         self.assertEqual((snapshot / 'main.py').read_bytes(), (self.source / 'main.py').read_bytes())
@@ -1484,6 +1594,8 @@ class TestPortableBundle(unittest.TestCase):
         self.assertEqual((self.source / 'requirements.txt').read_bytes(), self.files['requirements.txt'])
         self.assertEqual((snapshot / '.gitignore').read_bytes(), self.files['.update_repo_gitignore'])
         self.assertNotIn('pyappify', (snapshot / 'requirements.txt').read_text(encoding='utf-8'))
+        self.assertEqual((snapshot / 'pyappify/_nono_versions.py').read_bytes(),
+                         (snapshot / 'selfhost/versioning.py').read_bytes())
         self.assertFalse(any(
             'private' in path or path.startswith(('tests/', 'ok_templates/', '.git/'))
             or '__pycache__' in path or path == 'deploy.txt'
@@ -1642,7 +1754,8 @@ class TestPortableBundle(unittest.TestCase):
         source_sha = self.portable.git(self.source, 'rev-parse', 'HEAD')
         (self.source / 'main.py').write_bytes(b'current source snapshot')
         (self.source / 'requirements.txt').write_bytes(b'example==2.0.0\n')
-        for release_tag in (None, self.version, 'v3.8.1-beta.1'):
+        for release_tag in (None, self.version, 'v3.8.1-beta.1', 'v3.8.1-xmod', 'v3.8.1-xmod.10',
+                            'v3.8.1-beta.1-xmod'):
             with self.subTest(release_tag=release_tag):
                 calls, checks = [], []
                 def fetch(destination, app_name, candidate=None, proof_path=None, *, published=False):

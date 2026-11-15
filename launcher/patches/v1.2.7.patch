@@ -8,17 +8,17 @@
  use std::vec::Vec;
 -use tokio::io::AsyncWriteExt;
  use tracing::{debug, error, info, warn};
- 
+
  pub const YML_FILE_NAME: &str = "pyappify.yml";
  pub const UPDATE_METHOD_OPTION_MANUAL: &str = "MANUAL_UPDATE";
  pub const UPDATE_METHOD_OPTION_AUTO: &str = "AUTO_UPDATE";
  pub const UPDATE_METHOD_OPTION_AUTO_PRE_RELEASE: &str = "AUTO_UPDATE_PRE_RELEASE";
 -static APP_JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
- 
+
  fn default_update_method_fn() -> String {
      UPDATE_METHOD_OPTION_AUTO.to_string()
 @@ -268,8 +265,10 @@
- 
+
  pub(crate) async fn save_app_config_to_json(app: &App) -> anyhow::Result<()> {
      let config_path = get_app_config_json_path(&app.name);
 -    let json_data = serde_json::to_string_pretty(app)
@@ -32,7 +32,7 @@
              format!(
 @@ -290,63 +289,22 @@
  }
- 
+
  async fn write_file_atomically(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 -    let sequence = APP_JSON_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 -    let temp_path = path.with_file_name(format!(".app.json.{}.{sequence}.tmp", std::process::id()));
@@ -108,11 +108,11 @@
 +    }
 +    Ok(app)
  }
- 
+
  pub(crate) async fn load_app_config_from_json(app_name: &str) -> anyhow::Result<Option<App>> {
 @@ -399,7 +357,7 @@
              app.normalize_preferences();
- 
+
              let profile = app.get_current_profile_settings();
 -            debug!("app {} current profile: {:?}", app.name, profile);
 +            debug!("应用运行配置已解析");
@@ -168,11 +168,11 @@
 -        }
          Err(e) => return Err(e),
      };
- 
+
 @@ -385,6 +372,7 @@
      Ok(app)
  }
- 
+
 +#[cfg(test)]
  fn is_invalid_json_error(error: &anyhow::Error) -> bool {
      error
@@ -180,7 +180,7 @@
 @@ -392,9 +380,10 @@
          .is_some_and(|json_error| json_error.is_syntax() || json_error.is_eof())
  }
- 
+
 +#[cfg(test)]
  async fn backup_invalid_app_config(config_path: &Path) -> Result<PathBuf> {
 -    let unique_suffix = SystemTime::now()
@@ -201,12 +201,12 @@
 +    let mut update_failed = !bootstrap_pending
 +        && app.update_state != AppUpdateState::Idle
 +        && !retry_persisted_update(&mut app).await;
- 
+
      let update_method = startup_overrides
          .update_method
 @@ -497,9 +489,14 @@
      info!("locale is {}", get_locale());
- 
+
      if let Some(latest_version) = available_update {
 -        if !update_failed && app.installed && !app.available_versions.is_empty() {
 +        if !bootstrap_pending && !update_failed && app.installed && !app.available_versions.is_empty() {
@@ -218,12 +218,12 @@
 +        error!("首次接收状态未能提交，本次不启动业务（E_BOOTSTRAP_SAVE）");
 +        return;
      }
- 
+
      if auto_start
 @@ -1011,58 +1008,38 @@
- 
+
      update_working_from_repo(app_name).await?;
- 
+
 -    let temp_app_for_config = read_working_dir_app_config(app_name);
 -    let (profile_settings_for_setup, final_profile_name_to_set) =
 -        get_profile_for_setup(&temp_app_for_config, profile_name, app_name)?;
@@ -282,7 +282,7 @@
 +    *APP.lock().await = Some(installed_app);
 +    update_app_from_disk_at_version(version).await?;
 +    emit_app().await;
- 
+
      emit_success_finish!(app_name);
      Ok(())
 +}
@@ -306,7 +306,7 @@
 +    save_app_config_to_json(&app).await?;
 +    Ok(app)
  }
- 
+
  fn get_relevant_content(spec: &str, dir: &Path) -> Option<String> {
 --- a/src-tauri/src/config_manager.rs
 +++ b/src-tauri/src/config_manager.rs
@@ -324,17 +324,17 @@
          }
 @@ -119,7 +116,7 @@
  }
- 
+
  impl AppConfig {
 -    pub fn new() -> Self {
 +    pub fn new() -> Result<Self, Error> {
          let config_dir = get_config_dir();
          let config_file_path = config_dir.join("app_config.json");
- 
+
 @@ -130,12 +127,12 @@
              legacy_auto_start: None,
          };
- 
+
 -        instance.load_from_file();
 +        instance.load_from_file()?;
          instance.merge_and_validate_defaults();
@@ -345,12 +345,12 @@
 -        instance
 +        Ok(instance)
      }
- 
+
      fn get_default_config_items() -> HashMap<String, ConfigItem> {
 @@ -261,93 +258,34 @@
          });
      }
- 
+
 -    fn load_from_file(&mut self) {
 -        if !self.config_path.exists() {
 -            info!("Config file {:?} not found. Proceeding with current (default) configuration values.", self.config_path);
@@ -467,12 +467,12 @@
 +        crate::nono_state::write_json(&self.config_path, &values)?;
 +        Ok(())
      }
- 
+
      pub fn get_item_value(&self, name: &str) -> Option<ConfigValue> {
 @@ -360,7 +298,7 @@
          items_vec
      }
- 
+
 -    pub fn update_item_value(&mut self, name: &str, new_value: ConfigValue) {
 +    pub fn update_item_value(&mut self, name: &str, new_value: ConfigValue) -> Result<(), Error> {
          if name == I18N_CONFIG_KEY {
@@ -491,12 +491,12 @@
 +                        return Err(anyhow::anyhow!("配置项类型无效（E_GLOBAL_TYPE）").into());
                      }
                  }
- 
+
                  item.value = new_value;
                  item.validate_and_normalize();
 -                self.save_to_file();
 +                self.save_to_file()?;
- 
+
                  if name == PIP_CACHE_DIR_CONFIG_KEY {
                      self.update_pip_cache_env_var_from_config();
 @@ -395,9 +330,10 @@
@@ -511,7 +511,7 @@
 +        }
 +        Ok(())
      }
- 
+
      fn update_pip_cache_env_var_from_config(&self) {
 @@ -569,7 +505,7 @@
          .ok_or_else(|| "Pip Index URL configuration is missing".to_string())?;
@@ -523,14 +523,14 @@
      let item = &config.items[PIP_INDEX_URL_CONFIG_KEY];
      serde_json::to_string(&serde_json::json!({
 @@ -596,7 +532,7 @@
- 
+
      let config_value: ConfigValue = serde_json::from_value(value.clone())?;
- 
+
 -    config_manager.update_item_value(&name, config_value);
 +    config_manager.update_item_value(&name, config_value)?;
      Ok(())
  }
- 
+
 @@ -671,12 +607,12 @@
  #[tauri::command]
  pub fn save_configuration(state: tauri::State<'_, ConfigState>) -> Result<(), String> {
@@ -539,7 +539,7 @@
 +    config_manager.save_to_file().map_err(|_| "配置保存失败（E_GLOBAL_SAVE）".to_string())?;
      Ok(())
  }
- 
+
 -pub fn init_config_manager(app_handle: &tauri::AppHandle) {
 -    let config = AppConfig::new();
 +pub fn init_config_manager(app_handle: &tauri::AppHandle) -> Result<(), Error> {
@@ -566,7 +566,7 @@
 +    let portable_root = crate::nono_state::canonical_root(&std::env::current_dir()?)?;
 +    let user_root = crate::nono_state::ensure_directory(&portable_root, "data/user/NoNo")?;
 +    cmd.env("NONO_USER_DATA_ROOT", user_root);
- 
+
      for (key, value) in envs {
          cmd.env(key, value);
 -        emit_info!(app_name, "set Env: {}={}", key, value);
@@ -582,7 +582,7 @@
 +        let _ = (key, value);
 +        emit_info!(app_name, "业务环境项已准备");
      }
- 
+
      let app_name_owned = app_name.to_string();
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
@@ -605,7 +605,7 @@
 +    nono_receive_only: bool,
 +    nono_build_info: bool,
  }
- 
+
  impl CommandLineOptions {
 @@ -100,6 +107,15 @@
      while i < args.len() {
@@ -626,7 +626,7 @@
 @@ -260,10 +276,20 @@
          options.auto_start = Some(true);
      }
- 
+
 +    let nono_requests = usize::from(options.nono_install_working.is_some())
 +        + usize::from(options.nono_receive_only) + usize::from(options.nono_build_info);
 +    if nono_requests > 1 || (nono_requests > 0 && (options.command.is_some()
@@ -636,7 +636,7 @@
 +    }
      Ok(options)
  }
- 
+
  fn has_cli_command(options: &CommandLineOptions) -> bool {
 +    if options.nono_install_working.is_some() || options.nono_receive_only || options.nono_build_info {
 +        return true;
@@ -647,7 +647,7 @@
 @@ -304,6 +330,29 @@
      Ok(())
  }
- 
+
 +const RECEIVE_FAILURE_MESSAGE: &str = "NoNo 便携环境接收失败，原件已保留。请关闭程序后重试。";
 +
 +fn receive_failure_is_cli(options: &CommandLineOptions) -> bool {
@@ -716,7 +716,7 @@
 @@ -642,22 +723,6 @@
          .init();
      info!("Log initialized");
- 
+
 -    #[cfg(not(debug_assertions))]
 -    {
 -        if let Some(exe_path) = env::current_exe().ok() {
@@ -825,7 +825,7 @@
 +++ b/src-tauri/Cargo.lock
 @@ -3264,7 +3264,7 @@
  ]
- 
+
  [[package]]
 -name = "pyappify"
 +name = "NoNo"
@@ -840,3 +840,78 @@
   "shortcuts-rs",
   "sys-locale",
   "sysinfo",
+diff --git a/src-tauri/src/git.rs b/src-tauri/src/git.rs
+--- a/src-tauri/src/git.rs
++++ b/src-tauri/src/git.rs
+@@ -122,11 +122,13 @@
+     minor: u64,
+     patch: u64,
+     prerelease: Prerelease,
++    branded: bool,
++    revision: u64,
+ }
+
+ fn parse_version_tag(tag_name: &str) -> Option<VersionKey> {
+     static VERSION_REGEX: Lazy<Regex> = Lazy::new(|| {
+-        Regex::new(r"^v?(\d+)\.(\d+)\.(\d+)(?:(?:-|\.)(alpha|beta|rc)(?:\.(\d+))?)?$").unwrap()
++        Regex::new(r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-.](alpha|beta|rc)(?:\.([0-9]+))?)?(-xmod(?:\.([1-9][0-9]*))?)?$").unwrap()
+     });
+
+     let caps = VERSION_REGEX.captures(tag_name)?;
+@@ -145,12 +147,22 @@
+         None => Prerelease::Release,
+         _ => return None,
+     };
++    // xmod 是本应用发行品牌；稳定性由渠道决定，修订按整数排序。
++    let branded = caps.get(6).is_some();
++    let revision = caps
++        .get(7)
++        .map(|m| m.as_str().parse::<u64>())
++        .transpose()
++        .ok()?
++        .unwrap_or(0);
+
+     Some(VersionKey {
+         major,
+         minor,
+         patch,
+         prerelease,
++        branded,
++        revision,
+     })
+ }
+
+@@ -1977,6 +1989,33 @@
+     }
+
+     #[test]
++    fn compares_xmod_revisions_and_keeps_release_channels() {
++        let ordered = [
++            "v3.8.1-alpha.1-xmod",
++            "v3.8.1-beta.1-xmod",
++            "v3.8.1-rc.1-xmod",
++            "v3.8.1",
++            "v3.8.1-xmod",
++            "v3.8.1-xmod.1",
++            "v3.8.1-xmod.2",
++            "v3.8.1-xmod.10",
++            "v3.8.2-xmod",
++        ];
++        for pair in ordered.windows(2) {
++            assert_eq!(compare_version_tags(pair[0], pair[1]), Some(Ordering::Less));
++        }
++        for version in &ordered[3..] {
++            assert!(is_release_version(version), "{version}");
++        }
++        for version in &ordered[..3] {
++            assert!(!is_release_version(version), "{version}");
++        }
++        for invalid in ["dev", "v3.8.1-xmod.0", "v3.8.1-xmod.bad", "v3.8.1-other"] {
++            assert!(!is_version_tag(invalid), "{invalid}");
++        }
++    }
++
++    #[test]
+     fn version_history_compares_each_version_to_the_previous_filtered_version() {
+         let root = std::env::temp_dir().join(format!(
+             "pyappify-version-history-{}-{}",

@@ -15,15 +15,29 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | `ok-script` 3.0.5b7（适配上游应用 v3.8.0） |
+| 版本 | `ok-script` 3.0.5b8（适配上游应用 v3.8.1） |
 | 权威来源 | `selfhost/ok_pin.json`（版本、原始 wheel、完整补丁后树与逻辑差异集合的 SHA-256，由 `scripts/sync_ok.py` 维护） |
-| 来源 | PyPI wheel `ok_script-3.0.5b7-py3-none-any.whl` |
-| 原始 wheel SHA-256 | `3ddb003bb62bb3e80e7ada0c7261067773f0c0b1ce5784829cc3844a7bc59fb3` |
-| 内联范围 | wheel 的 `ok/` 基线共 281 个有效文件；逻辑差异后的实际数量由 `--check` 给出 |
+| 来源 | PyPI wheel `ok_script-3.0.5b8-py3-none-any.whl` |
+| 原始 wheel SHA-256 | `81bcecf0078378a0b6138a4487e53e2db0bc0ba58243ec26381093c8a198cf1e` |
+| 内联范围 | 固定 wheel 的 `ok/`；逻辑差异后的实际数量由 `--check` 给出 |
 | 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info 不作为框架源码入库；生成依赖和内联版本依据原始 wheel、pin 及严格来源清单，不能回退到另一份已安装的 ok-script |
 
 内联以固定 wheel 为基线，再施加品牌与已登记的逻辑差异，但**没有上游框架的 git 历史**。
 最初因本机沙箱禁止 `sh.exe` 创建命名管道、`git subtree` 无法运行，采用了“下载 wheel 解包后入库”的方式。
+
+## 应用版本使用 xmod 标识
+
+后续 NoNo 应用发布使用 `vX.Y.Z-xmod`，与上游版本区分。同一基础版本需要再次发布修复时，依次使用
+`vX.Y.Z-xmod.1`、`vX.Y.Z-xmod.2`；修订号按整数比较，`.10` 大于 `.2`，不覆盖旧标签，也不为绕过冲突
+冒用下一上游版本号。基础版本必须确实已合入当前源码，下载过某个上游标签不代表已经完成适配。
+
+`xmod` 和 `xmod.N` 都作为本项目正式版；预览版沿用渠道与序号，例如 `vX.Y.Z-beta.1-xmod`。
+历史无后缀版本仍可读取，同一数字版本从旧标签到 `-xmod` 属于更新。应用版本与框架 `ok-script`、
+启动器自身版本分别维护；EXE 的数字文件版本不会写入字母后缀。
+
+旧启动器会过滤 `-xmod` 标签，因此首次升级到这一发布格式时，需要退出 NoNo，下载完整的
+`NoNo-win32-portable.zip`，将包内 `NoNo/` 的内容覆盖到原目录后再启动。新启动器负责识别后续 xmod
+版本。便携包文件名与使用方式保持不变，账号、工坊和其它用户数据继续按下文的保护流程处理。
 
 ## 落地改动（相对上游 aa543c4）
 
@@ -79,6 +93,7 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 | `ok_pin.json` | 框架版本、原始 wheel、补丁后树与差异集合摘要的权威来源 | 同步 / 校验时 |
 | `runtime/host.c`、`runtime/host.rc` | 原生业务宿主及图标、产品名等 EXE 资源 | `scripts/build_runtime.ps1` 编译时 |
 | `portable.py` | 当前部署快照、启动器证据、完整运行时和 incoming 包的校验及归档 | 普通编译与正式发布共用 |
+| `versioning.py` | 官方基础版本与 xmod 发布版本的分类、映射和数值排序 | 发布、便携协议和内联更新器共用 |
 
 启动器差异单独放在 `launcher/`：官方 Rust 与 Action 的固定来源、最小统一差异、NoNo 接收与
 持久化模块，以及全部载荷的摘要都可审查。构建先校验固定来源，应用差异，再重编译 Action 的
@@ -153,7 +168,7 @@ v1.2.7 根启动器与原生业务宿主；快捷方式默认关闭，已有明�
 
 ```powershell
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py'            # 优先取上游 pyproject 版本，没有声明才用 pin
-& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b7   # 明确固定已经审查的版本
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b8   # 明确固定已经审查的版本
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --dry-run  # 下载并验证重放，只报告差异
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check    # 离线校验框架、基线及差异来源
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check --root 'E:\deploy\NoNo'  # 示例：校验另一棵部署树
@@ -223,10 +238,11 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 4. `python scripts/sync_ok.py --reapply`：在隔离树重放品牌与逻辑差异，成功后重建 `ok/`、重写依赖块；
 5. 复用 `.github/scripts/install_dependencies.py` 安装依赖，再运行 `scripts/check_foreground.ps1`：
    同时核对完整框架来源和前台输入、通知、多账号、无音消除、公共恢复及自维护冒烟；
-6. 全绿才 `git push origin HEAD:master`。首次创建指向适配提交的注释标签；重试复用已有标签，
-   不强推或移动历史版本，再用 `gh workflow run build.yml --ref <tag> --repo <本仓库>` 显式派发打包。
+6. 全绿才推送适配提交及本项目的 xmod 注释标签。上游原始标签仅用于来源核验，发布和镜像使用品牌标签；
+   同源重试可复用原标签，新源码采用新的品牌修订，不强推或移动历史版本。随后用
+   `gh workflow run build.yml --ref <本项目标签> --repo <本仓库>` 显式派发打包。
 
-`force` 只强制重跑检查及已有版本发布，不改变已有标签的提交。人工合并后缺少 Release 时，
+`force` 只强制重新检查和规划发布，不允许改变已有标签的提交。人工合并后缺少 Release 时，
 默认运行也会补发，不再要求勾选 `force`。需要发布新代码时应使用尚未发布的新版本标签。
 
 第 6 步的 `--repo` 不是可省的啰嗦：本仓库是 fork，`gh` 在 checkout 里会把"这个仓库"解析成**基仓库**
@@ -239,12 +255,10 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 能不能在新框架下站起来、`kit.*` 的 API 有没有漂移，上游全绿也覆盖不到。红了就不推，等于把
 "合并干净、构建成功、启动 ImportError"挡在发版之前。
 
-标签必须沿用上游版本号本身（`v3.7.17`），不能加 `+xmod` 之类的后缀。约束来自启动器而不是
-`ok/util/version.py`：当前 PyAppify 支持 `v?数字.数字.数字` 及可选 `[-.](alpha|beta|rc)[.数字]`，
-`NoNo.exe -c setup --setup-version v3.7.17+xmod` 会直接报版本标签无效，便携包
-在 setup 这一步就失败；而客户端拉版本列表用同一个正则，带后缀的标签也进不了列表，等于自更新
-永远看不到新版本。因此 fork 首次创建同名标签时指向自己的适配提交，语义是"同一版本号 + 我们的补丁"；
-上游原标签使用独立引用，不能覆盖本仓库已经发布的标签。
+应用版本规则见前文“应用版本使用 xmod 标识”。原版启动器及 Python 更新器不接受这个品牌格式，
+本项目通过受管源码差异同步适配两个更新器、发布分类和完整包接收；不能只在工作流拼接后缀。
+上游原标签仍使用独立引用，不能覆盖本仓库已经发布的标签。内联 Python 更新器保留固定原始来源，
+适配后的完整文件集合也必须通过校验；不修改开发环境依赖或跳过来源检查。
 
 第 6 步的显式派发同样不是可选项：用 `GITHUB_TOKEN` 推的 tag 不会触发 push 类工作流
 （GitHub 禁止 token 递归触发），不派发就会出现"源码合了、包没编译"。
@@ -291,7 +305,7 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 仓库权限仅为 `contents: read`，检出固定到本次 SHA，测试进程不继承 CI 凭据。
 
 `check_foreground.ps1` 默认先运行 `sync_ok.py --check`，再通过既有 `run_test.py` 执行集中输入、桌面通知、
-多账号、无音消除、一次性战斗、资源恢复、角色识别、Lily、绯雪皮肤、深塔和自维护测试。
+多账号、无音消除、一次性战斗、资源恢复、4C 拾取与下一轮重挑战、角色识别、Lily、绯雪皮肤、深塔和自维护测试。
 每个文件使用独立进程。`run_test.py` 的父进程创建临时用户目录，持有到测试进程完全退出；
 在任何框架导入前设置 `NONO_USER_DATA_ROOT`、`OK_DISABLE_FILE_LOG=1`，并明确配置、截图和日志路径。
 不能仅替换 `config_folder`：截图测试会强制开启 debug，旧框架会清空默认截图目录。
@@ -313,7 +327,8 @@ GitHub Actions 的工件下载容器内含上述 ZIP 和校验文件；正式 Re
 `--nono-install-working <manifest> -p China` 调用官方依赖安装后半段，安装当前 requirements，
 严格保存 App 状态；不能再调用可能重新检出或覆盖 working 的 setup。
 裸仓库保留真实正式锚点，当前源码仅部署到 working；原生宿主、内联 PyAppify 和忽略规则有明确生成来源。
-正式标签模式仅执行一次真实带标签 setup，并保留官方 alpha、beta、rc 标签格式；普通快照仍使用稳定锚点。
+正式标签模式仅执行一次真实带标签 setup，接受本项目 xmod 正式／修订及 alpha、beta、rc 预览标签；
+旧合法标签仍可读取，普通快照仍只使用稳定锚点，包括稳定 xmod 版本。
 两种模式都校验 working、框架来源、真实便携 Python 与原生宿主，
 再生成带完整大小和 SHA-256 清单的 incoming 包；版本查询不能替代真实安装。
 `tests/`、`ok_templates/`、未跟踪的账号配置、缓存和运行日志不会成为部署快照。

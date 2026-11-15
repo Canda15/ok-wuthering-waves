@@ -30,21 +30,6 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 手动触发时 GitHub 允许选任意 ref,而版本号取自 github.ref_name:
-      # 选到分支会得到一个叫 master 的“版本”,启动器 setup 会因
-      # `Invalid setup version tag 'master'` 失败,镜像仓库还会多一个同名 tag。
-      # 所以第一件事就把 ref 钉死成发布用的版本 tag,后面所有步骤都能假设
-      # RELEASE_TAG 形如 v3.7.17(与 pyappify 的标签正则一致)。
-      - name: 检查发布标签
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF_TYPE -ne 'tag') {
-            throw "这个工作流必须以 tag 为 ref 运行(当前 $env:GITHUB_REF)。要在 Actions 里手动跑,请把 Branch 下拉切到某个 tag;要合并上游并发布新版本,请手动运行 'Sync upstream release'。"
-          }
-          if ($env:GITHUB_REF_NAME -notmatch '^v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?$') {
-            throw "tag '$env:GITHUB_REF_NAME' 不是 PyAppify 支持的正式或 alpha/beta/rc 标签"
-          }
-
       - name: 配置构建机
         shell: pwsh
         run: |
@@ -69,6 +54,16 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             pyproject.toml
+
+      # 先检出并准备 Python，再由纯标准库的共享合同核对品牌标签。
+      - name: 检查发布标签
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+            throw '发布工作流必须以 xmod 版本 tag 为 ref 运行'
+          }
+          python -m selfhost.versioning "$env:GITHUB_REF_NAME" --new-release
+          if ($LASTEXITCODE -ne 0) { throw '发布标签不是受支持的 xmod 版本' }
 
       - name: 安装依赖
         run: python .github/scripts/install_dependencies.py
@@ -170,7 +165,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $isRelease = $env:RELEASE_TAG -match '^v?\d+\.\d+\.\d+$'
+          $versionJson = python -m selfhost.versioning "$env:RELEASE_TAG" --new-release
+          if ($LASTEXITCODE -ne 0) { throw '发布版本分类失败' }
+          $version = $versionJson | ConvertFrom-Json
+          $isRelease = $version.is_release
           "is_release=$($isRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Release version: $isRelease"
 
@@ -198,7 +196,7 @@ jobs:
           UPDATE_MIRROR: https://github.com/Canda15/nono-update.git
         # 镜像提交与源码提交不同；保存来源供同号补发核对，文件随 selfhost 部署白名单同步。
         run: |
-          python scripts/upstream_release.py record --upstream-tag "$env:RELEASE_TAG" --mirror "$env:UPDATE_MIRROR"
+          python scripts/upstream_release.py record --release-tag "$env:RELEASE_TAG" --mirror "$env:UPDATE_MIRROR"
           if ($LASTEXITCODE -ne 0) { throw '镜像来源核对或记录失败' }
 
       - name: 同步更新镜像

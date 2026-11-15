@@ -71,9 +71,8 @@ jobs:
             $tag = gh api "repos/$env:UPSTREAM_REPO/releases/latest" --jq .tag_name
             if ($LASTEXITCODE -ne 0) { throw '读取上游版本失败' }
           }
-          if ($tag -notmatch '^v?\d+\.\d+\.\d+(?:[-.](?:alpha|beta|rc)(?:\.\d+)?)?$') {
-            throw '上游标签不是支持的版本格式'
-          }
+          python -m selfhost.versioning "$tag" --upstream
+          if ($LASTEXITCODE -ne 0) { throw '上游标签不是支持的官方版本格式' }
           Write-Host "upstream tag: $tag"
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
@@ -90,7 +89,7 @@ jobs:
           $upstreamRef = "refs/upstream-tags/$tag"
           git fetch --no-tags upstream "refs/tags/${tag}:${upstreamRef}"
           if ($LASTEXITCODE -ne 0) { throw '抓取上游标签失败' }
-          # 版本号沿用上游，但同号 Release 还必须由实际包含上游的源码标签和完整附件证明。
+          # 官方来源与品牌发布分开；xmod Release 仍须由源码祖先和完整附件证明。
           $parameters = @('scripts/upstream_release.py', 'check', '--upstream-tag', $tag,
             '--repository', $env:GITHUB_REPOSITORY)
           if ($force -eq 'true') { $parameters += '--force' }
@@ -168,12 +167,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 版本号始终沿用上游；旧标签冲突须人工处理，不能自动改号或派发旧源码。
+          # 基础号沿用已验证上游；同基础的新修复使用 xmod 修订，历史标签不移动。
           $planJson = python scripts/upstream_release.py plan --upstream-tag "${{ steps.resolve.outputs.tag }}" --mirror "$env:UPDATE_MIRROR"
           if ($LASTEXITCODE -ne 0) { throw '核对本仓库同号发布失败' }
           $plan = $planJson | ConvertFrom-Json
           $tag = $plan.release_tag
-          if ($tag -ne "${{ steps.resolve.outputs.tag }}") { throw '发布版本号必须与上游一致' }
+          if ($plan.upstream_tag -ne "${{ steps.resolve.outputs.tag }}") { throw '发布来源必须与已核对的上游一致' }
           $validatedCommit = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $validatedCommit -ne $plan.source_commit) {
             throw '待发布源码与已核对的验证提交不一致'

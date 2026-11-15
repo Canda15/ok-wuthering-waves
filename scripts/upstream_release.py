@@ -1,4 +1,4 @@
-"""按实际提交核对上游同号发布，拒绝复用旧源码或来源不明的镜像标签。"""
+"""分别核对官方来源和 xmod 发布，拒绝复用旧源码或来源不明的镜像标签。"""
 
 import argparse
 import json
@@ -12,16 +12,18 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-TAG_PATTERN = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:[-.](alpha|beta|rc)(?:\.(\d+))?)?$')
+# 直接执行 scripts/ 下文件时也使用仓库内的同一纯版本合同。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from selfhost.versioning import (branded_tag, is_release_version, next_revision, parse_version_tag,
+                                require_version_tag, same_release_family, sort_version_tags)
+
 REQUIRED_ASSETS = {'NoNo-win32-portable.zip', 'NoNo-win32-sha256.txt'}
 SOURCE_RECORD = 'selfhost/build-source.json'
+UPSTREAM_URL = 'https://github.com/ok-oldking/ok-wuthering-waves.git'
 
 
 def validate_tag(tag):
-    match = TAG_PATTERN.fullmatch(tag) if isinstance(tag, str) else None
-    if not match:
-        raise ValueError('上游标签不是支持的版本格式')
-    return match
+    return require_version_tag(tag, branded=False)
 
 
 def git(root, *arguments, accepted=(0,)):
@@ -39,6 +41,44 @@ def git(root, *arguments, accepted=(0,)):
 def is_ancestor(root, ancestor, descendant):
     return git(root, 'merge-base', '--is-ancestor', ancestor, descendant,
                accepted=(0, 1)).returncode == 0
+
+
+def find_integrated_upstream(root, base_release=None):
+    """只从官方实际提交中选 HEAD 已包含的基础号，不相信本地缓存的标签名称。"""
+    if git(root, 'rev-parse', '--is-shallow-repository').stdout.strip() != 'false':
+        raise RuntimeError('版本来源检查需要完整 Git 历史，请先取消浅克隆')
+    configured = git(root, 'remote', 'get-url', 'upstream', accepted=(0, 2, 128))
+    remote = configured.stdout.strip() if configured.returncode == 0 else UPSTREAM_URL
+    lines = git(root, 'ls-remote', '--tags', remote, 'refs/tags/v*').stdout.splitlines()
+    direct, peeled = {}, {}
+    for line in lines:
+        oid, ref = line.split('\t', 1)
+        name = ref.removeprefix('refs/tags/')
+        target = peeled if name.endswith('^{}') else direct
+        target[name.removesuffix('^{}')] = oid
+    tags = {**direct, **peeled}
+    for tag in sort_version_tags(tags):
+        version = parse_version_tag(tag)
+        if version.branded or (base_release is not None and version.release != base_release):
+            continue
+        commit = git(root, 'rev-parse', '--verify', '--quiet', f'{tags[tag]}^{{commit}}', accepted=(0, 1, 128))
+        if commit.returncode == 0 and is_ancestor(root, commit.stdout.strip(), 'HEAD'):
+            return {'upstream_tag': tag, 'upstream_commit': commit.stdout.strip()}
+    raise RuntimeError('没有找到 HEAD 实际包含的官方基础版本，拒绝猜测或递增上游版本号')
+
+
+def _family_sources(root, upstream_tag, upstream, head):
+    refs = {tag: oid for tag, oid in remote_tags(root, 'origin', '*').items()
+            if same_release_family(tag, upstream_tag)}
+    commits = {}
+    for tag in refs:
+        commit = source_tag_commit(root, tag, refs)
+        if not is_ancestor(root, upstream, commit):
+            raise RuntimeError(f'源码已有的 {tag} 不包含目标上游提交，请先处理来源冲突')
+        if not is_ancestor(root, commit, head):
+            raise RuntimeError(f'源码标签 {tag} 不在当前 HEAD 历史中，请先同步并核对源码')
+        commits[tag] = commit
+    return refs, commits
 
 
 def remote_tags(root, remote, tag):
@@ -95,22 +135,17 @@ def release_complete(release):
 
 
 def check_release(root, upstream_tag, repository, force=False):
-    requested = validate_tag(upstream_tag)
+    validate_tag(upstream_tag)
     upstream = git(root, 'rev-parse', f'refs/upstream-tags/{upstream_tag}^{{commit}}').stdout.strip()
     head = git(root, 'rev-parse', 'HEAD').stdout.strip()
-    refs = remote_tags(root, 'origin', upstream_tag)
-    commit = source_tag_commit(root, upstream_tag, refs)
-    if commit:
-        if not is_ancestor(root, upstream, commit):
-            raise RuntimeError(f'源码已有的 {upstream_tag} 不包含目标上游提交，请先处理同号版本冲突')
-        if not is_ancestor(root, commit, head):
-            raise RuntimeError(f'源码标签 {upstream_tag} 不在当前 HEAD 历史中，请先同步并核对源码')
+    refs, commits = _family_sources(root, upstream_tag, upstream, head)
     if not is_ancestor(root, upstream, head) or force:
         return {'needed': True}
-    release = get_release(repository, upstream_tag)
-    if (commit and release_complete(release)
-            and (requested.group(4) or release.get('prerelease') is False)):
-        return {'needed': False, 'covered_tag': upstream_tag}
+    tag = sort_version_tags(refs)[0] if refs else branded_tag(upstream_tag)
+    release = get_release(repository, tag)
+    if (commits.get(tag) and release_complete(release)
+            and (not is_release_version(tag) or release.get('prerelease') is False)):
+        return {'needed': False, 'covered_tag': tag}
     return {'needed': True}
 
 
@@ -119,11 +154,16 @@ def source_record(tag, commit):
 
 
 def record_source(root, tag, mirror):
-    validate_tag(tag)
+    version = require_version_tag(tag)
     head = git(root, 'rev-parse', 'HEAD').stdout.strip()
     tagged = git(root, 'rev-parse', f'refs/tags/{tag}^{{commit}}').stdout.strip()
     if tagged != head:
         raise RuntimeError('构建来源记录必须对应当前检出的发布标签提交')
+    if version.branded:
+        # 手动创建品牌标签也不能把尚未集成的基础号写成发布版本。
+        integrated = find_integrated_upstream(root, base_release=version.release)
+        if version.channel is None and not is_release_version(integrated['upstream_tag']):
+            raise RuntimeError('不能把仅集成的官方预览基础自动标记成正式发布')
     # 手动派发 build.yml 也可能绕过自动同步，写镜像前仍须拒绝同号旧源码。
     verify_mirror_source(root, mirror, tag, head)
     record = source_record(tag, head)
@@ -164,28 +204,34 @@ def plan_release(root, upstream_tag, mirror):
     upstream = git(root, 'rev-parse', f'refs/upstream-tags/{upstream_tag}^{{commit}}').stdout.strip()
     if not is_ancestor(root, upstream, head):
         raise RuntimeError('待发布提交尚未包含目标上游，拒绝发布')
-    refs = remote_tags(root, 'origin', upstream_tag)
-    source_tag_commit(root, upstream_tag, refs)
-    local = git(root, 'rev-parse', '--verify', '--quiet', f'refs/tags/{upstream_tag}', accepted=(0, 1))
-    if local.returncode == 0:
-        tagged = git(root, 'rev-parse', f'refs/tags/{upstream_tag}^{{commit}}').stdout.strip()
-        if tagged != head:
-            raise RuntimeError(f'已有 {upstream_tag} 没有指向本次验证 HEAD，拒绝构建旧源码或移动历史标签')
-    verify_mirror_source(root, mirror, upstream_tag, head)
-    return {'release_tag': upstream_tag, 'source_commit': head, 'upstream_commit': upstream,
-            'reuse': local.returncode == 0}
+    _, commits = _family_sources(root, upstream_tag, upstream, head)
+    for tag in git(root, 'tag', '--list').stdout.splitlines():
+        if not same_release_family(tag, upstream_tag):
+            continue
+        tagged = git(root, 'rev-parse', f'refs/tags/{tag}^{{commit}}').stdout.strip()
+        if not is_ancestor(root, upstream, tagged) or not is_ancestor(root, tagged, head):
+            raise RuntimeError(f'已有 {tag} 的来源不在本次验证历史中，拒绝移动历史标签')
+        commits[tag] = tagged
+    same_head = [tag for tag, commit in commits.items() if commit == head]
+    tag = sort_version_tags(same_head)[0] if same_head else next_revision(upstream_tag, commits)
+    verify_mirror_source(root, mirror, tag, head)
+    return {'release_tag': tag, 'source_commit': head, 'upstream_tag': upstream_tag,
+            'upstream_commit': upstream, 'reuse': bool(same_head)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('check', 'plan', 'record'))
-    parser.add_argument('--upstream-tag', required=True)
+    parser.add_argument('mode', choices=('check', 'plan', 'record', 'base'))
+    parser.add_argument('--upstream-tag')
+    parser.add_argument('--release-tag')
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', ''))
     parser.add_argument('--mirror', default='')
     parser.add_argument('--force', action='store_true')
     arguments = parser.parse_args()
     try:
-        if arguments.mode == 'check':
+        if arguments.mode == 'base':
+            result = find_integrated_upstream(Path.cwd())
+        elif arguments.mode == 'check':
             result = check_release(Path.cwd(), arguments.upstream_tag, arguments.repository, arguments.force)
         elif arguments.mode == 'plan':
             if not arguments.mirror:
@@ -194,7 +240,7 @@ def main():
         else:
             if not arguments.mirror:
                 raise ValueError('记录发布来源需要指定更新镜像')
-            result = record_source(Path.cwd(), arguments.upstream_tag, arguments.mirror)
+            result = record_source(Path.cwd(), arguments.release_tag or arguments.upstream_tag, arguments.mirror)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:

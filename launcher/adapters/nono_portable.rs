@@ -182,8 +182,7 @@ pub(crate) fn read_manifest(path: &Path) -> Result<BundleManifest> {
     ensure!(
         crate::git::is_version_tag(&manifest.base_update_version)
             && (manifest.build_kind == "release_tag"
-                || regex::Regex::new(r"^v?\d+\.\d+\.\d+$")?
-                    .is_match(&manifest.base_update_version)),
+                || crate::git::is_release_version(&manifest.base_update_version)),
         "更新锚点与构建模式不匹配（E_BUNDLE_VERSION）"
     );
     ensure!(
@@ -1889,7 +1888,15 @@ mod tests {
     fn manifest_keeps_release_anchor_and_payload_boundaries() {
         let fixture = fixture(false);
         let path = fixture.root.join("manifest-test.json");
-        for version in ["v3.8.1-alpha.1", "v3.8.1-beta.1", "3.8.1.rc", "v3.8.1"] {
+        for version in [
+            "v3.8.1-alpha.1",
+            "v3.8.1-beta.1",
+            "3.8.1.rc",
+            "v3.8.1",
+            "v3.8.1-xmod",
+            "v3.8.1-xmod.10",
+            "v3.8.1-beta.1-xmod",
+        ] {
             let mut manifest = fixture.manifest.clone();
             manifest.build_kind = "release_tag".to_string();
             manifest.base_update_version = version.to_string();
