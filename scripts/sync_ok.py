@@ -240,10 +240,9 @@ def reapply_upstream_overwrites() -> list[str]:
     """把上游版本里被我们删掉的那几行重新删掉。
 
     上游每次 bump 框架版本都会改 pyproject.toml 的 `ok-script[ocr,qt]==x` 与
-    requirements.txt 的同名 pin。这两个文件在我们这里是被删掉那几行的状态,
-    git 因此判定 "deleted by us / modified by them" 并停下——这是自动合并里
-    唯一会周期性出现的冲突。既然我们对这两个文件的改动完全可脚本复现
-    (删 pin、加生成块),冲突就能自动解开:先取上游版本,再跑这个函数。
+    requirements.txt 的同名 pin。同步器先按受管声明规范化三方内容再合并，
+    保留本地开发依赖与上游其它更新；不能整文件取上游后指望本函数恢复自有配置。
+    本函数只移除框架声明并补齐生成块，官方框架版本由合并步骤显式传入。
     """
     dropped: list[str] = []
 

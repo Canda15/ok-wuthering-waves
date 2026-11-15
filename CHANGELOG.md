@@ -2,6 +2,14 @@
 
 Release history starts at v3.0.0.
 
+## v3.8.3 (2026-11-15)
+
+- Added Pynput as a selectable input method; PostMessage remains the default.
+
+## v3.8.2 (2026-11-15)
+
+- Updated text recognition to PP-OCRv6 small.
+
 ## v3.8.1 (2026-11-14)
 
 - Fixed tasks started from the command line (`-t`/`-e`) not running after the game launches.

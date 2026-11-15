@@ -15,10 +15,10 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | `ok-script` 3.0.5b8（适配上游应用 v3.8.1） |
+| 版本 | `ok-script` 3.0.5b9（适配上游应用 v3.8.3） |
 | 权威来源 | `selfhost/ok_pin.json`（版本、原始 wheel、完整补丁后树与逻辑差异集合的 SHA-256，由 `scripts/sync_ok.py` 维护） |
-| 来源 | PyPI wheel `ok_script-3.0.5b8-py3-none-any.whl` |
-| 原始 wheel SHA-256 | `81bcecf0078378a0b6138a4487e53e2db0bc0ba58243ec26381093c8a198cf1e` |
+| 来源 | PyPI wheel `ok_script-3.0.5b9-py3-none-any.whl` |
+| 原始 wheel SHA-256 | `f121e95962aba973998ac5edeaf459aac1aca83edf228c205c3965903b7c24a1` |
 | 内联范围 | 固定 wheel 的 `ok/`；逻辑差异后的实际数量由 `--check` 给出 |
 | 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info 不作为框架源码入库；生成依赖和内联版本依据原始 wheel、pin 及严格来源清单，不能回退到另一份已安装的 ok-script |
 
@@ -76,11 +76,9 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 上游跟踪的路径（`config.py`、`src/`、`pyproject.toml`、`pyappify.yml` …）尽量保持与上游一致，
 **我们的配置覆盖和框架差异来源放进 `selfhost/`**；框架实现仍在 `ok/`，由差异清单持久保存其改动。
-前台输入默认值、游戏／登录任务的恢复与旧任务撤出同时需要维护应用源码；这些正常源码差异参与上游合并，
-发生冲突时按现有同步规则停止并人工审查。
-理由：上游的 git 树里没有 `selfhost/`，所以
-`git merge upstream/<tag>` 不会在这里产生任何冲突；反之，往 `config.py` 里插三行，
-上游每改一次该文件我们就要手工解一次冲突。
+前台输入默认值、游戏／登录任务的恢复与旧任务撤出同时需要维护应用源码，这些差异参与上游合并。
+同步器仅对已知的 `windows.interaction` 字面量和框架依赖声明应用本项目规则，再交给 Git 三方合并；
+其它配置与依赖继续参与正常合并，未知冲突停止并人工审查。不能为了解决一个输入字段的冲突而覆盖整份配置。
 
 `selfhost/` 的自有配置与源码如下：
 
@@ -168,7 +166,7 @@ v1.2.7 根启动器与原生业务宿主；快捷方式默认关闭，已有明�
 
 ```powershell
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py'            # 优先取上游 pyproject 版本，没有声明才用 pin
-& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b8   # 明确固定已经审查的版本
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b9   # 明确固定已经审查的版本
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --dry-run  # 下载并验证重放，只报告差异
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check    # 离线校验框架、基线及差异来源
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check --root 'E:\deploy\NoNo'  # 示例：校验另一棵部署树
@@ -177,8 +175,9 @@ v1.2.7 根启动器与原生业务宿主；快捷方式默认关闭，已有明�
 **版本以对方声明为准，不是以 pin 为准。** 上游每次发版都会在 `pyproject.toml` 里写
 `ok-script[ocr,qt]==x.y.z`，那一行就是"这次的应用代码是按哪个框架写的"。合并之后如果继续按 pin
 内联旧框架，就会出现 src/ 比 ok/ 新：冒烟测试只覆盖我们自己的页面，这种漂移它测不出来，只会在
-某个功能被调用时炸。所以 `sync_ok.py` 先读出那一行再动手删它（顺序很重要：`--reapply` 一执行，
-版本依据就没了），`--version` 只在需要固定到某个版本时用。
+某个功能被调用时出错。自动同步在合并前从官方引用读取框架版本，合并后始终显式传给
+`sync_ok.py --reapply --version <官方框架版本>`，包括上游已经合入的重跑。手工运行 `sync_ok.py`
+仍会先读取当前文件里的框架声明，再移除它；声明已被移除时，应显式指定已审查版本。
 
 新版本还必须匹配逻辑清单的支持版本与精确基线；不匹配时在覆盖源码或执行 `--reapply` 前中止，
 等待人工审查和重新收集，不能只改清单里的版本号。即使当前清单为空，也保留完整基线约束。
@@ -232,10 +231,11 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 
 1. 检出前固定 Git 为 LF，防止 Windows 将严格校验的补丁头和载荷改成 CRLF；
 2. 上游标签保存在独立 `refs/upstream-tags/<tag>`。仅当其已合并、正式 Release 和完整 ZIP／校验附件均存在时跳过；缺发布或缺附件则继续，查询失败明确停止。需要合并时使用该独立引用；
-3. 冲突只允许出现在 `pyproject.toml` / `requirements.txt`——我们删过那里的 ok-script pin，上游每次
-   bump 版本都会改那两行，属于必然冲突且完全可脚本复现：取上游版本后由 `sync_ok.py --reapply` 重新删掉。
-   其他文件冲突一律失败退出，交给人；
-4. `python scripts/sync_ok.py --reapply`：在隔离树重放品牌与逻辑差异，成功后重建 `ok/`、重写依赖块；
+3. `scripts/merge_upstream.py` 先保存官方框架版本，再执行合并。仅对 `config.py` 的已知输入方式、
+   `pyproject.toml` / `requirements.txt` 的受管框架声明规范化三方内容并重新合并，保留本地开发依赖、
+   生成块和上游其它更新。任何未知冲突都失败退出，不能用上游整份文件覆盖本地；
+4. `python scripts/sync_ok.py --reapply --version <官方框架版本>`：在隔离树重放品牌与逻辑差异，
+   成功后重建 `ok/`、重写依赖块。新框架必须已经过人工审查并登记兼容基线；
 5. 复用 `.github/scripts/install_dependencies.py` 安装依赖，再运行 `scripts/check_foreground.ps1`：
    同时核对完整框架来源和前台输入、通知、多账号、无音消除、公共恢复及自维护冒烟；
 6. 全绿才推送适配提交及本项目的 xmod 注释标签。上游原始标签仅用于来源核验，发布和镜像使用品牌标签；

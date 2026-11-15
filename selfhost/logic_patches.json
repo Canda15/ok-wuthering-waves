@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "framework_version": "3.0.5b8",
-  "baseline_tree_sha256": "0d6dd964a7ed456940952518fc62dfa4e9ed5db230aef4544eef9b5d5bbdc846",
+  "framework_version": "3.0.5b9",
+  "baseline_tree_sha256": "d9166ed15ee5cec922afa125c2036328a88324036070f32217b7aa6abda27a69",
   "entries": [
     {
       "path": "__init__.py",

@@ -106,47 +106,47 @@ jobs:
           exit 0
 
       - name: Merge upstream
+        id: merge
         if: steps.check.outputs.needed == 'true'
         shell: pwsh
         run: |
           $tag = "${{ steps.resolve.outputs.tag }}"
           git config user.name 'github-actions[bot]'
+          if ($LASTEXITCODE -ne 0) { throw '设置同步提交用户名失败' }
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ($LASTEXITCODE -ne 0) { throw '设置同步提交邮箱失败' }
 
-          git merge --no-ff --no-edit "refs/upstream-tags/$tag"
-          if ($LASTEXITCODE -eq 0) { exit 0 }
-
-          # 我们删掉过 pyproject.toml / requirements.txt 里的 ok-script pin,上游每次
-          # bump 版本都会改这两行,因此必然出现 "deleted by us"。这两处改动完全可
-          # 脚本复现,取上游版本后交给 --reapply 重新删,不必叫人。
-          $conflicts = git diff --name-only --diff-filter=U
-          $auto = @('pyproject.toml', 'requirements.txt')
-          $manual = $conflicts | Where-Object { $auto -notcontains $_ }
-          if ($manual) {
-            Write-Host "需要人工合并:$($manual -join ', ')"
-            exit 1
-          }
-          foreach ($file in $conflicts) { git checkout --theirs -- $file }
-          git add -- $conflicts
-          git commit --no-edit
+          # 只规范受管输入字段和框架 pin，再做三方合并；保留本地开发依赖和上游其余更新。
+          $mergeJson = python scripts/merge_upstream.py --upstream-tag "$tag"
+          if ($LASTEXITCODE -ne 0) { throw '上游合并失败，未推送源码或发布标签' }
+          $result = $mergeJson | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($result.framework_version)) { throw '缺少官方声明的框架版本' }
+          "framework_version=$($result.framework_version)" >> $env:GITHUB_OUTPUT
 
       - name: Re-vendor ok-script
         if: steps.check.outputs.needed == 'true'
         shell: pwsh
+        env:
+          FRAMEWORK_VERSION: ${{ steps.merge.outputs.framework_version }}
         run: |
           # 先在隔离树重放品牌与逻辑差异；验证成功后才移除依赖 pin 并整体替换。
           # 这一步只用标准库，先做重放再安装依赖，避免重新装入上游 ok-script。
-          python scripts/sync_ok.py --reapply
+          # 合并时已经移除了 pin，显式传入从官方对象读取的版本，禁止回落到旧框架。
+          python scripts/sync_ok.py --reapply --version "$env:FRAMEWORK_VERSION"
           # 必须显式判负:脚本崩了但后面的 git 命令成功时,pwsh 步骤仍会判绿,
           # 结果是"合并干净、ok/ 没更新、测试全绿"——最坏的一种假成功。
           if ($LASTEXITCODE -ne 0) { throw 'sync_ok.py 执行失败' }
           git add -A
+          if ($LASTEXITCODE -ne 0) { throw '暂存框架同步结果失败' }
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
             Write-Host '框架源码无变化'
-          } else {
+          } elseif ($LASTEXITCODE -eq 1) {
             $version = (Get-Content selfhost/ok_pin.json -Raw | ConvertFrom-Json).version
             git commit -m "other: 同步内联框架 $version"
+            if ($LASTEXITCODE -ne 0) { throw '提交框架同步结果失败' }
+          } else {
+            throw '检查框架同步差异失败'
           }
 
       - name: 安装现有依赖

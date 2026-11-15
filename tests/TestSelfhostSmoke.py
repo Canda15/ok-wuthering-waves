@@ -183,10 +183,10 @@ class TestSelfhostSmoke(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'PYAPPIFY_VERSIONS_BASELINE_MISMATCH'):
                 inliner.verify_inlined_pyappify(destination)
 
-    def make_upstream_release_fixture(self):
+    def make_upstream_release_fixture(self, directory_name='upstream-release'):
         from selfhost.portable import process_environment
 
-        root = Path(self.temp_dir.name).resolve() / 'upstream-release'
+        root = Path(self.temp_dir.name).resolve() / directory_name
         root.mkdir()
         checkout, remote, mirror = root / 'checkout', root / 'remote.git', root / 'mirror.git'
         checkout.mkdir()
@@ -233,6 +233,184 @@ class TestSelfhostSmoke(unittest.TestCase):
                                upstream_remote=upstream_remote,
                                environment=environment, git=git, commit=commit, base=base,
                                upstream=upstream, head=head)
+
+    def make_upstream_merge_fixture(self, variant='normal'):
+        fixture = self.make_upstream_release_fixture(f'upstream-merge-{variant}')
+        base_config = (
+            "config = {\n"
+            "    'gui_title': '官方标题',\n"
+            "    'version': 'v3.8.1',\n"
+            "    'debug': False,\n"
+            "    'windows': {'标题': '中文偏移', 'interaction': 'PostMessage'},\n"
+            "    'screen_ratio': 1,\n"
+            "    'keep_setting': '保留',\n"
+            "    'trigger_tasks': [\n"
+            "        ['src.task.MouseResetTask', 'MouseResetTask'],\n"
+            "        ['src.task.KeepTask', 'KeepTask'],\n"
+            "    ],\n"
+            "    'update_only_game_exit': True,\n"
+            "}\n"
+        )
+        web_extra = 'web-test = [\n    "ok-script[web]==3.0.5b8",\n]\n'
+        base_project = (
+            '[project]\nname = "merge-fixture"\ndependencies = [\n'
+            '    "mcp==2.3.0",\n'
+            '    "ok-script[ocr,qt]==3.0.5b8",\n'
+            '    "onnxocr-ppocrv5>=0.0.23",\n'
+            '    "pyappify>=1.0.20",\n]\n\n'
+            '[project.optional-dependencies]\ndev = [\n    "pytest",\n    "polib",\n]\n'
+            + web_extra + 'docs = ["mkdocs"]\n'
+        )
+        framework_requirement = 'ok-script==3.0.5b8\n    # via\n    #   ok-ww (pyproject.toml)\n'
+        base_requirements = (
+            'mcp==2.3.0\n    # via ok-ww\n' + framework_requirement
+            + 'onnxocr-ppocrv5==0.0.23\n    # via\n    #   ok-script\n    #   ok-ww (pyproject.toml)\n'
+            'pyappify==1.0.20\n    # via ok-ww\n'
+        )
+        base_files = {'config.py': base_config, 'pyproject.toml': base_project,
+                      'requirements.txt': base_requirements, 'notes.txt': '共同说明\n'}
+
+        def save(files, message):
+            for name, content in files.items():
+                (fixture.checkout / name).write_text(content, encoding='utf-8', newline='')
+            fixture.git('add', '-A')
+            fixture.git('commit', '-m', message)
+            return fixture.git('rev-parse', 'HEAD')
+
+        shutil.copy2(Path(__file__).resolve().parents[1] / 'scripts/merge_upstream.py', fixture.checkout / 'scripts')
+        save(base_files, '官方合并共同基线')
+        fixture.git('checkout', '-b', 'upstream-v383')
+        theirs = {name: content.replace('3.0.5b8', '3.0.5b9').replace('ppocrv5', 'ppocrv6')
+                  .replace('0.0.23', '0.0.1') for name, content in base_files.items()}
+        theirs['config.py'] = base_config.replace("'PostMessage'", "['PostMessage', 'Pynput']")
+        theirs['config.py'] = theirs['config.py'].replace('官方标题', '上游新标题')
+        if variant == 'interaction':
+            theirs['config.py'] = theirs['config.py'].replace("'Pynput'", "'未知新方式'")
+        if variant == 'other_file':
+            theirs['notes.txt'] = '上游说明\n'
+        if variant == 'web_extra':
+            theirs['pyproject.toml'] = theirs['pyproject.toml'].replace(
+                '"ok-script[web]==3.0.5b9",', '"ok-script[web]==3.0.5b9",\n    "new-web-runtime",')
+        fixture.upstream_v383 = save(theirs, '官方框架和输入选项升级')
+        fixture.git('update-ref', 'refs/upstream-tags/v3.8.3', fixture.upstream_v383)
+        fixture.git('checkout', 'master')
+        ours = dict(base_files)
+        ours['config.py'] = base_config.replace("'PostMessage'", "'nono'")
+        ours['config.py'] = ours['config.py'].replace("        ['src.task.MouseResetTask', 'MouseResetTask'],\n", '')
+        ours['config.py'] = ours['config.py'].replace("    'update_only_game_exit': True,\n", '')
+        if variant == 'config_field':
+            ours['config.py'] = ours['config.py'].replace('官方标题', '本地修改的标题')
+        if variant == 'other_file':
+            ours['notes.txt'] = '本地说明\n'
+        ours['pyproject.toml'] = base_project.replace('    "ok-script[ocr,qt]==3.0.5b8",\n', '').replace(web_extra, '')
+        ours['pyproject.toml'] = ours['pyproject.toml'].replace('    "polib",\n', '    "polib",\n    "PyYAML==6.0.3",\n')
+        ours['pyproject.toml'] = ours['pyproject.toml'].replace(
+            '    "pyappify>=1.0.20",\n',
+            '    "pyappify>=1.0.20",\n'
+            '    # >>> generated: vendored ok-script dependencies (scripts/sync_ok.py)\n'
+            '    "pywin32!=312,>=306",\n'
+            '    # <<< generated: vendored ok-script dependencies\n')
+        ours['requirements.txt'] = base_requirements.replace(framework_requirement, '')
+        fixture.head = save(ours, '本地前台输入与内联依赖')
+        return fixture
+
+    def test_upstream_merge_preserves_policies_dependencies_and_official_framework_version(self):
+        import tomllib
+        merger = load_sync_script('merge_upstream.py')
+        fixture = self.make_upstream_merge_fixture()
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            result = merger.run_merge(fixture.checkout, 'v3.8.3')
+        self.assertEqual(result['resolved'], ['config.py', 'pyproject.toml', 'requirements.txt'])
+        self.assertEqual(result['framework_version'], '3.0.5b9')
+        config = ast.literal_eval(ast.parse((fixture.checkout / 'config.py').read_bytes()).body[0].value)
+        self.assertEqual(config['windows'], {'标题': '中文偏移', 'interaction': 'nono'})
+        self.assertEqual(config['gui_title'], '上游新标题')
+        self.assertEqual(config['trigger_tasks'], [['src.task.KeepTask', 'KeepTask']])
+        self.assertNotIn('update_only_game_exit', config)
+        text = (fixture.checkout / 'pyproject.toml').read_text(encoding='utf-8')
+        project = tomllib.loads(text)['project']
+        self.assertIn('PyYAML==6.0.3', project['optional-dependencies']['dev'])
+        self.assertIn('onnxocr-ppocrv6>=0.0.1', project['dependencies'])
+        self.assertIn('pywin32!=312,>=306', project['dependencies'])
+        self.assertNotIn('web-test', project['optional-dependencies'])
+        self.assertFalse(any(spec.startswith('ok-script') for spec in project['dependencies']))
+        self.assertIn('generated: vendored ok-script dependencies', text)
+        requirements = (fixture.checkout / 'requirements.txt').read_text(encoding='utf-8')
+        self.assertIn('onnxocr-ppocrv6==0.0.1', requirements)
+        self.assertNotRegex(requirements, r'(?m)^ok-script')
+        parents = fixture.git('rev-list', '--parents', '-n', '1', 'HEAD').split()
+        self.assertEqual(parents[1:], [fixture.head, fixture.upstream_v383])
+        self.assertEqual(fixture.git('status', '--porcelain'), '')
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            repeated = merger.run_merge(fixture.checkout, 'v3.8.3')
+        self.assertFalse(repeated['merged'])
+        self.assertEqual(repeated['framework_version'], '3.0.5b9')
+        self.assertEqual(fixture.git('rev-parse', 'HEAD'), parents[0])
+
+    def test_upstream_merge_rejects_unknown_conflicts_without_partially_resolving_files(self):
+        merger = load_sync_script('merge_upstream.py')
+        for variant, message in (('interaction', '未知值'), ('config_field', '非受管字段'),
+                                 ('other_file', '需要人工合并')):
+            with self.subTest(variant=variant):
+                fixture = self.make_upstream_merge_fixture(variant)
+                merge = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', 'refs/upstream-tags/v3.8.3'],
+                                       cwd=fixture.checkout, env=fixture.environment, capture_output=True, timeout=30)
+                self.assertEqual(merge.returncode, 1)
+                names = fixture.git('diff', '--name-only', '--diff-filter=U').splitlines()
+                before = {name: (fixture.checkout / name).read_bytes() for name in names}
+                index = fixture.git('ls-files', '--unmerged')
+                with patch.dict(os.environ, fixture.environment, clear=True):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        merger.resolve_conflicts(fixture.checkout)
+                self.assertEqual(fixture.git('ls-files', '--unmerged'), index)
+                self.assertEqual({name: (fixture.checkout / name).read_bytes() for name in names}, before)
+                self.assertEqual(fixture.git('rev-parse', 'HEAD'), fixture.head)
+
+    def test_upstream_merge_rejects_new_web_dependencies_before_mutating_the_checkout(self):
+        merger = load_sync_script('merge_upstream.py')
+        fixture = self.make_upstream_merge_fixture('web_extra')
+        with patch.dict(os.environ, fixture.environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'web-test 已包含未受管依赖'):
+                merger.run_merge(fixture.checkout, 'v3.8.3')
+        self.assertEqual(fixture.git('rev-parse', 'HEAD'), fixture.head)
+        self.assertEqual(fixture.git('status', '--porcelain'), '')
+
+    def test_upstream_workflow_passes_the_official_framework_version_after_merge(self):
+        import yaml
+        fixture = self.make_upstream_merge_fixture()
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = yaml.safe_load((repo_root / '.github/workflows/sync-upstream.yml').read_text(encoding='utf-8'))
+        steps = workflow['jobs']['sync']['steps']
+        merge_step = next(step for step in steps if step.get('name') == 'Merge upstream')
+        vendor_step = next(step for step in steps if step.get('name') == 'Re-vendor ok-script')
+        self.assertEqual(merge_step['id'], 'merge')
+        self.assertEqual(vendor_step['env']['FRAMEWORK_VERSION'], '${{ steps.merge.outputs.framework_version }}')
+        output = fixture.root / 'step-output.txt'
+        script = fixture.root / 'merge-step.ps1'
+        python_path = sys.executable.replace("'", "''")
+        bootstrap = "$ErrorActionPreference = 'Stop'\nfunction python { & '" + python_path + "' @args }\n"
+        script.write_text(bootstrap + merge_step['run'].replace('${{ steps.resolve.outputs.tag }}', 'v3.8.3'),
+                          encoding='utf-8')
+        environment = {**fixture.environment, 'GITHUB_OUTPUT': str(output)}
+        result = subprocess.run(['pwsh', '-NoProfile', '-File', str(script)], cwd=fixture.checkout,
+                                env=environment, capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(output.read_text(encoding='utf-8').strip(), 'framework_version=3.0.5b9')
+        arguments = fixture.root / 'vendor-arguments.json'
+        stub = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "function python {\n"
+            "  ConvertTo-Json -Compress -InputObject @($args) | Set-Content -LiteralPath $env:VENDOR_ARGUMENTS\n"
+            "  $global:LASTEXITCODE = 0\n"
+            "}\n"
+        )
+        script.write_text(stub + vendor_step['run'], encoding='utf-8')
+        environment.update({'FRAMEWORK_VERSION': '3.0.5b9', 'VENDOR_ARGUMENTS': str(arguments)})
+        result = subprocess.run(['pwsh', '-NoProfile', '-File', str(script)], cwd=fixture.checkout,
+                                env=environment, capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(arguments.read_text(encoding='utf-8-sig')),
+                         ['scripts/sync_ok.py', '--reapply', '--version', '3.0.5b9'])
 
     def set_mirror_release_record(self, fixture, content):
         # 镜像必须有独立提交历史；用源码仓库自己的 tag 充当镜像会掩盖跨仓库身份错误。
