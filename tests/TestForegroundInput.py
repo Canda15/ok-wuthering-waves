@@ -1,14 +1,17 @@
 """前台输入状态机与跨层生命周期；全部原生输入及用户配置均使用替身。"""
 
 import ctypes
+import gc
 import importlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import weakref
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -17,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import run_test as test_runner
 from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
 
@@ -1867,16 +1871,192 @@ class TestMcpForegroundPreparation(InputFixture):
 
 
 class TestRunnerIsolation(unittest.TestCase):
+    @staticmethod
+    def cleanup_error(code):
+        error = OSError('预期的临时目录清理错误')
+        error.winerror = code
+        return error
+
+    def test_临时目录仅重试Windows短暂非空错误(self):
+        directory_type = tempfile.TemporaryDirectory
+        original_rmtree = directory_type._rmtree
+        cases = (
+            ('win32', 145, False, 2),
+            ('win32', 145, True, 5),
+            ('win32', 5, True, 1),
+            ('linux', 145, True, 1),
+        )
+        for platform, error_code, persistent, attempts in cases:
+            with self.subTest(platform=platform, error=error_code, persistent=persistent):
+                temporary = directory_type(prefix='NoNo-清理重试-')
+                root = Path(temporary.name)
+                (root / '记录.txt').write_text('待清理', encoding='utf-8')
+                calls = []
+                error = self.cleanup_error(error_code)
+
+                def remove_tree(name, **kwargs):
+                    calls.append(name)
+                    if persistent or len(calls) == 1:
+                        raise error
+                    original_rmtree(name, **kwargs)
+
+                try:
+                    with patch.object(directory_type, '_rmtree', side_effect=remove_tree), \
+                            patch('sys.platform', platform), patch('time.sleep') as sleep:
+                        if persistent:
+                            with self.assertRaises(OSError) as raised:
+                                temporary.cleanup()
+                            self.assertIs(raised.exception, error)
+                            self.assertTrue(root.exists())
+                        else:
+                            temporary.cleanup()
+                            self.assertFalse(root.exists())
+                        self.assertEqual(len(calls), attempts)
+                        self.assertEqual(sleep.call_count, attempts - 1)
+                        for call in sleep.call_args_list:
+                            self.assertEqual(call.args, (0.1,))
+                finally:
+                    temporary.cleanup()
+
+    def test_重试前重新核验目录且拒绝后垃圾回收不误删(self):
+        with tempfile.TemporaryDirectory(prefix='NoNo-目录身份-') as parent:
+            temporary = test_runner._TestTemporaryDirectory(dir=parent)
+            root = Path(temporary.name)
+            saved = Path(parent) / '原目录'
+            replacement = root / '保留.txt'
+            reference = weakref.ref(temporary)
+            finalizer = temporary._finalizer
+
+            def replace_directory(_seconds):
+                root.rename(saved)
+                root.mkdir()
+                replacement.write_text('其它目录的数据', encoding='utf-8')
+
+            with patch.object(type(temporary), '_rmtree', side_effect=self.cleanup_error(145)) as remove, \
+                    patch('sys.platform', 'win32'), patch('time.sleep', side_effect=replace_directory):
+                with self.assertRaisesRegex(RuntimeError, '身份'):
+                    temporary.cleanup()
+                self.assertEqual(remove.call_count, 1)
+                self.assertFalse(finalizer.alive)
+                del temporary
+                gc.collect()
+                self.assertIsNone(reference())
+            self.assertEqual(replacement.read_text(encoding='utf-8'), '其它目录的数据')
+            self.assertTrue(saved.is_dir())
+
+    def test_清理拒绝路径篡改跨进程与目录链接(self):
+        for changed in ('name', 'process', 'reparse'):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix='NoNo-清理边界-') as parent:
+                temporary = test_runner._TestTemporaryDirectory(dir=parent)
+                root = Path(temporary.name)
+                other = Path(parent) / '其它目录'
+                other.mkdir()
+                marker = other / '保留.txt'
+                marker.write_text('不属于此临时对象', encoding='utf-8')
+                reference = weakref.ref(temporary)
+                finalizer = temporary._finalizer
+                with ExitStack() as stack:
+                    if changed == 'name':
+                        temporary.name = str(other)
+                    elif changed == 'process':
+                        stack.enter_context(patch('run_test.os.getpid', return_value=os.getpid() + 1))
+                    else:
+                        identity = root.lstat()
+                        stack.enter_context(patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                            st_mode=identity.st_mode, st_dev=identity.st_dev, st_ino=identity.st_ino,
+                            st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                        )))
+                    with patch.object(type(temporary), '_rmtree') as remove:
+                        with self.assertRaises(RuntimeError):
+                            temporary.cleanup()
+                        remove.assert_not_called()
+                    self.assertFalse(finalizer.alive)
+                    del temporary
+                    gc.collect()
+                    self.assertIsNone(reference())
+                self.assertTrue(root.is_dir())
+                self.assertEqual(marker.read_text(encoding='utf-8'), '不属于此临时对象')
+
+    def test_临时对象正常垃圾回收无强引用泄漏(self):
+        with tempfile.TemporaryDirectory(prefix='NoNo-自动清理-') as parent:
+            temporary = test_runner._TestTemporaryDirectory(dir=parent)
+            root = Path(temporary.name)
+            (root / '记录.txt').write_text('待回收', encoding='utf-8')
+            reference = weakref.ref(temporary)
+            with self.assertWarns(ResourceWarning):
+                del temporary
+                gc.collect()
+            self.assertIsNone(reference())
+            self.assertFalse(root.exists())
+
+    def test_显式保留目录仍可手动清理(self):
+        with tempfile.TemporaryDirectory(prefix='NoNo-保留目录-') as parent:
+            temporary = test_runner._TestTemporaryDirectory(dir=parent, delete=False)
+            with temporary as directory:
+                root = Path(directory)
+            self.assertTrue(root.is_dir())
+            temporary.cleanup()
+            self.assertFalse(root.exists())
+
+    def test_父入口等待子进程后重试清理并保留失败码(self):
+        directory_type = test_runner._TestTemporaryDirectory
+        original_rmtree = directory_type._rmtree
+        state = {'child_finished': False, 'cleanup_calls': 0}
+
+        def child_finished(*_arguments, **kwargs):
+            state['root'] = Path(kwargs['env']['NONO_USER_DATA_ROOT'])
+            self.assertTrue(state['root'].is_dir())
+            self.assertEqual(state['cleanup_calls'], 0)
+            state['child_finished'] = True
+            return SimpleNamespace(returncode=7)
+
+        def remove_tree(name, **kwargs):
+            self.assertTrue(state['child_finished'])
+            self.assertEqual(Path(name), state['root'])
+            state['cleanup_calls'] += 1
+            if state['cleanup_calls'] == 1:
+                raise self.cleanup_error(145)
+            original_rmtree(name, **kwargs)
+
+        with patch.object(directory_type, '_rmtree', side_effect=remove_tree), \
+                patch('run_test.subprocess.run', side_effect=child_finished), \
+                patch('sys.argv', ['run_test.py']), patch('sys.platform', 'win32'), patch('time.sleep'):
+            with self.assertRaises(SystemExit) as raised:
+                test_runner.main()
+        self.assertEqual(raised.exception.code, 7)
+        self.assertEqual(state['cleanup_calls'], 2)
+        self.assertFalse(state['root'].exists())
+
     def test_隔离入口保留失败码并拒绝后台异常(self):
         project_root = Path(__file__).resolve().parents[1]
-        source = '''import os
+        source = '''import gc
+import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import run_test
+
+installed_before_tests = tempfile.TemporaryDirectory is run_test._TestTemporaryDirectory
 
 
 class RunnerProbe(unittest.TestCase):
     def test_result(self):
+        self.assertTrue(installed_before_tests)
         mode = os.environ['NONO_RUNNER_PROBE_CASE']
+        if mode == 'gc_cleanup':
+            temporary = tempfile.TemporaryDirectory(dir=os.environ['NONO_USER_DATA_ROOT'])
+            root = Path(temporary.name)
+            error = OSError('预期的自动清理持续失败')
+            error.winerror = 145
+            with patch.object(type(temporary), '_rmtree', side_effect=error) as remove, \\
+                    patch('sys.platform', 'win32'), patch('time.sleep'):
+                del temporary
+                gc.collect()
+                self.assertEqual(remove.call_count, 5)
+            self.assertTrue(root.exists())
         if mode == 'assertion':
             self.fail('预期的主线程断言失败')
         if mode in ('thread', 'late_thread'):
@@ -1894,7 +2074,8 @@ class RunnerProbe(unittest.TestCase):
             environment = os.environ.copy()
             environment['PYTHONPATH'] = directory
             environment['QT_QPA_PLATFORM'] = 'offscreen'
-            for mode, expected in (('normal', 0), ('assertion', 1), ('thread', 1), ('late_thread', 1)):
+            for mode, expected in (
+                    ('normal', 0), ('assertion', 1), ('thread', 1), ('late_thread', 1), ('gc_cleanup', 1)):
                 with self.subTest(mode=mode):
                     environment['NONO_RUNNER_PROBE_CASE'] = mode
                     result = subprocess.run(
@@ -1910,6 +2091,10 @@ class RunnerProbe(unittest.TestCase):
                         # 主线程用例仍成功，失败必须来自实际后台异常及完整子进程收尾。
                         self.assertIn('\nOK\n', output)
                         self.assertIn('Exception in thread', output)
+                    if mode == 'gc_cleanup':
+                        # GC 的异常不会让 unittest 失败，必须由父入口读取独立错误标记。
+                        self.assertIn('\nOK\n', output)
+                        self.assertIn('临时目录自动清理失败', output)
 
 
 if __name__ == '__main__':
