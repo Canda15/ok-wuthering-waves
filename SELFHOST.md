@@ -269,7 +269,8 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | --- | --- | --- |
 | 现在就要跟上上游最新 release | **Sync upstream release** | 自动合并、校验并发布；已合并但缺 Release／完整附件时仍会补发，已完整发布才跳过。`force` 可强制重跑 |
 | 只是重新打一次已有的版本 | **Windows 发布** | 必须把 `Branch` 下拉切到对应 **tag**；选分支会在第一步就报错（版本号取自 ref 名，`master` 不是合法版本） |
-| 编译普通源码提交并下载便携包 | **Windows 编译检查** | master 推送自动运行，也可手动派发；生成完整 NoNo-win32-portable.zip，不要求发布 tag |
+| 检查普通源码提交 | **Windows 检查** | master 推送自动运行快速检查，不生成便携包，也不发布 Release |
+| 手动编译普通提交并下载便携包 | **Windows 检查** | 手动运行并开启 `full_build`，执行完整检查后生成 NoNo-win32-portable.zip，不要求发布 tag |
 | 重新编启动器 | **构建 NoNo 启动器** | 固定官方来源并应用 NoNo 差异；先产出候选，发布需显式授权 |
 
 `Windows Release` 不能替代 `Sync upstream release`：它不查上游、也不合并，只会拿当前 ref 的
@@ -284,7 +285,7 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 | `Windows Release` | tag 一推就打包（由 `Sync upstream release` 派发） |
 | `Sync upstream release` | 12 小时轮询上游 release |
 | `构建 NoNo 启动器` | 手动重编候选启动器；默认只上传工件，显式发布使用新的 launcher-2 |
-| `Windows 编译检查` | master 推送验证完整框架及前台核心，编译原生业务 EXE 并上传对应 SHA 的产物 |
+| `Windows 检查` | master 推送只做快速检查；手动开启 `full_build` 才执行完整检查和便携包构建 |
 
 其余全部在 GitHub 侧 `disabled_manually`：`Documentation`、`close_stale_issues`、
 `issue-triage.lock`、`pull-request-review.lock`、`sync_issue_labels`、`sign_exe`、
@@ -296,12 +297,19 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 "deleted by us" 冲突。万一上游合并把这些工作流改回 `active`（比如改了 YAML 里的触发条件），
 重停一次即可：Actions 页面左侧选中该工作流 → 右上角 `...` → `Disable workflow`。
 
-### master 编译与前台核心门禁
+### 普通推送、完整检查与便携构建
 
-`.github/workflows/windows-compile.yml` 对每次 master 推送运行，不使用分支名生成发布版本，也不写入
-更新镜像。顺序为安装现有依赖 → `scripts/check_foreground.ps1` → `scripts/build_runtime.ps1` →
-共享 `.github/actions/build-nono-launcher` 构建并核验启动器 →
-`python -m selfhost.portable --source-sha <本次 SHA> --launcher-exe build/launcher-dist/NoNo.exe` → 上传完整便携包。
+`.github/workflows/windows-compile.yml` 对每次 master 推送运行快速检查：安装现有依赖 →
+`scripts/check_foreground.ps1 -Quick`。快速检查保留完整框架来源校验，以及前台输入保护、恢复新帧、
+nono 接线、版本分类、自定义页签和迁移启动的少量现有回归；不构建业务 EXE、启动器或 ZIP，
+也不创建 Release 或写入更新镜像。新的普通推送可以取消同分支尚未完成的旧快速检查。
+
+需要试用完整便携包时，手动运行 **Windows 检查** 并开启 `full_build`。该模式先执行默认完整
+`scripts/check_foreground.ps1`，随后依次运行 `scripts/build_runtime.ps1`、共享
+`.github/actions/build-nono-launcher`、
+`python -m selfhost.portable --source-sha <本次 SHA> --launcher-exe build/launcher-dist/NoNo.exe`，最后上传完整便携包。
+手动完整构建与普通推送分别排队，不会被新的快速检查取消。正式 xmod 标签继续走 **Windows 发布**，
+保留完整测试、编译、Release 和更新镜像流程。
 仓库权限仅为 `contents: read`，检出固定到本次 SHA，测试进程不继承 CI 凭据。
 
 `check_foreground.ps1` 默认先运行 `sync_ok.py --check`，再通过既有 `run_test.py` 执行集中输入、桌面通知、
@@ -310,10 +318,11 @@ pip 只在装依赖时才报错——测试全绿、包打不出来，所以写�
 在任何框架导入前设置 `NONO_USER_DATA_ROOT`、`OK_DISABLE_FILE_LOG=1`，并明确配置、截图和日志路径。
 不能仅替换 `config_folder`：截图测试会强制开启 debug，旧框架会清空默认截图目录。
 父进程在测试进程完全退出后检查后台线程错误标记，不能仅凭 unittest 的成功字样判定通过。
-开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 调用默认完整门禁，
-只有最终差异收集后框架检查通过才能继续编译。
+本地小改动只运行受影响的现有测试；需要快速冒烟时使用 `-Quick`。只有相关源码或环境发生变化，
+才重复对应验证。开发期间可以用 `-TestsOnly` 验证尚在编辑的源码；CI 不使用这个跳过来源检查的选项。
+手动完整构建和上游同步继续使用默认完整门禁，只有框架来源校验和测试通过后才继续编译。
 
-`build_runtime.ps1` 继续负责唯一宿主编译入口和原生进程验证。之后共享打包器生成
+手动完整构建时，`build_runtime.ps1` 继续负责唯一宿主编译入口和原生进程验证。之后共享打包器生成
 `build/portable-dist/NoNo-win32-portable.zip` 与 `NoNo-win32-sha256.txt`，Actions 工件名为
 `NoNo-portable-windows-<本次完整 SHA>`，保留 14 天；运行摘要提供完整便携包的下载链接。
 ZIP 内是 `NoNo/` 目录，仅直接投递根启动器和 `data/incoming/NoNo/` 下的完整包。

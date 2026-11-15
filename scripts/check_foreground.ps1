@@ -1,5 +1,6 @@
 param(
-    [switch]$TestsOnly
+    [switch]$TestsOnly,
+    [switch]$Quick
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,21 +45,54 @@ $testFiles = @(
     'tests/TestSelfhostSmoke.py'
 )
 
-# run_test.py 统一隔离配置、截图和日志；每个文件独立进程，避免 Qt 和执行器状态串用。
+$testGroups = if ($Quick) {
+    # 日常推送只保留关键接线和输入保护；同一文件的选择器合并运行以减少进程启动。
+    @(
+        @{
+            Name = 'tests/TestForegroundInput.py'
+            Targets = @(
+                'tests.TestForegroundInput.TestForegroundInput',
+                'tests.TestForegroundInput.TestForegroundLifecycle.test_安全等待回前台刷新代次和新帧但不置前',
+                'tests.TestForegroundInput.TestForegroundDeviceAndWindow.test_新旧公开入口保持同一前台类型'
+            )
+        },
+        @{
+            Name = 'tests/TestSelfhostSmoke.py'
+            Targets = @(
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_default_input_policy_and_mouse_reset_removal',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_xmod_versions_sort_as_branded_releases_in_both_python_consumers',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_main_window_still_consumes_custom_tabs',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_registered_tabs_instantiate_against_current_framework',
+                'tests.TestSelfhostSmoke.TestUserDataMigration.test_real_main_imports_existing_accounts_and_team_after_migration'
+            )
+        }
+    )
+} else {
+    foreach ($testFile in $testFiles) {
+        @{ Name = $testFile; Targets = @($testFile) }
+    }
+}
+$checkName = if ($Quick) { '快速' } else { '前台核心' }
 
+# run_test.py 统一隔离配置、截图和日志；每个文件独立进程，避免 Qt 和执行器状态串用。
 Push-Location -LiteralPath $projectPath
 try {
-    # 开发阶段可先验证正在编辑的源码；CI 始终使用默认完整门禁。
+    # 快速与完整检查都核对来源；TestsOnly 仅供尚未登记差异的开发阶段使用。
     if (-not $TestsOnly) {
         & $pythonPath -X utf8 -B 'scripts/sync_ok.py' --check
         if ($LASTEXITCODE -ne 0) { throw "内联框架与逻辑差异校验失败，退出码 $LASTEXITCODE。" }
     }
-    foreach ($testFile in $testFiles) {
-        Write-Host "运行前台核心测试：$testFile"
-        & $pythonPath -X utf8 -B -u 'run_test.py' $testFile
-        if ($LASTEXITCODE -ne 0) { throw "前台核心测试失败：$testFile，退出码 $LASTEXITCODE。" }
+    foreach ($testGroup in $testGroups) {
+        Write-Host "运行${checkName}测试：$($testGroup.Name)"
+        $targets = [string[]]$testGroup.Targets
+        & $pythonPath -X utf8 -B -u 'run_test.py' @targets
+        if ($LASTEXITCODE -ne 0) { throw "${checkName}测试失败：$($testGroup.Name)，退出码 $LASTEXITCODE。" }
     }
 } finally {
     Pop-Location
 }
-Write-Host '前台核心检查通过。'
+if ($Quick) {
+    Write-Host '快速检查通过。'
+} else {
+    Write-Host '前台核心检查通过。'
+}

@@ -1,18 +1,24 @@
-name: Windows 编译检查
-run-name: Windows 编译 · ${{ github.sha }}
+name: Windows 检查
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build && 'Windows 完整编译' || 'Windows 快速检查' }} · ${{ github.sha }}
 
 on:
   push:
     branches:
       - master
   workflow_dispatch:
+    inputs:
+      full_build:
+        description: '执行完整测试并生成便携包'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-compile-${{ github.ref }}
-  cancel-in-progress: false
+  # 新推送替代旧的快速检查，手动完整构建使用独立队列。
+  group: windows-check-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   PYTHON_VERSION: '3.12'
@@ -22,9 +28,9 @@ env:
 
 jobs:
   compile:
-    name: 前台核心、原生 EXE 与便携包
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build && '完整检查与便携包' || '快速检查' }}
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build && 90 || 15 }}
     steps:
       - name: 配置源码换行
         shell: pwsh
@@ -54,28 +60,39 @@ jobs:
         shell: pwsh
         run: python .github/scripts/install_dependencies.py
 
-      - name: 校验框架来源与前台核心
+      - name: 快速校验框架来源与关键用例
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.full_build }}
+        timeout-minutes: 10
+        shell: pwsh
+        run: .\scripts\check_foreground.ps1 -Quick
+
+      - name: 校验框架来源与完整前台核心
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         timeout-minutes: 20
         shell: pwsh
         run: .\scripts\check_foreground.ps1
 
-      # 普通分支编译直接复用宿主脚本；该脚本包含七项原生进程验证，不创建发布版本。
+      # 完整构建只由手动选项启用；普通推送在快速检查后结束。
       - name: 编译并验证原生业务 EXE
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         shell: pwsh
         run: |
           .\scripts\build_runtime.ps1
 
       - name: 编译并核验本次新版启动器
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         id: launcher
         uses: ./.github/actions/build-nono-launcher
 
       - name: 生成并验证本次 SHA 的完整便携包
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         shell: pwsh
         env:
           BUILD_SHA: ${{ github.sha }}
         run: python -m selfhost.portable --source-sha "$env:BUILD_SHA" --launcher-exe build/launcher-dist/NoNo.exe --launcher-proof build/launcher-dist/launcher-build.json
 
       - name: 上传本次 SHA 的完整便携包
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         id: portable_artifact
         uses: actions/upload-artifact@v7
         with:
@@ -88,6 +105,7 @@ jobs:
           retention-days: 14
 
       - name: 记录源码与产物
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_build }}
         shell: pwsh
         env:
           BUILD_SHA: ${{ github.sha }}
@@ -95,3 +113,13 @@ jobs:
         run: |
           "源码 SHA：$env:BUILD_SHA" >> $env:GITHUB_STEP_SUMMARY
           "完整便携包（含运行环境、依赖和原生入口）：[下载构建产物]($env:PORTABLE_ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: 记录快速检查结果
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.full_build }}
+        shell: pwsh
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          "源码 SHA：$env:BUILD_SHA" >> $env:GITHUB_STEP_SUMMARY
+          '本次已完成框架来源和关键回归检查，未生成 EXE 或便携 ZIP。' >> $env:GITHUB_STEP_SUMMARY
+          '如需试用包，请手动运行本工作流并勾选“执行完整测试并生成便携包”；正式版本由 Windows 发布流程生成。' >> $env:GITHUB_STEP_SUMMARY
