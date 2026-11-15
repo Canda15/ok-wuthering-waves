@@ -1,6 +1,8 @@
+import ctypes
 import unittest
 import time
 from contextlib import nullcontext
+from ctypes import wintypes
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -56,6 +58,118 @@ class FakeComboTask:
 
     def tr(self, message):
         return message
+
+
+class NativeComboScenario:
+    """模拟原生列表的几何和真实点击效果，导航键默认无效，复现登录 SDK 的现场。"""
+
+    def __init__(self, case, *, items=None, top_index=0, visible_rows=3, upward=False, scale=1):
+        self.items = list(items or ['第一个账号', '第二个账号', '目标账号'])
+        self.index = 0
+        self.dropped = False
+        self.combo = 42
+        self.list_hwnd = 0x100000084
+        self.identity = (10, 20)
+        self.top_index = top_index
+        self.row_height = 40 * scale
+        self.width = 200 * scale
+        self.field_height = 30 * scale
+        self.viewport_height = visible_rows * self.row_height
+        self.origin = (-1800 * scale, 100 * scale)
+        self.combo_origin = (self.origin[0] + 100 * scale, self.origin[1] + 200 * scale)
+        self.upward = upward
+        self.scroll_step = 1
+        self.scroll_stalled = False
+        self.ignore_row_click = False
+        self.info_failed = False
+        self.rect_failed = False
+        self.info_combo = self.combo
+        self.task = SimpleNamespace(
+            width=1600 * scale, height=900 * scale, _foreground_epoch=0,
+            next_frame=Mock(), sleep=Mock(), _login_combo=lambda: self.combo,
+            executor=SimpleNamespace(interaction=SimpleNamespace(
+                target_generation=1,
+                capture=SimpleNamespace(get_abs_cords=lambda x, y: (x + self.origin[0], y + self.origin[1])))),
+            wait_until=lambda condition, **kwargs: condition(),
+        )
+        self.task.click = Mock(side_effect=self.click)
+        self.task.scroll = Mock(side_effect=self.scroll)
+        self.task.send_key = Mock()
+        case.enterContext(patch.object(multi_account_module, '_SendMessageW', side_effect=self.read_message))
+        case.enterContext(patch.object(multi_account_module, '_GetComboBoxInfo',
+                                       side_effect=self.combo_info, create=True))
+        case.enterContext(patch.object(multi_account_module, 'combo_items', side_effect=lambda combo: self.items.copy()))
+        case.enterContext(patch.object(multi_account_module, 'combo_selected_item',
+                                       side_effect=lambda combo: self.items[self.index]))
+        case.enterContext(patch('win32gui.GetClientRect', side_effect=self.client_rect))
+        case.enterContext(patch('win32gui.ClientToScreen', side_effect=self.client_to_screen))
+        case.enterContext(patch('win32gui.IsWindow', side_effect=lambda hwnd: hwnd in (self.combo, self.list_hwnd)))
+        case.enterContext(patch('win32gui.IsWindowVisible',
+                               side_effect=lambda hwnd: hwnd == self.combo or (hwnd == self.list_hwnd and self.dropped)))
+        case.enterContext(patch('win32process.GetWindowThreadProcessId', side_effect=lambda hwnd: self.identity))
+
+    @property
+    def list_origin(self):
+        x, y = self.combo_origin
+        return x, y - self.viewport_height if self.upward else y + self.field_height
+
+    def client_rect(self, hwnd):
+        return (0, 0, self.width, self.field_height if hwnd == self.combo else self.viewport_height)
+
+    def client_to_screen(self, hwnd, point):
+        origin = self.combo_origin if hwnd == self.combo else self.list_origin
+        return origin[0] + point[0], origin[1] + point[1]
+
+    def combo_info(self, hwnd, pointer):
+        if self.info_failed:
+            return 0
+        info = pointer._obj
+        if info.cbSize != ctypes.sizeof(info):
+            raise AssertionError('必须按真实结构大小初始化 ComboBox 查询')
+        info.hwndCombo = self.info_combo
+        info.hwndList = self.list_hwnd
+        return 1
+
+    def read_message(self, hwnd, message, wparam, lparam):
+        if message == 0x198 and hwnd == self.list_hwnd:  # LB_GETITEMRECT
+            if self.rect_failed:
+                return -1
+            rect = ctypes.cast(lparam, ctypes.POINTER(wintypes.RECT)).contents
+            rect.left, rect.right = 0, self.width
+            rect.top = (wparam - self.top_index) * self.row_height
+            rect.bottom = rect.top + self.row_height
+            return 0
+        if message == 0x18E and hwnd == self.list_hwnd:  # LB_GETTOPINDEX
+            return self.top_index
+        values = {0x147: self.index, 0x157: int(self.dropped), 0x154: self.field_height, 0x156: 0}
+        if hwnd != self.combo or message not in values:
+            raise AssertionError('只能查询本次原生控件，不能发送写消息')
+        return values[message]
+
+    def click(self, x, y, **kwargs):
+        screen = (x + self.origin[0], y + self.origin[1])
+        combo_x, combo_y = self.combo_origin
+        if combo_x <= screen[0] < combo_x + self.width and combo_y <= screen[1] < combo_y + self.field_height:
+            self.dropped = not self.dropped
+            return
+        list_x, list_y = self.list_origin
+        if (self.dropped and list_x <= screen[0] < list_x + self.width
+                and list_y <= screen[1] < list_y + self.viewport_height):
+            if screen[0] >= list_x + self.width * .75:
+                raise AssertionError('选号不得点击账号行右侧的删除区域')
+            if not self.ignore_row_click:
+                self.index = self.top_index + (screen[1] - list_y) // self.row_height
+                self.dropped = False
+
+    def scroll(self, x, y, count):
+        screen = (x + self.origin[0], y + self.origin[1])
+        list_x, list_y = self.list_origin
+        if not (self.dropped and list_x <= screen[0] < list_x + self.width
+                and list_y <= screen[1] < list_y + self.viewport_height):
+            raise AssertionError('滚动必须指向当前展开的账号列表')
+        if not self.scroll_stalled:
+            max_top = max(0, len(self.items) - max(1, self.viewport_height // self.row_height))
+            self.top_index = max(0, min(max_top, self.top_index - count * self.scroll_step))
 
 
 class TestMultiAccountDailyTask(unittest.TestCase):
@@ -353,74 +467,51 @@ class TestMultiAccountDailyTask(unittest.TestCase):
         with self.assertRaises(WaitFailedException):
             MultiAccountDailyTask._select_and_login_account(FakeTask())
 
-    def native_combo_task(self, extended=False):
-        items = ['第一个账号', '第二个账号', '目标账号']
-        state = SimpleNamespace(index=0, dropped=False, focused=False, combo=42)
-        task = SimpleNamespace(
-            width=1600, height=900, next_frame=Mock(), _login_combo=lambda: state.combo,
-            executor=SimpleNamespace(interaction=SimpleNamespace(
-                capture=SimpleNamespace(get_abs_cords=lambda x, y: (x - 1800, y + 100)))),
-            wait_until=lambda condition, **kwargs: condition(),
-        )
+    def native_combo_task(self, **kwargs):
+        scenario = NativeComboScenario(self, **kwargs)
+        return scenario.task, scenario
 
-        def click(x, y, **kwargs):
-            # 负屏幕坐标和登录子窗口位置必须反算为同一捕获坐标，才会点中控件。
-            state.focused = (x, y) == (200, 215)
-
-        def send_key(key, **kwargs):
-            if not state.focused:
-                return
-            if key == ('down' if extended else 'f4') and not state.dropped:
-                state.dropped = True
-            elif state.dropped:
-                if key == 'home':
-                    state.index = 0
-                elif key == 'down':
-                    state.index = min(len(items) - 1, state.index + 1)
-                elif key == 'enter':
-                    state.dropped = False
-
-        def read_message(combo, message, wparam, lparam):
-            values = {
-                multi_account_module.CB_GETCURSEL: state.index,
-                multi_account_module.CB_GETDROPPEDSTATE: int(state.dropped),
-                multi_account_module.CB_GETITEMHEIGHT: 30,
-                multi_account_module.CB_GETEXTENDEDUI: int(extended),
-            }
-            if message not in values:
-                raise AssertionError('只能查询原生控件，不能发送写消息')
-            return values[message]
-
-        task.click = Mock(side_effect=click)
-        task.send_key = Mock(side_effect=send_key)
-        self.enterContext(patch.object(multi_account_module, '_SendMessageW', side_effect=read_message))
-        self.enterContext(patch.object(multi_account_module, 'combo_items', return_value=items))
-        self.enterContext(patch.object(multi_account_module, 'combo_selected_item',
-                                      side_effect=lambda combo: items[state.index]))
-        self.enterContext(patch('win32gui.GetClientRect', return_value=(0, 0, 200, 240)))
-        self.enterContext(patch('win32gui.ClientToScreen',
-                                side_effect=lambda combo, point: (point[0] - 1700, point[1] + 300)))
-        return task, state
-
-    def test_native_selection_uses_capture_coordinates_and_confirms_keyboard_result(self):
+    def test_native_selection_clicks_visible_row_when_navigation_keys_have_no_effect(self):
         task, state = self.native_combo_task()
         self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
-        task.click.assert_called_once_with(200, 215, after_sleep=.2)
+        self.assertEqual(task.click.call_args_list[0].args, (200, 215))
         self.assertEqual(state.index, 2)
         self.assertFalse(state.dropped)
-        self.assertEqual([call.args[0] for call in task.send_key.call_args_list],
-                         ['f4', 'home', 'down', 'down', 'enter'])
+        self.assertEqual(task.click.call_count, 2)
+        task.send_key.assert_not_called()
 
-    def test_native_extended_ui_opens_with_down_before_selecting(self):
-        task, state = self.native_combo_task(extended=True)
+    def test_native_selection_keeps_an_already_open_list(self):
+        task, state = self.native_combo_task()
+        state.dropped = True
         self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
         self.assertEqual(state.index, 2)
-        self.assertEqual(task.send_key.call_args_list[0].args, ('down',))
+        self.assertEqual(task.click.call_count, 1)
+        task.send_key.assert_not_called()
 
-    def test_native_selection_does_not_report_success_when_key_has_no_effect(self):
-        task, _ = self.native_combo_task()
-        task.send_key.side_effect = None
+    def test_native_editable_combo_uses_shortcut_only_to_open_then_clicks_the_row(self):
+        task, state = self.native_combo_task()
+
+        def click_without_opening(*args, **kwargs):
+            if state.dropped:
+                state.click(*args, **kwargs)
+
+        def open_with_shortcut(key, **kwargs):
+            if key == 'f4':
+                state.dropped = True
+
+        task.click.side_effect = click_without_opening
+        task.send_key.side_effect = open_with_shortcut
+        self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
+        self.assertEqual(state.index, 2)
+        self.assertEqual(task.send_key.call_args_list[0].args, ('f4',))
+        self.assertEqual(task.send_key.call_count, 1)
+
+    def test_native_selection_does_not_report_success_when_row_click_has_no_effect(self):
+        task, state = self.native_combo_task()
+        state.ignore_row_click = True
         self.assertFalse(select_combo_item(task, 42, 2, '目标账号'))
+        self.assertEqual(state.index, 0)
+        self.assertTrue(state.dropped)
 
     def test_native_selection_stops_before_input_after_dialog_or_items_change(self):
         task, state = self.native_combo_task()
@@ -430,6 +521,184 @@ class TestMultiAccountDailyTask(unittest.TestCase):
                 self.assertFalse(select_combo_item(task, 42, 2, item))
         task.click.assert_not_called()
         task.send_key.assert_not_called()
+
+    def test_native_selection_does_not_reopen_an_already_confirmed_account(self):
+        task, state = self.native_combo_task()
+        state.index = 2
+        self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
+        task.click.assert_not_called()
+        task.scroll.assert_not_called()
+        task.send_key.assert_not_called()
+
+    def test_native_selection_handles_upward_lists_and_scaled_screen_pixels(self):
+        for upward in (False, True):
+            for scale in (1, 2):
+                with self.subTest(upward=upward, scale=scale):
+                    task, state = self.native_combo_task(upward=upward, scale=scale)
+                    self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
+                    self.assertEqual(state.index, 2)
+                    self.assertEqual(task.click.call_args_list[0].args, (200 * scale, 215 * scale))
+                    task.send_key.assert_not_called()
+
+    def test_native_selection_scrolls_in_both_directions_before_clicking(self):
+        items = [f'测试账号{i}' for i in range(8)]
+        for top_index, target in ((0, 7), (5, 0)):
+            with self.subTest(top_index=top_index, target=target):
+                task, state = self.native_combo_task(items=items, top_index=top_index, visible_rows=2)
+                state.index = (target + 1) % len(items)
+                self.assertTrue(select_combo_item(task, 42, target, items[target]))
+                self.assertEqual(state.index, target)
+                self.assertFalse(state.dropped)
+                self.assertGreater(task.scroll.call_count, 0)
+                task.send_key.assert_not_called()
+
+    def test_native_selection_scrolls_a_partially_visible_row_before_clicking(self):
+        task, state = self.native_combo_task()
+        state.viewport_height = 100
+        self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
+        self.assertEqual(state.index, 2)
+        task.scroll.assert_called_once()
+
+    def test_native_selection_bounds_stalled_or_oscillating_scrolls(self):
+        items = [f'测试账号{i}' for i in range(8)]
+        for stalled, step, target in ((True, 1, 7), (False, 3, 2)):
+            with self.subTest(stalled=stalled, step=step):
+                task, state = self.native_combo_task(items=items, visible_rows=2)
+                state.scroll_stalled, state.scroll_step = stalled, step
+                self.assertFalse(select_combo_item(task, 42, target, items[target]))
+                self.assertEqual(state.index, 0)
+                self.assertTrue(state.dropped)
+                self.assertLessEqual(task.scroll.call_count, 2)
+                self.assertEqual(task.click.call_count, 1)
+
+    def test_native_selection_rejects_unusable_or_foreign_list_geometry(self):
+        for attribute, value in (('info_failed', True), ('rect_failed', True), ('info_combo', 99),
+                                 ('viewport_height', 0), ('viewport_height', 20)):
+            with self.subTest(attribute=attribute):
+                task, state = self.native_combo_task()
+                state.dropped = True
+                setattr(state, attribute, value)
+                self.assertFalse(select_combo_item(task, 42, 2, '目标账号'))
+                task.click.assert_not_called()
+                task.scroll.assert_not_called()
+
+    def test_native_selection_does_not_click_a_row_outside_the_capture(self):
+        task, state = self.native_combo_task(upward=True)
+        state.viewport_height = 500
+        state.dropped = True
+        self.assertFalse(select_combo_item(task, 42, 1, '第二个账号'))
+        task.click.assert_not_called()
+        task.scroll.assert_not_called()
+
+    def test_native_selection_rechecks_dialog_identity_and_account_order_after_opening(self):
+        for changed in ('dialog', 'identity', 'items'):
+            with self.subTest(changed=changed):
+                task, state = self.native_combo_task()
+
+                def click_and_change(*args, **kwargs):
+                    state.click(*args, **kwargs)
+                    if changed == 'dialog':
+                        state.combo = 43
+                    elif changed == 'identity':
+                        state.identity = (11, 21)
+                    else:
+                        state.items.reverse()
+
+                task.click.side_effect = click_and_change
+                self.assertFalse(select_combo_item(task, 42, 2, '目标账号'))
+                self.assertEqual(task.click.call_count, 1)
+                self.assertEqual(state.index, 0)
+
+    def test_native_selection_discards_old_points_after_silent_foreground_changes(self):
+        for changed in ('epoch', 'generation', 'origin', 'capture'):
+            with self.subTest(changed=changed):
+                task, state = self.native_combo_task()
+
+                def click_and_change(*args, **kwargs):
+                    state.click(*args, **kwargs)
+                    if changed == 'epoch':
+                        task._foreground_epoch += 1
+                    elif changed == 'generation':
+                        task.executor.interaction.target_generation += 1
+                    elif changed == 'origin':
+                        state.origin = (-1700, 100)
+                    else:
+                        task.executor.interaction.capture = SimpleNamespace(get_abs_cords=lambda x, y: (x, y))
+
+                task.click.side_effect = click_and_change
+                with self.assertRaises(ForegroundInputInterrupted):
+                    select_combo_item(task, 42, 2, '目标账号')
+                self.assertEqual(task.click.call_count, 1)
+                self.assertEqual(state.index, 0)
+
+    def test_native_selection_confirms_a_completed_click_after_foreground_recovery(self):
+        task, state = self.native_combo_task()
+
+        def click_and_resume(*args, **kwargs):
+            state.click(*args, **kwargs)
+            if not state.dropped:
+                task._foreground_epoch += 1
+
+        task.click.side_effect = click_and_resume
+        self.assertTrue(select_combo_item(task, 42, 2, '目标账号'))
+        self.assertEqual(state.index, 2)
+        self.assertEqual(task.click.call_count, 2)
+
+    def test_native_selection_requeries_row_geometry_immediately_before_input(self):
+        for changed in ('scroll', 'list'):
+            with self.subTest(changed=changed):
+                task, state = self.native_combo_task(items=['账号一', '账号二', '目标账号', '账号四'])
+                state.dropped = True
+                moved = False
+
+                def query_then_change(hwnd, message, wparam, lparam):
+                    nonlocal moved
+                    result = state.read_message(hwnd, message, wparam, lparam)
+                    if message == 0x198 and not moved:
+                        moved = True
+                        if changed == 'scroll':
+                            state.top_index = 1
+                        else:
+                            state.list_hwnd += 1
+                    return result
+
+                with patch.object(multi_account_module, '_SendMessageW', side_effect=query_then_change):
+                    with self.assertRaises(ForegroundInputInterrupted):
+                        select_combo_item(task, 42, 2, '目标账号')
+                task.click.assert_not_called()
+                task.scroll.assert_not_called()
+
+    def test_native_selection_discards_points_when_only_the_list_window_moves(self):
+        task, state = self.native_combo_task()
+        state.dropped = True
+        moved = False
+
+        def get_position_then_move(hwnd, point):
+            nonlocal moved
+            position = state.client_to_screen(hwnd, point)
+            if hwnd == state.list_hwnd and point == (0, 0) and not moved:
+                moved = True
+                state.combo_origin = (state.combo_origin[0] + 30, state.combo_origin[1])
+            return position
+
+        with patch('win32gui.ClientToScreen', side_effect=get_position_then_move):
+            with self.assertRaises(ForegroundInputInterrupted):
+                select_combo_item(task, 42, 2, '目标账号')
+        task.click.assert_not_called()
+        task.scroll.assert_not_called()
+
+    def test_native_selection_propagates_cancellation_and_input_failures(self):
+        for error_type in (TaskDisabledException, ForegroundInputError, ForegroundInputInterrupted):
+            for operation in ('click', 'scroll'):
+                with self.subTest(error=error_type.__name__, operation=operation):
+                    task, state = self.native_combo_task(visible_rows=2)
+                    state.dropped = True
+                    if operation == 'click':
+                        state.viewport_height = 120
+                    getattr(task, operation).side_effect = error_type()
+                    with self.assertRaises(error_type):
+                        select_combo_item(task, 42, 2, '目标账号')
+                    self.assertEqual(state.index, 0)
 
     def test_native_confirmation_failure_prevents_daily_login(self):
         task = FakeComboTask()

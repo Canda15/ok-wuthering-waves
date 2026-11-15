@@ -20,9 +20,23 @@ ACCOUNT_CONFIGURATION = 'Account Configuration'
 
 CB_GETCOUNT, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN = 0x146, 0x147, 0x148, 0x149
 CB_GETITEMHEIGHT, CB_GETEXTENDEDUI, CB_GETDROPPEDSTATE = 0x154, 0x156, 0x157
+LB_GETTOPINDEX, LB_GETITEMRECT = 0x18E, 0x198
+
+
+class _COMBOBOXINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', wintypes.DWORD), ('rcItem', wintypes.RECT), ('rcButton', wintypes.RECT),
+        ('stateButton', wintypes.DWORD), ('hwndCombo', wintypes.HWND),
+        ('hwndItem', wintypes.HWND), ('hwndList', wintypes.HWND),
+    ]
+
+
 _SendMessageW = ctypes.windll.user32.SendMessageW
 _SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 _SendMessageW.restype = ctypes.c_ssize_t
+_GetComboBoxInfo = ctypes.windll.user32.GetComboBoxInfo
+_GetComboBoxInfo.argtypes = [wintypes.HWND, ctypes.POINTER(_COMBOBOXINFO)]
+_GetComboBoxInfo.restype = wintypes.BOOL
 
 
 def normalize_account_name(account):
@@ -77,48 +91,128 @@ def combo_selected_item(combo):
 
 
 def select_combo_item(task, combo, index, expected_item):
-    """通过任务公共输入真实选号，随后只读确认；不伪造控件或父窗口通知。"""
+    """点击原生列表中可见的目标账号，并回读确认；不依赖 SDK 的导航键处理。"""
     task.next_frame()
     if combo != task._login_combo():
         return False
-    items = combo_items(combo)
+    items = tuple(combo_items(combo))
     if not 0 <= index < len(items) or items[index] != expected_item:
         return False
-    if (_SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
-            and not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0)):
-        return True
+    identity = win32process.GetWindowThreadProcessId(combo)
+    interaction = task.executor.interaction
+    capture = interaction.capture
+    origin = capture.get_abs_cords(0, 0)
+    epoch = getattr(task, '_foreground_epoch', 0)
+    generation = getattr(interaction, 'target_generation', None)
 
-    left, top, right, bottom = win32gui.GetClientRect(combo)
-    field_height = _SendMessageW(combo, CB_GETITEMHEIGHT, -1, 0)
-    if right <= left or bottom <= top or field_height <= 0:
-        return False
-    # 原生查询返回屏幕位置，公共输入接收捕获像素；两边使用同一裁剪原点，
-    # 不能把登录子窗口的客户坐标直接当作游戏坐标，也不能再次乘 DPI 比例。
-    screen_x, screen_y = win32gui.ClientToScreen(
-        combo, ((left + right) // 2, top + min(bottom - top, field_height) // 2))
-    origin_x, origin_y = task.executor.interaction.capture.get_abs_cords(0, 0)
-    x, y = round(screen_x - origin_x), round(screen_y - origin_y)
-    if not (0 <= x < task.width and 0 <= y < task.height):
-        return False
-    task.click(x, y, after_sleep=.2)
-    if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
-        # 普通下拉框用 F4 展开，扩展界面用向下键展开；展开后 Home 才选择列表首项。
-        key = 'down' if _SendMessageW(combo, CB_GETEXTENDEDUI, 0, 0) else 'f4'
-        task.send_key(key, after_sleep=.1)
-    if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
-        return False
-    task.send_key('home', after_sleep=.05)
-    for _ in range(index):
-        task.send_key('down', after_sleep=.05)
-    task.send_key('enter', after_sleep=.3)
+    def source_matches():
+        return (combo == task._login_combo()
+                and win32process.GetWindowThreadProcessId(combo) == identity
+                and tuple(combo_items(combo)) == items)
+
+    def check_input_context():
+        # sleep/next_frame 可能在内部完成失焦恢复；不能把旧列表行坐标继续交给新捕获目标。
+        if (getattr(task, '_foreground_epoch', 0) != epoch
+                or task.executor.interaction is not interaction or interaction.capture is not capture
+                or getattr(interaction, 'target_generation', None) != generation
+                or capture.get_abs_cords(0, 0) != origin):
+            raise ForegroundInputInterrupted('账号列表画面已变化，需要重新选择')
+
+    def task_point(hwnd, point):
+        # 原生控件查询和捕获原点都使用屏幕像素，不再次乘 DPI 比例。
+        screen_x, screen_y = win32gui.ClientToScreen(hwnd, point)
+        x, y = round(screen_x - origin[0]), round(screen_y - origin[1])
+        return (x, y) if 0 <= x < task.width and 0 <= y < task.height else None
 
     def confirmed():
-        return (combo == task._login_combo()
-                and _SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
+        if (source_matches() and _SendMessageW(combo, CB_GETCURSEL, 0, 0) == index
                 and not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0)
-                and combo_selected_item(combo) == expected_item)
+                and combo_selected_item(combo) == expected_item):
+            return True
+        # 点击可能已在失焦前被接受；先看当前选中结果，不能因换帧重复点击已关闭的列表。
+        check_input_context()
+        return False
 
-    return bool(task.wait_until(confirmed, time_out=2, raise_if_not_found=False))
+    def list_geometry():
+        info = _COMBOBOXINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if (not _GetComboBoxInfo(combo, ctypes.byref(info)) or info.hwndCombo != combo
+                or not info.hwndList or not win32gui.IsWindow(info.hwndList)
+                or not win32gui.IsWindowVisible(info.hwndList)
+                or win32process.GetWindowThreadProcessId(info.hwndList) != identity):
+            return None
+        row = wintypes.RECT()
+        if _SendMessageW(info.hwndList, LB_GETITEMRECT, index, ctypes.addressof(row)) < 0:
+            return None
+        return (info.hwndList, (row.left, row.top, row.right, row.bottom),
+                win32gui.GetClientRect(info.hwndList), win32gui.ClientToScreen(info.hwndList, (0, 0)))
+
+    if confirmed():
+        return True
+
+    if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
+        left, top, right, bottom = win32gui.GetClientRect(combo)
+        field_height = _SendMessageW(combo, CB_GETITEMHEIGHT, -1, 0)
+        if right <= left or bottom <= top or field_height <= 0:
+            return False
+        point = task_point(combo, ((left + right) // 2, top + min(bottom - top, field_height) // 2))
+        check_input_context()
+        if point is None or not source_matches():
+            return False
+        task.click(*point, after_sleep=.2)
+        check_input_context()
+        if not source_matches():
+            return False
+        if not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
+            # 可编辑的标准下拉框点击文本区只会取得焦点；快捷键仅用于展开，选号始终点可见行。
+            key = 'down' if _SendMessageW(combo, CB_GETEXTENDEDUI, 0, 0) else 'f4'
+            task.send_key(key, after_sleep=.1)
+
+    list_hwnd = None
+    seen_positions = set()
+    for _ in range(len(items) + 1):
+        task.next_frame()
+        check_input_context()
+        if not source_matches() or not _SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0):
+            return confirmed()
+        geometry = list_geometry()
+        if geometry is None:
+            return False
+        current_list, row_rect, bounds = geometry[:3]
+        row_left, row_top, row_right, row_bottom = row_rect
+        if list_hwnd is not None and list_hwnd != current_list:
+            return False
+        list_hwnd = current_list
+        left, top, right, bottom = bounds
+        row_left, row_right = max(left, row_left), min(right, row_right)
+        if (row_right <= row_left or bottom <= top or row_bottom <= row_top
+                or row_bottom - row_top > bottom - top):
+            return False
+        if top <= row_top and row_bottom <= bottom:
+            # SDK 在账号行右侧放有删除按钮；只在文字区域点击完整可见的行。
+            point = task_point(list_hwnd, (row_left + (row_right - row_left) // 3, (row_top + row_bottom) // 2))
+            check_input_context()
+            if point is None or not source_matches():
+                return False
+            if list_geometry() != geometry:
+                raise ForegroundInputInterrupted('账号列表位置已变化，需要重新选择')
+            task.click(*point, after_sleep=.3)
+            return bool(task.wait_until(confirmed, time_out=2, raise_if_not_found=False))
+
+        first_visible = _SendMessageW(list_hwnd, LB_GETTOPINDEX, 0, 0)
+        position = (first_visible, row_top, row_bottom, top, bottom)
+        if not 0 <= first_visible < len(items) or position in seen_positions:
+            return False
+        seen_positions.add(position)
+        point = task_point(list_hwnd, (left + (right - left) // 3, (top + bottom) // 2))
+        check_input_context()
+        if point is None or not source_matches():
+            return False
+        if list_geometry() != geometry:
+            raise ForegroundInputInterrupted('账号列表位置已变化，需要重新选择')
+        task.scroll(*point, 1 if row_top < top else -1)
+        task.sleep(.1)
+    return False
 
 
 class MultiAccountDailyTask(WWOneTimeTask, BaseCombatTask):

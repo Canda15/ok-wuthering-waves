@@ -33,6 +33,7 @@ from src.task.account.MultiAccountConfigStore import (
 from src.task.account.RuntimeTaskConfig import (
     RuntimeTaskConfig, account_task_config, effective_config, isolated_task_configs,
 )
+from tests.TestMultiAccountDailyTask import NativeComboScenario
 
 
 class ExampleTask:
@@ -185,6 +186,34 @@ class TestMultiAccountConfig(unittest.TestCase):
                 select.assert_called_once_with(runner, 42, 2, displayed)
                 runner.ocr.assert_not_called()
                 runner.click.assert_not_called()
+
+    def test_configured_account_uses_real_shared_row_selection_when_keys_do_nothing(self):
+        scenario = NativeComboScenario(self, items=['其它账号', '目标账号'])
+        runner = scenario.task
+        runner.tr = str
+        runner.ocr = Mock(side_effect=AssertionError('原生列表可用时不应改用 OCR'))
+        module = 'src.task.MultiAccountConfigTask.'
+        with patch(module + 'combo_items', side_effect=lambda combo: scenario.items.copy()), \
+                patch(module + 'combo_selected_item', side_effect=lambda combo: scenario.items[scenario.index]):
+            MultiAccountConfigTask._select_target_account(runner, '目标账号')
+        self.assertEqual(scenario.index, 1)
+        self.assertFalse(scenario.dropped)
+        runner.send_key.assert_not_called()
+        runner.ocr.assert_not_called()
+
+    def test_unconfirmed_real_row_selection_stops_configured_account_before_login(self):
+        scenario = NativeComboScenario(self, items=['其它账号', '目标账号'])
+        scenario.ignore_row_click = True
+        runner = scenario.task
+        runner.tr = str
+        runner.ensure_main = Mock()
+        module = 'src.task.MultiAccountConfigTask.'
+        with patch(module + 'combo_items', side_effect=lambda combo: scenario.items.copy()), \
+                patch(module + 'combo_selected_item', side_effect=lambda combo: scenario.items[scenario.index]), \
+                self.assertRaises(WaitFailedException):
+            MultiAccountConfigTask._login_target_account(runner, '目标账号')
+        self.assertEqual(scenario.index, 0)
+        runner.ensure_main.assert_not_called()
 
     def test_native_selection_or_confirmation_failure_never_logs_in(self):
         module = 'src.task.MultiAccountConfigTask.'
