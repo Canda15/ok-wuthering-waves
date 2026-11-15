@@ -84,3 +84,8 @@ assets/result.json
 
 # 原生业务宿主由发布流程编译，只随部署树分发，不提交构建产物。
 /selfhost/NoNo.exe
+/.agents
+/.codex
+/.trellis
+*.md
+/ok-kit-icons
