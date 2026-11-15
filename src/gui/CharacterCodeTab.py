@@ -1011,9 +1011,9 @@ class CharacterCodeTab(CustomTab):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self.add_widget(splitter, stretch=1)
+        self._team_data_error = False
         self._set_editor_enabled(False)
-        normalize_custom_teams()
-        self._refresh_team_list()
+        self._load_team_data()
         theme.changed.connect(self._refresh_theme)
 
     def _refresh_theme(self):
@@ -1039,10 +1039,29 @@ class CharacterCodeTab(CustomTab):
             result.setdefault(info["cls"], self._label_name(label))
         return result
 
+    def _report_team_data_error(self, error):
+        self._team_data_error = True
+        self.logger.error(f"读取工坊数据失败：{error}")
+        show_info_bar(self.window(), str(error), title=self.tr("Error"), error=True)
+
+    def _load_team_data(self):
+        try:
+            normalize_custom_teams()
+        except Exception as error:
+            self._report_team_data_error(error)
+            return False
+        return self._refresh_team_list()
+
     def _refresh_team_list(self, selected_team=None):
         selected_team = normalize_team(selected_team) if selected_team else self.current_team
-        teams = list_custom_teams()
-        states = {team: team_code_state(team) for team in teams}
+        try:
+            teams = list_custom_teams()
+            states = {team: team_code_state(team) for team in teams}
+        except Exception as error:
+            self._report_team_data_error(error)
+            return False
+        # 全部读取成功后再替换列表，损坏或不可读目录不能清空已显示的队伍。
+        self._team_data_error = False
         self.team_list.blockSignals(True)
         self.team_list.clear()
         selected_row = -1
@@ -1068,6 +1087,7 @@ class CharacterCodeTab(CustomTab):
             self._update_team_info_button()
         self._update_switch_all_button(states)
         self._update_code_mode_button()
+        return not self._team_data_error
 
     @staticmethod
     def _mark_team_state(item, state):
@@ -1080,8 +1100,12 @@ class CharacterCodeTab(CustomTab):
 
         Rebuilding the whole list would drop the scroll position and re-run
         every team on disk, while this only re-reads the states once."""
-        teams = list_custom_teams()
-        states = {team: team_code_state(team) for team in teams}
+        try:
+            teams = list_custom_teams()
+            states = {team: team_code_state(team) for team in teams}
+        except Exception as error:
+            self._report_team_data_error(error)
+            return
         team = self.current_team
         row = teams.index(team) if team in teams else -1
         if row >= 0:
@@ -1121,14 +1145,23 @@ class CharacterCodeTab(CustomTab):
         never got imported copies and still show it."""
         visible = self.current_team is not None and self.current_code_state != TEAM_CODE_MODE_BUILTIN
         if visible:
-            visible = bool(str(read_team_manifest(self.current_team).get("description") or "").strip())
+            try:
+                visible = bool(str(read_team_manifest(self.current_team).get("description") or "").strip())
+            except Exception as error:
+                self._report_team_data_error(error)
+                return
         self.team_info_button.setVisible(visible)
 
     def _show_team_info(self):
         item = self.team_list.currentItem()
         if self.current_team is None or item is None:
             return
-        TeamInfoDialog(read_team_manifest(self.current_team), item.text(), self.window()).exec()
+        try:
+            manifest = read_team_manifest(self.current_team)
+        except Exception as error:
+            self._report_team_data_error(error)
+            return
+        TeamInfoDialog(manifest, item.text(), self.window()).exec()
 
     def _member_selected(self, index):
         if index < 0 or self.current_team is None or self.suppress_selection_guard:
@@ -1319,7 +1352,11 @@ class CharacterCodeTab(CustomTab):
 
     def _update_switch_all_button(self, states=None):
         if states is None:
-            states = {team: team_code_state(team) for team in list_custom_teams()}
+            try:
+                states = {team: team_code_state(team) for team in list_custom_teams()}
+            except Exception as error:
+                self._report_team_data_error(error)
+                return
         target, switchable = self._switch_all_target(states)
         self._set_switch_icon(self.switch_all_button, target)
         self.switch_all_button.setText(
@@ -1330,7 +1367,11 @@ class CharacterCodeTab(CustomTab):
     def _update_code_mode_button(self):
         if self.current_team is None or self.current_char_cls is None:
             return
-        state = team_code_state(self.current_team)
+        try:
+            state = team_code_state(self.current_team)
+        except Exception as error:
+            self._report_team_data_error(error)
+            return
         self.current_code_state = state
         if state == TEAM_CODE_MODE_IMPORT:
             target = TEAM_CODE_MODE_BUILTIN
@@ -1371,7 +1412,11 @@ class CharacterCodeTab(CustomTab):
     def _switch_all_code_mode(self):
         if not self._settle_unsaved_changes():
             return
-        states = {team: team_code_state(team) for team in list_custom_teams()}
+        try:
+            states = {team: team_code_state(team) for team in list_custom_teams()}
+        except Exception as error:
+            self._report_team_data_error(error)
+            return
         target, switchable = self._switch_all_target(states)
         if not switchable:
             show_info_bar(self.window(), translate_ui("No team has imported code to switch."),
@@ -1419,7 +1464,11 @@ class CharacterCodeTab(CustomTab):
         if self.current_team is None or self.current_char_cls is None:
             return
         team = self.current_team
-        state = team_code_state(team)
+        try:
+            state = team_code_state(team)
+        except Exception as error:
+            self._report_team_data_error(error)
+            return
         if state == TEAM_CODE_STATE_NONE:
             self._reset_to_builtin_code()
             return
@@ -1427,10 +1476,14 @@ class CharacterCodeTab(CustomTab):
         if not self._settle_unsaved_changes():
             return
         # saving from built in code lands the team on imported code already
-        if team_code_state(team) == target:
+        try:
+            if team_code_state(team) == target:
+                return
+            drifted = drifted_team_members(team)
+        except Exception as error:
+            self._report_team_data_error(error)
             return
         target_text = translate_ui("built in code") if target == TEAM_CODE_MODE_BUILTIN else translate_ui("imported code")
-        drifted = drifted_team_members(team)
         keep_drifted = False
         if drifted:
             names = ", ".join(self.tr(get_english_char_name(name)) for name in drifted)
@@ -1466,6 +1519,7 @@ class CharacterCodeTab(CustomTab):
         except Exception as e:
             self.logger.error(f"switch team char code failed: {e}")
             show_info_bar(self.window(), str(e), title=self.tr("Error"), error=True)
+            return
         self._load_editor_code()
         self._update_code_mode_button()
         self._refresh_team_state_marker()
@@ -1745,6 +1799,8 @@ class CharacterCodeTab(CustomTab):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self._team_data_error:
+            self._load_team_data()
         if not self.show_char_feature_image:
             self.show_char_feature_image = True
         self._update_char_image()

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
-from PySide6.QtGui import QFontDatabase, QImage, QPainter
+from PySide6.QtGui import QFontDatabase, QImage, QPainter, QShowEvent
 
 from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 from PySide6.QtWidgets import QLabel, QLineEdit, QTableWidget, QTextEdit
@@ -73,6 +73,94 @@ class TestCharacterCodeTab(unittest.TestCase):
             self.assertEqual(tab.member_combo.count(), 3)
             self.assertIsNotNone(tab.current_char_cls)
             self.assertEqual(tab.editor.toPlainText(), read_team_char_code(team, tab.current_char_cls))
+        finally:
+            tab.deleteLater()
+
+    def test_initial_team_read_failure_is_visible_and_can_retry(self):
+        team = (Mortefi, Chixia, Verina)
+        folder = create_custom_team(team)
+        manifest = folder / 'team.json'
+        original = manifest.read_bytes()
+        original_iterdir = Path.iterdir
+        for failure in ('directory', 'manifest'):
+            with self.subTest(failure=failure):
+                manifest.write_bytes(b'{"unfinished":' if failure == 'manifest' else original)
+
+                def iterdir(path):
+                    if failure == 'directory' and path == folder.parent:
+                        raise PermissionError('合成工坊目录读取失败')
+                    return original_iterdir(path)
+
+                tab = None
+                try:
+                    with patch.object(Path, 'iterdir', iterdir), \
+                            patch('src.gui.CharacterCodeTab.show_info_bar') as notice:
+                        tab = CharacterCodeTab()
+                        notice.assert_called_once()
+                        self.assertTrue(notice.call_args.kwargs['error'])
+                        self.assertIsNone(tab.current_team)
+                    self.assertEqual(manifest.read_bytes(),
+                                     b'{"unfinished":' if failure == 'manifest' else original)
+                    manifest.write_bytes(original)
+                    with patch('src.gui.CharacterCodeTab.show_info_bar') as notice:
+                        tab.showEvent(QShowEvent())
+                        notice.assert_not_called()
+                    self.assertEqual(tab.team_list.count(), 1)
+                    self.assertEqual(tab.current_team, self._names(team))
+                finally:
+                    if tab is not None:
+                        tab.deleteLater()
+                    manifest.write_bytes(original)
+
+    def test_team_read_errors_keep_existing_display_and_stop_actions(self):
+        team = (Mortefi, Chixia, Verina)
+        folder = create_custom_team(team)
+        for char_cls in team:
+            save_team_import_code(team, char_cls, read_builtin_char_code(char_cls))
+        set_team_code_mode(team, TEAM_CODE_MODE_IMPORT)
+        manifest = folder / 'team.json'
+        original = manifest.read_bytes()
+        original_iterdir = Path.iterdir
+        tab = CharacterCodeTab()
+        try:
+            def display():
+                return (tab.current_team, tab.current_char_cls, tab.editor.toPlainText(),
+                        tab.team_list.count(), tab.team_list.currentRow(), tab.current_code_state,
+                        tab.reset_button.text(), tab.switch_all_button.text(), tab.clean_code)
+
+            previous = display()
+            for failure in ('directory', 'manifest'):
+                manifest.write_bytes(b'{"unfinished":' if failure == 'manifest' else original)
+                methods = ['_refresh_team_list', '_refresh_team_state_marker',
+                           '_update_switch_all_button', '_switch_all_code_mode']
+                if failure == 'manifest':
+                    methods += ['_update_code_mode_button', '_update_team_info_button',
+                                '_show_team_info', '_switch_code_mode']
+
+                def iterdir(path):
+                    if failure == 'directory' and path == folder.parent:
+                        raise PermissionError('合成工坊目录读取失败')
+                    return original_iterdir(path)
+
+                for method in methods:
+                    with self.subTest(failure=failure, method=method), \
+                            patch.object(Path, 'iterdir', iterdir), \
+                            patch('src.gui.CharacterCodeTab.show_info_bar') as notice, \
+                            patch('src.gui.CharacterCodeTab.confirmation_dialog') as confirmation, \
+                            patch('src.gui.CharacterCodeTab.TeamInfoDialog') as info_dialog:
+                        getattr(tab, method)()
+                        notice.assert_called_once()
+                        self.assertTrue(notice.call_args.kwargs['error'])
+                        confirmation.assert_not_called()
+                        info_dialog.assert_not_called()
+                        self.assertEqual(display(), previous)
+                        self.assertEqual(manifest.read_bytes(),
+                                         b'{"unfinished":' if failure == 'manifest' else original)
+            manifest.write_bytes(original)
+            with patch('src.gui.CharacterCodeTab.show_info_bar') as notice:
+                tab._refresh_team_list()
+                notice.assert_not_called()
+            self.assertEqual(display(), previous)
         finally:
             tab.deleteLater()
 

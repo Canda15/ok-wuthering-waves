@@ -8,7 +8,7 @@ use crate::nono_build;
 use crate::nono_state::{
     canonical_json, canonical_root, collect_tree, copy_tree, copy_verified, digest_bytes,
     ensure_directory, exclusive_lease, file_stamp, merge_app_object, path_under, read_object,
-    relative_path, rename_no_replace, write_json, FileStamp, TreeStamp,
+    relative_path, rename_no_replace, write_json, ExclusiveLease, FileStamp, TreeStamp,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -97,6 +98,8 @@ struct AcceptedReceipt {
     base_update_commit: String,
     launcher: LauncherIdentity,
     bootstrap_pending: bool,
+    #[serde(default)]
+    user_data_schema_version: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -258,10 +261,12 @@ fn validate_payload_boundaries(manifest: &BundleManifest) -> Result<()> {
             .keys()
             .chain(manifest.payload_directories.iter())
             .any(|name| (name.starts_with("working/")
-                && name.split('/').nth(1).is_some_and(|part| matches!(
-                    part.to_ascii_lowercase().as_str(),
-                    "configs" | "ok_tasks" | "ok_import" | "ok_templates" | "screenshots" | "logs"
-                )))
+                && name
+                    .split('/')
+                    .nth(1)
+                    .is_some_and(|part| nono_build::USER_ROOTS
+                        .iter()
+                        .any(|root| root.eq_ignore_ascii_case(part))))
                 || name
                     .to_ascii_lowercase()
                     .ends_with(".pip_update_needed.tmp")),
@@ -302,25 +307,132 @@ pub(crate) fn verify_working(root: &Path, manifest: &BundleManifest) -> Result<A
     Ok(app)
 }
 
+// libgit2 的长路径选项不覆盖裸仓库自身；使用受检运行时中的既有 Dulwich 读取真实对象。
+// 固定脚本随启动器差异一起登记，隔离导入且禁用 site，不能执行 working、用户模块或 .pth。
+const GIT_ANCHOR_READER: &str = r#"
+import os
+import sys
+
+def extended(path):
+    path = os.path.abspath(path)
+    if os.name != 'nt' or path.startswith('\\\\?\\'):
+        return path
+    if path.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + path[2:]
+    return '\\\\?\\' + path
+
+runtime = extended(os.path.dirname(sys.executable))
+sys.path[:] = [os.path.join(runtime, *part.split('/')) for part in (
+    'python312.zip', 'DLLs', 'Lib', '', 'Lib/site-packages')]
+try:
+    import json
+    from dulwich.config import ConfigFile
+    from dulwich.objects import Commit, Tag
+    from dulwich.repo import Repo
+except Exception as error:
+    print(type(error).__name__, file=sys.stderr)
+    raise SystemExit(20)
+
+try:
+    path = extended(sys.argv[1])
+    # 完整包必须自包含；外部对象库和配置包含文件不能改变受检仓库的来源。
+    for relative in ('.git', 'commondir', 'gitdir',
+                     'objects/info/alternates', 'objects/info/http-alternates'):
+        if os.path.lexists(os.path.join(path, *relative.split('/'))):
+            raise SystemExit(21)
+    config = ConfigFile.from_path(os.path.join(path, 'config'), expand_includes=False)
+    if (not config.get_boolean((b'core',), b'bare', False)
+            or any(section[0].lower() in (b'include', b'includeif')
+                   for section in config.sections())):
+        raise SystemExit(21)
+
+    class PayloadRepo(Repo):
+        def get_config(self):
+            return config
+
+    with PayloadRepo(path) as repository:
+        if not repository.bare:
+            raise SystemExit(21)
+
+        def checked_object(oid):
+            obj = repository.object_store[oid]
+            obj.check()
+            if obj.id != oid:
+                raise SystemExit(22)
+            return obj
+
+        head = checked_object(repository.refs[b'HEAD'])
+        if not isinstance(head, Commit):
+            raise SystemExit(22)
+        tag = checked_object(repository.refs[b'refs/tags/' + sys.argv[2].encode('utf-8')])
+        seen = set()
+        # 逐个读取并验证注释标签对象，不能相信 packed-refs 中缓存的 peeled SHA。
+        while isinstance(tag, Tag):
+            if tag.id in seen:
+                raise SystemExit(22)
+            seen.add(tag.id)
+            tag = checked_object(tag.object[1])
+        if not isinstance(tag, Commit):
+            raise SystemExit(22)
+        print(json.dumps({
+            'head': head.id.decode('ascii'),
+            'tag': tag.id.decode('ascii'),
+            'origin': config.get((b'remote', b'origin'), b'url').decode('utf-8'),
+        }, ensure_ascii=False))
+except Exception as error:
+    print(type(error).__name__, file=sys.stderr)
+    raise SystemExit(22)
+"#;
+
 pub(crate) fn verify_git_anchor(repo: &Path, manifest: &BundleManifest) -> Result<()> {
     ensure!(
         !repo.join(".git").exists(),
         "载荷包含旧仓库布局（E_GIT_LAYOUT）"
     );
-    let repository =
-        git2::Repository::open_bare(repo).map_err(|_| anyhow!("载荷不是裸仓库（E_GIT_LAYOUT）"))?;
-    ensure!(repository.is_bare(), "载荷不是裸仓库（E_GIT_LAYOUT）");
-    let head = repository.head()?.peel_to_commit()?.id().to_string();
-    let tag = repository
-        .find_reference(&format!("refs/tags/{}", manifest.base_update_version))?
-        .peel_to_commit()?
-        .id()
-        .to_string();
-    let remote = repository.find_remote("origin")?;
+    let repo = repo
+        .canonicalize()
+        .context("无法读取更新仓库（E_GIT_LAYOUT）")?;
+    let payload = repo
+        .parent()
+        .ok_or_else(|| anyhow!("更新仓库没有配套运行时（E_GIT_RUNTIME）"))?;
+    let mut command = Command::new(payload.join("python/python.exe"));
+    command
+        .args(["-I", "-S", "-B", "-X", "utf8", "-c", GIT_ANCHOR_READER])
+        .arg(&repo)
+        .arg(&manifest.base_update_version)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // 参数与导入目录都是绝对路径；Windows 子进程不能把深层 incoming 用作当前目录。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let result = command
+        .output()
+        .context("无法启动受检 Git 校验器（E_GIT_RUNTIME）")?;
+    if !result.status.success() {
+        match result.status.code() {
+            Some(20) => bail!("受检运行时无法导入 Git 校验依赖（E_GIT_RUNTIME）"),
+            Some(21) => bail!("载荷不是自包含的裸仓库（E_GIT_LAYOUT）"),
+            _ => bail!("无法校验真实 Git 更新对象（E_GIT_OBJECT）"),
+        }
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GitAnchor {
+        head: String,
+        tag: String,
+        origin: String,
+    }
+    let anchor: GitAnchor = serde_json::from_slice(&result.stdout)
+        .context("Git 校验器返回格式无效（E_GIT_PROTOCOL）")?;
     ensure!(
-        head == manifest.base_update_commit
-            && tag == head
-            && remote.url()? == manifest.origin.as_str(),
+        anchor.head == manifest.base_update_commit
+            && anchor.tag == anchor.head
+            && anchor.origin == OFFICIAL_ORIGIN
+            && anchor.origin == manifest.origin,
         "正式更新锚点发生变化（E_GIT_ANCHOR）"
     );
     Ok(())
@@ -359,6 +471,7 @@ fn verify_payload(
         "working/pyappify.yml",
         "working/selfhost/NoNo.exe",
         "working/selfhost/ok_pin.json",
+        "working/selfhost/user_data.py",
         "python/python.exe",
         "python/python3.dll",
         "python/python312.dll",
@@ -544,92 +657,66 @@ fn protect_originals(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
     checkpoint("originals_protected")
 }
 
-fn migrate_user_data(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
+fn migrate_user_data(
+    root: &Path,
+    journal: &mut ReceiveJournal,
+    receiver: &ExclusiveLease,
+    idle: &ExclusiveLease,
+) -> Result<()> {
     // 新安装无原件或从保护阶段恢复时，本阶段仍要创建保护记录的受检父目录。
     ensure_directory(
         root,
         &format!("data/backups/NoNo/{}", journal.transaction_id),
     )?;
-    ensure_directory(root, USER_ROOT)?;
-    let supported = [
-        "configs",
-        "ok_tasks",
-        "ok_import",
-        "ok_templates",
-        "screenshots",
-        "logs",
-        ".ok_cache",
-    ];
-    for source_kind in ["working", "repo"] {
-        let source = original_path(root, journal, &format!("{APP_ROOT}/{source_kind}"))?;
-        if !source.is_dir() {
-            continue;
-        }
-        let tree = collect_tree(&source)?;
-        for directory in &tree.directories {
-            let first = directory.split('/').next().unwrap_or_default();
-            if let Some(canonical) = supported
-                .iter()
-                .find(|name| name.eq_ignore_ascii_case(first))
-            {
-                // 只统一已知目录首段；旧文件及其子目录原名继续保留，避免账号退回默认值。
-                let normalized = format!("{canonical}{}", &directory[first.len()..]);
-                ensure_directory(root, &format!("{USER_ROOT}/{normalized}"))?;
-            }
-        }
-        for (relative, stamp) in &tree.files {
-            let first = relative.split('/').next().unwrap_or_default();
-            if matches!(
-                first,
-                ".git" | "HEAD" | "config" | "objects" | "refs" | "hooks" | "logs"
-            ) && source_kind == "repo"
-            {
-                continue;
-            }
-            let source_file = source.join(relative_path(relative)?);
-            if let Some(canonical) = supported
-                .iter()
-                .find(|name| name.eq_ignore_ascii_case(first))
-            {
-                if *canonical == "configs"
-                    && relative.split('/').count() == 2
-                    && source_file.extension().is_some_and(|extension| {
-                        extension.to_string_lossy().eq_ignore_ascii_case("json")
-                    })
-                {
-                    read_object(&source_file)?;
-                }
-                let normalized = format!("{canonical}{}", &relative[first.len()..]);
-                let target = path_under(root, &format!("{USER_ROOT}/{normalized}"))?;
-                if !target.exists() || file_stamp(&target)? == *stamp {
-                    copy_verified(root, &source_file, &target, stamp)?;
-                } else {
-                    let conflict = path_under(
-                        root,
-                        &format!(
-                            "{USER_ROOT}/conflicts/{}/{source_kind}/{relative}",
-                            journal.transaction_id
-                        ),
-                    )?;
-                    copy_verified(root, &source_file, &conflict, stamp)?;
-                }
-            } else if first != ".git" {
-                // 未知附件和用户改写源码留在独立目录，绝不遮盖新 working。
-                let extra = path_under(
-                    root,
-                    &format!(
-                        "{USER_ROOT}/extras/{}/{source_kind}/{relative}",
-                        journal.transaction_id
-                    ),
-                )?;
-                copy_verified(root, &source_file, &extra, stamp)?;
-            }
-        }
+    let payload = path_under(
+        root,
+        &format!("{INCOMING_ROOT}/{}", journal.manifest.bundle_id),
+    )?;
+    // 恢复入口也先验证整份载荷，迁移不能执行旧 working 的用户代码或系统解释器。
+    verify_payload(root, &payload, &journal.manifest, false)?;
+    let mut command = Command::new(payload.join("python/python.exe"));
+    command
+        .args(["-I", "-S", "-B", "-X", "utf8"])
+        .arg(payload.join("working/selfhost/user_data.py"))
+        .arg("--receive")
+        .arg(root)
+        .arg("--transaction")
+        .arg(&journal.transaction_id)
+        .current_dir(root)
+        .stdin(receiver.child_stdio()?)
+        .stdout(idle.child_stdio()?)
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
     }
+    let result = command
+        .output()
+        .context("无法启动用户数据保护核心（E_USER_DATA_START）")?;
+    ensure!(
+        result.status.success(),
+        "用户数据保护失败，请检查迁移错误记录（E_USER_DATA_MIGRATION）"
+    );
+    let receipt = read_object(&state_path(root, "user-data.json")?)?
+        .ok_or_else(|| anyhow!("用户数据迁移收据缺失（E_USER_DATA_RECEIPT）"))?;
+    ensure!(
+        receipt.get("schema_version") == Some(&Value::from(1))
+            && receipt.get("initialized") == Some(&Value::Bool(true))
+            && receipt.get("pending") == Some(&Value::Null)
+            && receipt
+                .get("roots")
+                .and_then(Value::as_object)
+                .is_some_and(|roots| nono_build::USER_ROOTS
+                    .iter()
+                    .all(|name| roots.contains_key(*name))),
+        "用户数据迁移收据不完整（E_USER_DATA_RECEIPT）"
+    );
     let protection = serde_json::json!({
         "schema_version": 1, "transaction_id": journal.transaction_id,
         "bundle_id": journal.manifest.bundle_id, "complete": true,
-        "originals": journal.originals,
+        "originals": journal.originals, "user_data_schema_version": 1,
+        "user_data_receipt": format!("{STATE_ROOT}/user-data.json"),
     });
     write_json(
         &backup_root(root, journal)?.join("protection.json"),
@@ -945,6 +1032,7 @@ fn commit_package(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
         base_update_commit: journal.manifest.base_update_commit.clone(),
         launcher: journal.manifest.launcher.clone(),
         bootstrap_pending: true,
+        user_data_schema_version: Some(1),
     };
     write_json(&state_path(root, "accepted.json")?, &receipt)?;
     checkpoint("receipt_saved")?;
@@ -984,7 +1072,12 @@ fn finish_cleanup(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
     Ok(())
 }
 
-fn resume_transaction(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
+fn resume_transaction(
+    root: &Path,
+    journal: &mut ReceiveJournal,
+    receiver: &ExclusiveLease,
+    idle: &ExclusiveLease,
+) -> Result<()> {
     ensure!(
         journal.schema_version == 1
             && sha(&journal.manifest.bundle_id, 64)
@@ -998,7 +1091,7 @@ fn resume_transaction(root: &Path, journal: &mut ReceiveJournal) -> Result<()> {
         protect_originals(root, journal)?;
     }
     if journal.stage == ReceiveStage::OriginalsProtected {
-        migrate_user_data(root, journal)?;
+        migrate_user_data(root, journal, receiver, idle)?;
     }
     if journal.stage == ReceiveStage::Protected {
         prepare_package(root, journal)?;
@@ -1089,12 +1182,12 @@ pub(crate) async fn receive_portable_package(portable_root: &Path) -> Result<Rec
             }
         }
     }
-    let _receiver = exclusive_lease(&root, "receive.lock")?;
-    let _idle = exclusive_lease(&root, "runtime.lock")?;
+    let receiver = exclusive_lease(&root, "receive.lock")?;
+    let idle = exclusive_lease(&root, "runtime.lock")?;
     assert_no_running_process(&root)?;
     if journal_exists {
         let mut journal: ReceiveJournal = parse_json(&journal_path(&root)?)?;
-        resume_transaction(&root, &mut journal)?;
+        resume_transaction(&root, &mut journal, &receiver, &idle)?;
     }
     // 新选择文件即使解压中断也不能拖住已准备好的旧事务恢复。
     let selected = if journal_exists && selected_path.exists() {
@@ -1140,7 +1233,7 @@ pub(crate) async fn receive_portable_package(portable_root: &Path) -> Result<Rec
             save_journal(&root, &journal)?;
             checkpoint("journal_saved")?;
             info!("便携接收开始，阶段 verified");
-            resume_transaction(&root, &mut journal)?;
+            resume_transaction(&root, &mut journal, &receiver, &idle)?;
         }
     }
     let receipt: AcceptedReceipt = parse_json(&state_path(&root, "accepted.json")?)?;
@@ -1196,6 +1289,30 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn install_test_migration_runtime(payload: &Path) {
+        // 接收测试使用包含固定 Dulwich 依赖的真实 CPython，以及本次共享迁移核心。
+        let runtime = PathBuf::from(
+            std::env::var_os("NONO_TEST_RUNTIME")
+                .expect("请先准备含 Dulwich 的隔离 CPython 并设置 NONO_TEST_RUNTIME"),
+        );
+        let script = PathBuf::from(
+            std::env::var_os("NONO_TEST_USER_DATA_SCRIPT")
+                .expect("请设置本次 selfhost/user_data.py 的绝对路径"),
+        );
+        for entry in walkdir::WalkDir::new(&runtime) {
+            let entry = entry.unwrap();
+            let target = payload
+                .join("python")
+                .join(entry.path().strip_prefix(&runtime).unwrap());
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(target).unwrap();
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+        fs::copy(script, payload.join("working/selfhost/user_data.py")).unwrap();
+    }
+
     fn fixture(legacy: bool) -> Fixture {
         let root = std::env::temp_dir().join(format!(
             "nono-receive-{}-{}",
@@ -1232,6 +1349,7 @@ mod tests {
         ] {
             write_file(&payload, name, bytes);
         }
+        install_test_migration_runtime(&payload);
         let repo = git2::Repository::init_bare(payload.join("repo")).unwrap();
         let signature = git2::Signature::now("NoNo测试", "fixture@example.invalid").unwrap();
         let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
@@ -1402,6 +1520,141 @@ mod tests {
         assert!(!app.join("repo.git.migrating").exists());
     }
 
+    #[test]
+    fn deep_bare_repository_keeps_strict_git_anchor_checks() {
+        let fixture = fixture(false);
+        let original_payload = fixture
+            .root
+            .join(format!("{INCOMING_ROOT}/{}", fixture.manifest.bundle_id));
+        let repository = git2::Repository::open_bare(original_payload.join("repo")).unwrap();
+        let signature = git2::Signature::now("NoNo测试", "fixture@example.invalid").unwrap();
+        let tree = repository.head().unwrap().peel_to_tree().unwrap();
+        let other_commit = repository
+            .commit(None, &signature, &signature, "错误的更新锚点", &tree, &[])
+            .unwrap();
+        let object = repository.find_object(other_commit, None).unwrap();
+        let other_tag = repository
+            .tag("v0.0.1", &object, &signature, "错误的标签对象", false)
+            .unwrap();
+        drop(object);
+        drop(tree);
+        drop(repository);
+
+        // 真实目录超过 MAX_PATH；保留完整运行时与仓库，不通过短路径别名规避。
+        let payload = fixture
+            .root
+            .join("deep-reception-validation".repeat(5))
+            .join("deep-reception-validation".repeat(4));
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::rename(original_payload, &payload).unwrap();
+        let repo = payload.join("repo");
+        assert!(repo.as_os_str().len() > 300);
+        let execution_marker = payload.join("unexpected-import.txt");
+        let marker_literal = serde_json::to_string(&execution_marker.to_string_lossy()).unwrap();
+        let unexpected_code = format!(
+            "import pathlib; pathlib.Path({marker_literal}).write_text('不应执行', encoding='utf-8')\n"
+        );
+        for relative in [
+            "dulwich.py",
+            "working/dulwich/__init__.py",
+            "python/Lib/site-packages/sitecustomize.py",
+            "python/Lib/site-packages/nono-git-reader.pth",
+        ] {
+            write_file(&payload, relative, unexpected_code.as_bytes());
+        }
+        let before = collect_tree(&repo).unwrap();
+        verify_git_anchor(&repo, &fixture.manifest).unwrap();
+        assert_eq!(collect_tree(&repo).unwrap(), before);
+        assert!(!execution_marker.exists());
+        let assert_rejected = |code: &str| {
+            let error = verify_git_anchor(&repo, &fixture.manifest).unwrap_err();
+            assert!(error.to_string().contains(code), "{error:#}");
+        };
+
+        let head = fs::read(repo.join("HEAD")).unwrap();
+        fs::write(repo.join("HEAD"), format!("{other_commit}\n")).unwrap();
+        assert_rejected("E_GIT_ANCHOR");
+        fs::write(repo.join("HEAD"), head).unwrap();
+
+        let config = fs::read_to_string(repo.join("config")).unwrap();
+        fs::write(
+            repo.join("config"),
+            config.replace(OFFICIAL_ORIGIN, "https://example.invalid/other.git"),
+        )
+        .unwrap();
+        assert_rejected("E_GIT_ANCHOR");
+        fs::write(repo.join("config"), &config).unwrap();
+        let nonbare = config.replace("bare = true", "bare = false");
+        assert_ne!(nonbare, config);
+        fs::write(repo.join("config"), nonbare).unwrap();
+        assert_rejected("E_GIT_LAYOUT");
+        fs::write(
+            repo.join("config"),
+            format!("{config}\n[include]\n\tpath = ../external.gitconfig\n"),
+        )
+        .unwrap();
+        write_file(&payload, "external.gitconfig", config.as_bytes());
+        assert_rejected("E_GIT_LAYOUT");
+        fs::write(repo.join("config"), &config).unwrap();
+        for relative in [
+            ".git",
+            "commondir",
+            "gitdir",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            write_file(&repo, relative, b"../../external\n");
+            assert_rejected("E_GIT_LAYOUT");
+            fs::remove_file(repo.join(relative)).unwrap();
+        }
+
+        let tag_path = repo.join(format!(
+            "refs/tags/{}",
+            fixture.manifest.base_update_version
+        ));
+        let tag = fs::read(&tag_path).unwrap();
+        fs::write(
+            &tag_path,
+            format!("{}\n", fixture.manifest.base_update_commit),
+        )
+        .unwrap();
+        verify_git_anchor(&repo, &fixture.manifest).unwrap();
+        fs::write(&tag_path, format!("{other_tag}\n")).unwrap();
+        assert_rejected("E_GIT_ANCHOR");
+        fs::remove_file(&tag_path).unwrap();
+        // packed-refs 的缓存 peel 可伪造，必须读取标签对象本身才能证明真实目标。
+        fs::write(
+            repo.join("packed-refs"),
+            format!(
+                "# pack-refs with: peeled fully-peeled sorted\n{other_tag} refs/tags/{}\n^{}\n",
+                fixture.manifest.base_update_version, fixture.manifest.base_update_commit
+            ),
+        )
+        .unwrap();
+        assert_rejected("E_GIT_ANCHOR");
+        fs::remove_file(repo.join("packed-refs")).unwrap();
+        fs::write(&tag_path, tag).unwrap();
+
+        let commit = &fixture.manifest.base_update_commit;
+        let object_path = repo.join(format!("objects/{}/{}", &commit[..2], &commit[2..]));
+        let commit_bytes = fs::read(&object_path).unwrap();
+        fs::remove_file(&object_path).unwrap();
+        assert_rejected("E_GIT_OBJECT");
+        let other_commit = other_commit.to_string();
+        let other_bytes = fs::read(repo.join(format!(
+            "objects/{}/{}",
+            &other_commit[..2],
+            &other_commit[2..]
+        )))
+        .unwrap();
+        fs::write(&object_path, other_bytes).unwrap();
+        assert_rejected("E_GIT_OBJECT");
+        fs::write(object_path, commit_bytes).unwrap();
+        verify_git_anchor(&repo, &fixture.manifest).unwrap();
+        assert_eq!(collect_tree(&repo).unwrap(), before);
+        assert!(!execution_marker.exists());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn real_directories_preserve_data_and_resume_every_commit_boundary() {
         // 新安装没有旧原件，也必须形成保护记录后才能准备和提交完整环境。
@@ -1522,8 +1775,23 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn new_selected_restores_old_transaction_before_receiving_new_bytes() {
         let mut fixture = fixture(true);
+        write_file(
+            &fixture.root,
+            &format!("{APP_ROOT}/working/Configs/deleted.json"),
+            br#"{"old":true}"#,
+        );
         TEST_INTERRUPTION.with(|target| *target.borrow_mut() = Some("protected".to_string()));
         assert!(receive_portable_package(&fixture.root).await.is_err());
+        let user_receipt = read_object(&state_path(&fixture.root, "user-data.json").unwrap())
+            .unwrap()
+            .unwrap();
+        let completed_configs = user_receipt["roots"]["configs"].clone();
+        fs::remove_file(
+            fixture
+                .root
+                .join(format!("{USER_ROOT}/configs/deleted.json")),
+        )
+        .unwrap();
         let incoming = fixture.root.join(INCOMING_ROOT);
         let source = incoming.join(&fixture.manifest.bundle_id);
         let next = incoming.join("next-preparing");
@@ -1556,6 +1824,15 @@ mod tests {
         fixture.manifest = manifest;
         receive_portable_package(&fixture.root).await.unwrap();
         assert_received(&fixture);
+        let user_receipt = read_object(&state_path(&fixture.root, "user-data.json").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_receipt["roots"]["configs"], completed_configs);
+        assert!(!fixture
+            .root
+            .join(format!("{USER_ROOT}/configs/deleted.json"))
+            .exists());
+        assert!(user_receipt["sources"].as_array().unwrap().len() >= 3);
         let receipt: AcceptedReceipt =
             parse_json(&state_path(&fixture.root, "accepted.json").unwrap()).unwrap();
         assert_eq!(receipt.source_sha, "b".repeat(40));
@@ -1641,6 +1918,7 @@ mod tests {
             "working/configs",
             "working/Configs",
             "working/LOGS/empty",
+            "working/.ok_cache",
             "python/.PIP_UPDATE_NEEDED.tmp",
         ] {
             let mut manifest = fixture.manifest.clone();
@@ -1650,6 +1928,7 @@ mod tests {
         }
         for file in [
             "working/Configs/private.json",
+            "working/.ok_cache/schedule_tasks_cache.json",
             "working/.PIP_UPDATE_NEEDED.tmp",
         ] {
             let mut manifest = fixture.manifest.clone();

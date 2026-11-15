@@ -10,6 +10,7 @@
 """
 
 import inspect
+import importlib
 import ast
 import hashlib
 import json
@@ -711,6 +712,179 @@ function gh {
             with self.assertRaises(ValueError):
                 get_user_data_path('configs')
 
+    def test_user_tasks_import_only_the_stable_package_and_bare_helpers(self):
+        from ok import og
+        from ok.core.task_manager import TaskManager
+        from ok.util.clazz import generate_label_enum
+
+        repo = Path(__file__).resolve().parents[1]
+        search_paths = [value for value in sys.path if Path(value or os.getcwd()).resolve() != repo]
+        for regular_package in (False, True):
+            for legacy_state in ('missing', 'present', 'cached'):
+                with self.subTest(regular_package=regular_package, legacy_state=legacy_state):
+                    case = self.user_root / f'{regular_package}-{legacy_state}'
+                    stable = case / 'user'
+                    tasks = stable / 'ok_tasks'
+                    working = case / 'working'
+                    legacy = case / 'previous' / 'ok_tasks'
+                    working.mkdir(parents=True)
+                    (stable / 'ApplicationImportProbe.py').parent.mkdir(parents=True)
+                    (stable / 'ApplicationImportProbe.py').write_text("VALUE = '用户根遮蔽'\n", encoding='utf-8')
+                    (working / 'ApplicationImportProbe.py').write_text("VALUE = '应用模块'\n", encoding='utf-8')
+                    for root, marker in ((tasks, '稳定'), (legacy, '旧版')):
+                        if root == legacy and legacy_state == 'missing':
+                            continue
+                        (root / 'helpers').mkdir(parents=True)
+                        if regular_package:
+                            (root / 'helpers/__init__.py').write_text('from .nested import VALUE\n', encoding='utf-8')
+                        (root / 'helpers/nested.py').write_text(f'VALUE = {marker!r}\n', encoding='utf-8')
+                        (root / 'BareTaskHelper.py').write_text(f'VALUE = {marker!r}\n', encoding='utf-8')
+                        if regular_package:
+                            (root / '__init__.py').write_text('from .helpers import VALUE\n', encoding='utf-8')
+                    if legacy_state != 'missing':
+                        (legacy / 'SyntheticLabels.py').write_text(
+                            "from enum import Enum\nclass SyntheticLabels(Enum):\n    stable_feature = '旧标签'\n",
+                            encoding='utf-8')
+                        (legacy / 'RetiredTaskHelper.py').write_text("VALUE = '旧版残留'\n", encoding='utf-8')
+                    (tasks / 'UserDataTaskProbe.py').write_text(
+                        'from ok.task.task import BaseTask\n'
+                        'from ok_tasks.SyntheticLabels import SyntheticLabels\n'
+                        'from ok_tasks.helpers.nested import VALUE as nested_value\n'
+                        'from BareTaskHelper import VALUE as bare_value\n'
+                        'from ApplicationImportProbe import VALUE as application_value\n'
+                        'import ok_tasks\n'
+                        'class UserDataTaskProbe(BaseTask):\n'
+                        '    observed = (SyntheticLabels.stable_feature.value, nested_value, bare_value,\n'
+                        "                getattr(ok_tasks, 'VALUE', 'namespace'), application_value)\n",
+                        encoding='utf-8')
+                    paths = [str(working), *search_paths]
+                    if legacy_state != 'missing':
+                        paths[1:1] = [str(legacy.parent), str(legacy)]
+                    # 只替代实例化与插件注册，真实加载器负责执行任务源码和 Python 导入。
+                    with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(stable)}), \
+                            patch.object(sys, 'path', paths), patch.dict(sys.modules), chdir(working), \
+                            patch.object(og, 'config', {'custom_tasks': True}), \
+                            patch.object(TaskManager, 'load_imported_tasks'), \
+                            patch.object(TaskManager, '_instantiate_task', return_value=None) as instantiate:
+                        names = {'SyntheticLabels', 'BareTaskHelper', 'UserDataTaskProbe',
+                                 'RetiredTaskHelper', 'ApplicationImportProbe'}
+                        for name in tuple(sys.modules):
+                            if name in names or name == 'ok_tasks' or name.startswith('ok_tasks.'):
+                                sys.modules.pop(name)
+                        importlib.invalidate_caches()
+                        if legacy_state == 'cached':
+                            importlib.import_module('ok_tasks.SyntheticLabels')
+                            importlib.import_module('ok_tasks.helpers.nested')
+                            importlib.import_module('BareTaskHelper')
+                        generate_label_enum('ok_tasks.SyntheticLabels', ['stable_feature'])
+                        manager = TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                        self.assertEqual(manager.task_errors, {})
+                        instantiate.assert_called_once()
+                        self.assertEqual(instantiate.call_args.args[0].observed,
+                                         ('stable_feature', '稳定', '稳定',
+                                          '稳定' if regular_package else 'namespace', '应用模块'))
+                        self.assertNotIn(str(stable), sys.path)
+                        for name in ('ok_tasks.RetiredTaskHelper', 'RetiredTaskHelper'):
+                            with self.assertRaises(ModuleNotFoundError):
+                                importlib.import_module(name)
+
+    def test_template_store_rejects_bad_annotations_before_saving_an_image(self):
+        import cv2
+        import numpy as np
+        from ok.core.template_store import CocoTemplateStore
+
+        store = CocoTemplateStore()
+        for original in (b'{', b'[]', b'{"images": NaN}', b'{"images": {"lost": 1}}',
+                         b'{"annotations": [null]}'):
+            with self.subTest(original=original):
+                store.coco_path.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    store.load()
+                with patch.object(cv2, 'imwrite') as write_image:
+                    with self.assertRaises(ValueError):
+                        store.save_frame(np.zeros((8, 8, 3), dtype=np.uint8))
+                    write_image.assert_not_called()
+                self.assertEqual(store.coco_path.read_bytes(), original)
+                self.assertEqual(list(store.folder.iterdir()), [store.coco_path])
+
+    def test_template_store_keeps_annotations_on_io_and_serialization_failure(self):
+        from ok.core.template_store import CocoTemplateStore
+
+        store = CocoTemplateStore()
+        original = b'{"images": [], "annotations": [], "categories": [], "info": {"enabled": false}}'
+        store.coco_path.write_bytes(original)
+        with patch('builtins.open', side_effect=PermissionError('合成读取拒绝')), \
+                patch('io.open', side_effect=PermissionError('合成读取拒绝')):
+            with self.assertRaises(PermissionError):
+                store.load()
+        with self.assertRaises(ValueError):
+            store.save({'images': [], 'annotations': [], 'categories': [], 'info': {'number': float('nan')}})
+        self.assertEqual(store.coco_path.read_bytes(), original)
+        with patch('os.replace', side_effect=PermissionError('合成原子提交失败')):
+            with self.assertRaises(PermissionError):
+                store.save(store.load())
+        self.assertEqual(store.coco_path.read_bytes(), original)
+        self.assertEqual(list(store.folder.iterdir()), [store.coco_path])
+
+    def test_template_store_preserves_existing_metadata_when_saving_a_frame(self):
+        import numpy as np
+        from ok.core.template_store import CocoTemplateStore
+
+        store = CocoTemplateStore()
+        metadata = {'enabled': False, 'count': 0, 'extra': None}
+        original = {'images': [], 'annotations': [], 'categories': [], 'info': metadata}
+        store.coco_path.write_text(json.dumps(original), encoding='utf-8')
+        saved = store.save_frame(np.zeros((8, 8, 3), dtype=np.uint8))
+        data = store.load()
+        self.assertTrue(saved.is_file())
+        self.assertEqual(data['images'][0]['file_name'], saved.name)
+        self.assertEqual((data['images'][0]['width'], data['images'][0]['height']), (8, 8))
+        self.assertEqual(data['info'], metadata)
+
+    def test_task_manifest_rejects_bad_data_and_failed_writes_without_overwriting(self):
+        from ok.core.script_packager import export_script, get_ok_tasks_folder, load_manifest, save_manifest
+
+        tasks = Path(get_ok_tasks_folder())
+        tasks.mkdir(parents=True)
+        path = tasks / 'manifest.json'
+        output = self.user_root / 'exports'
+        for original in (b'{', b'[]', b'{"extension": NaN}'):
+            with self.subTest(original=original):
+                path.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    load_manifest()
+                with self.assertRaises(ValueError):
+                    export_script([], 'probe', '合成任务', '1.0', output_folder=output)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse(output.exists())
+        original = b'{"extension": {"enabled": false, "count": 0, "value": null}}'
+        path.write_bytes(original)
+        with patch('builtins.open', side_effect=PermissionError('合成读取拒绝')):
+            with self.assertRaises(PermissionError):
+                load_manifest()
+        with self.assertRaises(TypeError):
+            save_manifest({'invalid': object()})
+        self.assertEqual(path.read_bytes(), original)
+        with patch('os.replace', side_effect=PermissionError('合成原子提交失败')):
+            with self.assertRaises(PermissionError):
+                save_manifest({'version': '2.0'})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(tasks.iterdir()), [path])
+
+    def test_task_manifest_keeps_legacy_bom_and_unknown_fields_through_export(self):
+        from ok.core.script_packager import export_script, get_ok_tasks_folder, load_manifest
+
+        tasks = Path(get_ok_tasks_folder())
+        tasks.mkdir(parents=True)
+        extension = {'enabled': False, 'count': 0, 'value': None}
+        (tasks / 'manifest.json').write_text(json.dumps({'extension': extension}), encoding='utf-8-sig')
+        self.assertEqual(load_manifest()['extension'], extension)
+        success, message, path = export_script([], 'probe', '合成任务', '1.0', output_folder=self.user_root / 'exports')
+        self.assertTrue(success, message)
+        with zipfile.ZipFile(path) as package:
+            self.assertEqual(json.loads(package.read('manifest.json'))['extension'], extension)
+        self.assertEqual(load_manifest()['extension'], extension)
+
     def test_diagnostics_export_uses_stable_folders_and_relative_archive_names(self):
         from ok import og
         from ok.ui.qt.shell import diagnostics
@@ -1214,6 +1388,7 @@ class TestPortableBundle(unittest.TestCase):
             'ok/core/foreground_fixture.py': b'FRAMEWORK_STATE = "current"\n',
             'selfhost/__init__.py': b'\n',
             'selfhost/ok_pin.json': b'{"package": "ok-script", "version": "test"}\n',
+            'selfhost/user_data.py': (Path(__file__).resolve().parents[1] / 'selfhost/user_data.py').read_bytes(),
             'assets/current.bin': b'current asset',
             '.update_repo_gitignore': b'__pycache__/\n*.pyc\nlogs/\n',
             'deploy.txt': b'src\nok\nselfhost\npyappify\nmain.py\nconfig.py\nrequirements.txt\npyappify.yml\nassets\n',
@@ -1625,13 +1800,14 @@ class TestPortableBundle(unittest.TestCase):
             package.extractall(extracted)
         self.assertEqual(portable_protocol.collect_tree(payload), portable_protocol.collect_tree(restored))
         for relative in ('data/config', 'root/private', 'working/configs', 'working/Configs',
-                         'working/LOGS/empty', 'python/.PIP_UPDATE_NEEDED.tmp'):
+                         'working/LOGS/empty', 'working/.ok_cache', 'python/.PIP_UPDATE_NEEDED.tmp'):
             with self.subTest(directory=relative):
                 changed = {**manifest, 'payload_directories': sorted({*manifest['payload_directories'], relative})}
                 changed = portable_protocol.seal_manifest(changed)
                 with self.assertRaises(RuntimeError):
                     portable_protocol.validate_manifest(changed)
-        for relative in ('working/Configs/private.json', 'working/.PIP_UPDATE_NEEDED.tmp'):
+        for relative in ('working/Configs/private.json', 'working/.ok_cache/schedule_tasks_cache.json',
+                         'working/.PIP_UPDATE_NEEDED.tmp'):
             with self.subTest(file=relative):
                 changed = {**manifest, 'payload_files': {**manifest['payload_files'], relative: {
                     'size': 0, 'sha256': hashlib.sha256(b'').hexdigest()}}}
@@ -1674,6 +1850,8 @@ class TestNativeRuntime(unittest.TestCase):
         cls.runtime.mkdir(parents=True)
         cls.executable = cls.working / 'selfhost' / 'NoNo.exe'
         shutil.copy2(cls.repo_root / 'selfhost' / 'NoNo.exe', cls.executable)
+        shutil.copy2(cls.repo_root / 'selfhost/user_data.py', cls.working / 'selfhost/user_data.py')
+        (cls.working / 'selfhost/__init__.py').write_bytes(b'')
 
         # 复制与 pyappify 相同的运行时目录布局，不能用 _pth 指回本机标准库，
         # 否则会掩盖宿主的 PYTHONHOME 和模块搜索路径错误。测试树不含目录联接。
@@ -1681,6 +1859,7 @@ class TestNativeRuntime(unittest.TestCase):
         for pattern in ('python3*.dll', 'vcruntime*.dll'):
             for library in base.glob(pattern):
                 shutil.copy2(library, cls.runtime / library.name)
+        shutil.copy2(base / 'python.exe', cls.runtime / 'python.exe')
         for folder in ('Lib', 'DLLs'):
             shutil.copytree(base / folder, cls.runtime / folder,
                             ignore=shutil.ignore_patterns('__pycache__', 'site-packages', 'test'))
@@ -1701,6 +1880,102 @@ class TestNativeRuntime(unittest.TestCase):
                               cwd=cwd or self.working, capture_output=True,
                               text=True, encoding='utf-8', timeout=15,
                               env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+
+    def read_native_manifest(self, executable, *, remove=False):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+        kernel.LoadLibraryExW.restype = wintypes.HMODULE
+        kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+        kernel.FindResourceW.argtypes = [wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p]
+        kernel.FindResourceW.restype = ctypes.c_void_p
+        kernel.LoadResource.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+        kernel.LoadResource.restype = ctypes.c_void_p
+        kernel.LockResource.argtypes = [ctypes.c_void_p]
+        kernel.LockResource.restype = ctypes.c_void_p
+        kernel.SizeofResource.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+        kernel.SizeofResource.restype = wintypes.DWORD
+        module = kernel.LoadLibraryExW(str(executable), None, 0x2 | 0x20)
+        self.assertTrue(module)
+        languages = []
+        try:
+            resource = kernel.FindResourceW(module, 1, 24)
+            if not resource:
+                return b''
+            content = ctypes.string_at(kernel.LockResource(kernel.LoadResource(module, resource)),
+                                       kernel.SizeofResource(module, resource))
+            callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMODULE, ctypes.c_void_p,
+                                               ctypes.c_void_p, wintypes.WORD, ctypes.c_ssize_t)
+            callback = callback_type(lambda module, kind, name, language, extra: languages.append(language) or True)
+            kernel.EnumResourceLanguagesW.argtypes = [wintypes.HMODULE, ctypes.c_void_p, ctypes.c_void_p,
+                                                      callback_type, ctypes.c_ssize_t]
+            self.assertTrue(kernel.EnumResourceLanguagesW(module, 24, 1, callback, 0))
+        finally:
+            kernel.FreeLibrary(module)
+        if remove:
+            # 只移除隔离 EXE 的清单，保留代码和其它资源，证明核心不依赖进程长路径 opt-in。
+            kernel.BeginUpdateResourceW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL]
+            kernel.BeginUpdateResourceW.restype = wintypes.HANDLE
+            kernel.UpdateResourceW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                               wintypes.WORD, ctypes.c_void_p, wintypes.DWORD]
+            kernel.EndUpdateResourceW.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+            update = kernel.BeginUpdateResourceW(str(executable), False)
+            self.assertTrue(update)
+            try:
+                for language in languages:
+                    self.assertTrue(kernel.UpdateResourceW(update, 24, 1, language, None, 0))
+            except BaseException:
+                kernel.EndUpdateResourceW(update, True)
+                raise
+            self.assertTrue(kernel.EndUpdateResourceW(update, False))
+        return content
+
+    def test_native_manifest_enables_long_paths_without_changing_elevation(self):
+        manifest = self.read_native_manifest(self.executable)
+        self.assertTrue(manifest, '原生宿主必须实际内嵌应用清单')
+        root = ET.fromstring(manifest)
+        self.assertEqual(root.find('.//{http://schemas.microsoft.com/SMI/2016/WindowsSettings}longPathAware').text, 'true')
+        self.assertEqual(root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel').get('level'), 'asInvoker')
+
+    def test_deep_native_migration_preserves_real_assets_without_manifest_opt_in(self):
+        from selfhost.portable import process_environment, hidden_process_options
+        relative = 'assets/templates/cancel_button_highlight_hcenter_vcenter_3840x2160_914_1255.png'
+        contents = (self.repo_root / relative).read_bytes()
+        for without_manifest in (False, True):
+            with self.subTest(without_manifest=without_manifest):
+                base = self.root / 'deep-deployment-' / str(without_manifest) / 'NoNo'
+                padding = 280 - len(str(base / 'data/apps/NoNo/working' / relative))
+                self.assertGreater(padding, 0)
+                portable = self.root / ('deep-deployment-' + 'x' * padding) / str(without_manifest) / 'NoNo'
+                working = portable / 'data/apps/NoNo/working'
+                shutil.copytree(self.working, Path('\\\\?\\' + str(working)))
+                shutil.copytree(self.runtime, Path('\\\\?\\' + str(portable / 'data/apps/NoNo/python')))
+                executable = working / 'selfhost/NoNo.exe'
+                if without_manifest:
+                    self.read_native_manifest(executable, remove=True)
+                    self.assertEqual(self.read_native_manifest(executable), b'')
+                original = working / relative
+                extended_original = Path('\\\\?\\' + str(original))
+                extended_original.parent.mkdir(parents=True)
+                extended_original.write_bytes(contents)
+                (working / 'configs').mkdir()
+                (working / 'configs/account.json').write_bytes(b'{"enabled":false}')
+                self.assertGreater(len(str(original)), 260)
+                code = ('import json,os; from pathlib import Path; '
+                        'print((Path(os.environ["NONO_USER_DATA_ROOT"])/"configs/account.json").read_text())')
+                result = subprocess.run([str(executable), '-c', code], cwd=working, env=process_environment(),
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8',
+                                        timeout=45, **hidden_process_options())
+                error_path = portable / 'data/state/NoNo/user-data-error.json'
+                error = error_path.read_text(encoding='utf-8') if error_path.exists() else ''
+                self.assertEqual(result.returncode, 0, result.stderr + error)
+                self.assertEqual(json.loads(result.stdout), {'enabled': False})
+                receipt = json.loads((portable / 'data/state/NoNo/user-data.json').read_bytes())
+                protected = portable / receipt['sources'][0]['path'] / relative
+                self.assertGreater(len(str(protected)), 260)
+                self.assertEqual(Path('\\\\?\\' + str(protected)).read_bytes(), contents)
+                self.assertEqual(extended_original.read_bytes(), contents)
 
     def test_launcher_uses_native_main_entry(self):
         """宿主编出来却没被启动器使用，仍然会出现原来的 Python 进程。"""
@@ -1822,3 +2097,847 @@ class TestNativeRuntime(unittest.TestCase):
         finally:
             kernel.CloseHandle(lease)
 
+    def test_legacy_native_migrates_before_any_business_code(self):
+        from selfhost.portable import process_environment, hidden_process_options
+
+        portable = self.root / 'legacy-upgrade/NoNo'
+        working = portable / 'data/apps/NoNo/working'
+        runtime = portable / 'data/apps/NoNo/python'
+        shutil.copytree(self.working, working)
+        shutil.copytree(self.runtime, runtime)
+        core = self.repo_root / 'selfhost/user_data.py'
+        if core.exists():
+            shutil.copy2(core, working / 'selfhost/user_data.py')
+        (working / 'selfhost/__init__.py').write_bytes(b'')
+        source = working / 'configs/custom_teams/old-team'
+        source.mkdir(parents=True)
+        (source / 'team.json').write_bytes(b'{"name":"old-team","mode":"custom"}')
+        (source / 'SyntheticChar.py').write_bytes(b'class SyntheticChar: pass\n')
+        (working / 'captures').mkdir()
+        (working / 'captures/old.bin').write_bytes(b'old capture')
+        executable = working / 'selfhost/NoNo.exe'
+        code = (
+            'import json,os; from pathlib import Path; '
+            'root=Path(os.environ["NONO_USER_DATA_ROOT"]); '
+            'print(json.dumps({"team":json.loads((root/"configs/custom_teams/old-team/team.json").read_bytes()),'
+            '"code":(root/"configs/custom_teams/old-team/SyntheticChar.py").read_text()}))'
+        )
+        result = subprocess.run([str(executable), '-c', code], cwd=self.root,
+                                env=process_environment(), capture_output=True, text=True,
+                                encoding='utf-8', timeout=45, **hidden_process_options())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['team']['mode'], 'custom')
+        self.assertEqual(json.loads(result.stdout)['code'], 'class SyntheticChar: pass\n')
+
+    def test_concurrent_native_handoff_keeps_named_helpers_and_runtime_lease(self):
+        import time
+        import psutil
+        from selfhost import user_data
+        from selfhost.portable import process_environment, hidden_process_options
+
+        portable = self.root / 'concurrent/NoNo'
+        working = portable / 'data/apps/NoNo/working'
+        shutil.copytree(self.working, working)
+        shutil.copytree(self.runtime, portable / 'data/apps/NoNo/python')
+        (working / 'captures').mkdir()
+        (working / 'captures/old.bin').write_bytes(b'original capture')
+        executable = working / 'selfhost/NoNo.exe'
+        processes = []
+        receiver = user_data.FileLease(portable, 'receive.lock')
+        try:
+            for index in range(2):
+                ready = self.root / f'concurrent-ready-{index}'
+                code = (
+                    'import json,runpy,sys; from pathlib import Path; '
+                    f'api=runpy.run_path({str(self.repo_root / "ok/util/file.py")!r}); '
+                    'capture=Path(api["get_user_data_path"]("captures"))/"old.bin"; '
+                    'print(json.dumps({"capture":capture.read_text()}),flush=True); '
+                    f'Path({str(ready)!r}).write_bytes(b"ready"); sys.stdin.read(1)'
+                )
+                processes.append(subprocess.Popen([str(executable), '-c', code], cwd=self.root,
+                                                   env=process_environment(), stdin=subprocess.PIPE,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                   text=True, encoding='utf-8', **hidden_process_options()))
+            deadline = time.monotonic() + 10
+            children = []
+            while time.monotonic() < deadline:
+                children = [child for process in processes for child in psutil.Process(process.pid).children()]
+                if len(children) == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(Path(child.exe()).resolve() == executable.resolve() for child in children))
+            receiver.close()
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if all((self.root / f'concurrent-ready-{index}').exists() for index in range(2)):
+                    break
+                if any(process.poll() is not None for process in processes):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(all((self.root / f'concurrent-ready-{index}').exists() for index in range(2)))
+            with self.assertRaisesRegex(RuntimeError, 'USER_LEASE_BUSY'):
+                user_data.FileLease(portable, 'runtime.lock')
+            receipt = json.loads((portable / 'data/state/NoNo/user-data.json').read_bytes())
+            self.assertEqual(len(receipt['sources']), 1)
+            self.assertIn('captures', receipt['roots'])
+            for process in processes:
+                output, error = process.communicate('A', timeout=15)
+                self.assertEqual(process.returncode, 0, error)
+                self.assertEqual(json.loads(output)['capture'], 'original capture')
+            with user_data.FileLease(portable, 'runtime.lock'):
+                pass
+        finally:
+            receiver.close()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    def test_internal_native_mode_cannot_execute_business_arguments(self):
+        result = self.run_native('--nono-bootstrap-helper', '-c', 'print("不应执行")')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('不应执行', result.stdout)
+
+
+class TestUserDataMigration(unittest.TestCase):
+    """真实旧布局、稳定根和持久化边界，不创建游戏运行时。"""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='用户迁移-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve() / 'NoNo'
+        self.working = self.root / 'data/apps/NoNo/working'
+        self.user = self.root / 'data/user/NoNo'
+        self.working.mkdir(parents=True)
+        self.environment = patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(self.user)})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def write(self, base, relative, data):
+        target = base / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return target
+
+    def prepare(self):
+        from selfhost.user_data import bootstrap_user_data
+        context = bootstrap_user_data(self.working)
+        self.addCleanup(context.close)
+        return context
+
+    def test_explicit_external_project_keeps_its_own_user_paths(self):
+        from ok.util.file import get_user_data_path
+        external = Path(self.temporary.name).resolve() / 'other-project'
+        original = self.write(external, 'captures/old.bin', b'external capture')
+        before = original.stat()
+        self.assertEqual(Path(get_user_data_path('captures', base_path=external)), external / 'captures')
+        self.assertEqual(original.read_bytes(), b'external capture')
+        self.assertEqual(original.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_fixed_roots_and_requested_custom_root_survive_deleted_working(self):
+        from ok.util.file import get_user_data_path, read_json_file
+        for relative, data in {
+            'configs/Basic Options.json': b'{"enabled":false,"unknown":{"count":0,"value":null}}',
+            'ok_tasks/manifest.json': b'{"scripts":{}}',
+            'ok_import/sample/manifest.json': b'{"id":"sample"}',
+            'ok_templates/coco_annotations.json': b'{"images":[],"annotations":[],"categories":[]}',
+            'screenshots/old.bin': b'old screenshot', 'logs/old.log': b'old log',
+            '.ok_cache/schedule_tasks_cache.json': b'{"tasks":[]}',
+            'captures/session/old.bin': b'old capture',
+        }.items():
+            self.write(self.working, relative, data)
+        context = self.prepare()
+        data = read_json_file(get_user_data_path('configs', 'Basic Options.json'), strict=True)
+        self.assertEqual(data, {'enabled': False, 'unknown': {'count': 0, 'value': None}})
+        self.assertEqual((self.user / '.ok_cache/schedule_tasks_cache.json').read_bytes(), b'{"tasks":[]}')
+        shutil.rmtree(self.working / 'captures')
+        path = Path(get_user_data_path('captures/session'))
+        self.assertEqual((path / 'old.bin').read_bytes(), b'old capture')
+        (path / 'old.bin').unlink()
+        context.close()
+        self.prepare()
+        self.assertFalse((Path(get_user_data_path('captures/session')) / 'old.bin').exists())
+
+    def test_conflicting_teams_and_plugin_transactions_are_complete_units(self):
+        self.write(self.user, 'configs/custom_teams/same/A.py', b'stable A')
+        self.write(self.working, 'configs/custom_teams/same/A.py', b'old A')
+        self.write(self.working, 'configs/custom_teams/same/B.py', b'old B')
+        self.write(self.working, 'configs/custom_teams/same/team.json', b'{"mode":"custom"}')
+        self.write(self.user, 'ok_import/sample/stable.py', b'stable plugin')
+        self.write(self.working, 'ok_import/sample/old.py', b'old plugin')
+        self.write(self.working, 'ok_import/.plugin-staging/sample/operation.json', b'{"action":"install"}')
+        self.write(self.working, 'ok_import/.plugin-staging/sample/previous/old.py', b'previous plugin')
+        self.prepare()
+        self.assertEqual((self.user / 'configs/custom_teams/same/A.py').read_bytes(), b'stable A')
+        self.assertFalse((self.user / 'configs/custom_teams/same/B.py').exists())
+        self.assertFalse((self.user / 'ok_import/sample/old.py').exists())
+        self.assertFalse((self.user / 'ok_import/.plugin-staging/sample').exists())
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        conflicts = [entry for entry in receipt['conflicts'] if entry['root'] in ('configs', 'ok_import')]
+        self.assertEqual(len(conflicts), 2)
+        for entry in conflicts:
+            self.assertTrue((self.root / entry['source']).exists())
+
+    def test_staging_only_source_cannot_join_a_stable_plugin(self):
+        from ok.core.plugin_staging import apply_pending_plugin_changes
+        self.write(self.user, 'ok_import/sample/current.py', b'stable selected plugin')
+        operation = {'namespace': 'sample', 'action': 'delete', 'phase': 'applying', 'had_previous': True}
+        self.write(self.working, 'ok_import/.plugin-staging/sample/operation.json', json.dumps(operation).encode())
+        source = self.write(self.working, 'ok_import/.plugin-staging/sample/previous/current.py', b'old deleted plugin')
+        # 不同 namespace 仍可迁入，缺少 staging 的来源成员不能阻止普通插件复制。
+        self.write(self.working, 'ok_import/new/current.py', b'new independent plugin')
+        self.prepare()
+        staged = self.user / 'ok_import/.plugin-staging/sample'
+        self.assertFalse(staged.exists())
+        results = apply_pending_plugin_changes(import_base=self.user / 'ok_import')
+        self.assertNotIn('sample', results)
+        self.assertEqual((self.user / 'ok_import/sample/current.py').read_bytes(), b'stable selected plugin')
+        self.assertEqual((self.user / 'ok_import/new/current.py').read_bytes(), b'new independent plugin')
+        self.assertEqual(source.read_bytes(), b'old deleted plugin')
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        self.assertEqual([entry['unit'] for entry in receipt['conflicts'] if entry['root'] == 'ok_import'],
+                         [['sample', '.plugin-staging/sample']])
+
+    def test_source_plugin_cannot_join_a_stable_staging_only_transaction(self):
+        from ok.core.plugin_staging import apply_pending_plugin_changes
+        operation = {'namespace': 'sample', 'action': 'delete', 'phase': 'applying', 'had_previous': True}
+        self.write(self.user, 'ok_import/.plugin-staging/sample/operation.json', json.dumps(operation).encode())
+        self.write(self.user, 'ok_import/.plugin-staging/sample/previous/current.py', b'stable deletion original')
+        self.write(self.working, 'ok_import/sample/current.py', b'old unrelated plugin')
+        self.prepare()
+        self.assertFalse((self.user / 'ok_import/sample').exists())
+        apply_pending_plugin_changes(import_base=self.user / 'ok_import')
+        self.assertFalse((self.user / 'ok_import/sample').exists())
+        self.assertFalse((self.user / 'ok_import/.plugin-staging/sample').exists())
+        self.assertEqual((self.working / 'ok_import/sample/current.py').read_bytes(), b'old unrelated plugin')
+
+    def receive_protected_sources(self):
+        import _winapi
+        import msvcrt
+        from selfhost import user_data
+        transaction = '1234567890abcdef-12345'
+        app = self.root / user_data.APP_PATH
+        original = self.root / f'data/backups/NoNo/{transaction}/original/{user_data.APP_PATH}'
+
+        def borrowed_stream(lease):
+            handle = _winapi.DuplicateHandle(_winapi.GetCurrentProcess(), lease.handle,
+                                             _winapi.GetCurrentProcess(), 0, False, _winapi.DUPLICATE_SAME_ACCESS)
+            return os.fdopen(msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY), 'r+b')
+
+        with ExitStack() as stack:
+            receiver = stack.enter_context(user_data.FileLease(self.root, 'receive.lock'))
+            idle = stack.enter_context(user_data.FileLease(self.root, 'runtime.lock'))
+            stamp = user_data._stamp(self.root, app)
+            user_data._copy(self.root, app, original, stamp)
+            user_data._write_json(self.root, self.root / 'data/state/NoNo/receive.json', {
+                'schema_version': 1, 'transaction_id': transaction, 'stage': 'originals_protected',
+                'originals': {user_data.APP_PATH: stamp},
+            })
+            core = Path(__file__).resolve().parents[1] / 'selfhost/user_data.py'
+            return subprocess.run([sys.executable, '-I', '-S', '-B', '-X', 'utf8', str(core),
+                                   '--receive', str(self.root), '--transaction', transaction],
+                                  stdin=stack.enter_context(borrowed_stream(receiver)),
+                                  stdout=stack.enter_context(borrowed_stream(idle)), stderr=subprocess.PIPE,
+                                  cwd=self.root, text=True, encoding='utf-8', timeout=30,
+                                  creationflags=subprocess.CREATE_NO_WINDOW)
+
+    def test_interrupted_capture_then_receive_produces_a_loadable_receipt(self):
+        from selfhost import user_data
+        from ok.util.file import get_user_data_path, read_json_file
+        account = self.write(self.working, 'configs/account.json', b'{"enabled":false}')
+        self.write(self.working, 'z-later/old.bin', b'late requested original')
+        copy = user_data._copy
+
+        def interrupt(root, source, destination, expected):
+            if source.name == 'old.bin':
+                raise OSError('合成封存中断')
+            return copy(root, source, destination, expected)
+
+        with patch.object(user_data, '_copy', side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, '合成封存中断'):
+                self.prepare()
+        receipt_path = self.root / 'data/state/NoNo/user-data.json'
+        before = json.loads(receipt_path.read_bytes())
+        self.assertFalse(before['initialized'])
+        self.assertTrue(before['capture'])
+        captured = self.root / before['capture'][0]['path']
+        self.assertEqual((captured / 'configs/account.json').read_bytes(), account.read_bytes())
+        result = self.receive_protected_sources()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.prepare()
+        after = json.loads(receipt_path.read_bytes())
+        self.assertIsNone(after['capture'])
+        self.assertTrue(after['initialized'])
+        self.assertEqual(read_json_file(get_user_data_path('configs/account.json'), strict=True), {'enabled': False})
+        shutil.rmtree(self.working / 'z-later')
+        self.assertEqual((Path(get_user_data_path('z-later')) / 'old.bin').read_bytes(), b'late requested original')
+
+    def test_changed_source_keeps_interrupted_capture_on_receiver_failure(self):
+        from selfhost import user_data
+        source = self.write(self.working, 'configs/account.json', b'{"enabled":false}')
+        with patch.object(user_data, '_copy', side_effect=OSError('合成封存中断')):
+            with self.assertRaisesRegex(OSError, '合成封存中断'):
+                self.prepare()
+        receipt = self.root / 'data/state/NoNo/user-data.json'
+        before = receipt.read_bytes()
+        source.write_bytes(b'{"enabled":true}')
+        result = self.receive_protected_sources()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(receipt.read_bytes(), before)
+        self.assertFalse((self.user / 'configs/account.json').exists())
+        self.assertEqual(source.read_bytes(), b'{"enabled":true}')
+
+    def test_unicode_requested_root_keeps_its_name_and_completed_identity(self):
+        from ok.util.file import get_user_data_path
+        self.write(self.working, 'Straße/session/old.bin', b'custom captured bytes')
+        context = self.prepare()
+        requested = Path(get_user_data_path('Straße/session'))
+        self.assertEqual((requested / 'old.bin').read_bytes(), b'custom captured bytes')
+        self.assertFalse((self.user / 'strasse').exists())
+        alternate = Path(get_user_data_path('STRAßE/session'))
+        self.assertTrue(requested.samefile(alternate))
+        (requested / 'old.bin').unlink()
+        context.close()
+        self.prepare()
+        self.assertFalse((Path(get_user_data_path('straße/session')) / 'old.bin').exists())
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        self.assertIn('Straße', receipt['roots'])
+        self.assertNotIn('strasse', receipt['roots'])
+
+    def test_distinct_unicode_roots_have_independent_sources_and_receipts(self):
+        from ok.util.file import get_user_data_path
+        names = ('Straße', 'strasse', 'İstanbul', 'i\u0307stanbul')
+        for index, name in enumerate(names):
+            self.write(self.working, f'{name}/old.bin', str(index).encode())
+        self.prepare()
+        for index, name in enumerate(names):
+            self.assertEqual((Path(get_user_data_path(name)) / 'old.bin').read_bytes(), str(index).encode())
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        self.assertTrue(set(names) <= set(receipt['roots']))
+
+    def test_bad_json_preserves_source_and_prevents_any_publication(self):
+        source = self.write(self.working, 'configs/custom_teams/old/team.json', b'{broken')
+        self.write(self.working, 'configs/Basic Options.json', b'{"enabled":false}')
+        with self.assertRaisesRegex(RuntimeError, 'JSON'):
+            self.prepare()
+        self.assertEqual(source.read_bytes(), b'{broken')
+        self.assertFalse((self.user / 'configs/Basic Options.json').exists())
+        snapshots = list((self.root / 'data/backups/NoNo').rglob('team.json'))
+        self.assertTrue(snapshots)
+        self.assertTrue(all(path.read_bytes() == b'{broken' for path in snapshots))
+
+    def test_interrupted_publication_resumes_only_the_recorded_directory_identity(self):
+        from selfhost import user_data
+        old = self.write(self.working, 'configs/old.json', b'{"enabled":false}')
+        stable = self.write(self.user, 'configs/stable.json', b'{"value":0}')
+        move = user_data._move
+
+        def interrupted(root, source, destination, **kwargs):
+            move(root, source, destination, **kwargs)
+            if destination == self.user / 'configs':
+                raise OSError('合成目录发布后中断')
+
+        with patch.object(user_data, '_move', side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, '合成目录发布后中断'):
+                self.prepare()
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        self.assertIsNotNone(receipt['pending'])
+        self.assertEqual(old.read_bytes(), b'{"enabled":false}')
+        stable.write_bytes(b'{"value":99}')
+        with self.assertRaisesRegex(RuntimeError, 'USER_RECOVERY_IDENTITY'):
+            self.prepare()
+        self.assertEqual(stable.read_bytes(), b'{"value":99}')
+        stable.write_bytes(b'{"value":0}')
+        self.prepare()
+        self.assertEqual((self.user / 'configs/old.json').read_bytes(), old.read_bytes())
+        receipt = json.loads((self.root / 'data/state/NoNo/user-data.json').read_bytes())
+        self.assertIsNone(receipt['pending'])
+
+    def test_locked_original_fails_without_defaults_and_can_retry(self):
+        from selfhost import user_data
+        source = self.write(self.working, 'configs/account.json', b'{"accounts":["synthetic"]}')
+        handle = user_data._open_handle(source)
+        try:
+            with self.assertRaises((OSError, RuntimeError)):
+                self.prepare()
+            self.assertFalse((self.user / 'configs/account.json').exists())
+        finally:
+            user_data._kernel().CloseHandle(handle)
+        self.prepare()
+        self.assertEqual((self.user / 'configs/account.json').read_bytes(), source.read_bytes())
+
+    def test_fixed_user_root_file_conflict_fails_before_config_can_replace_it(self):
+        source = self.write(self.working, 'configs/account.json', b'{"enabled":false}')
+        original = self.write(self.user, 'configs', b'original file at the configuration root')
+        with self.assertRaisesRegex(RuntimeError, 'USER_DIRECTORY_REQUIRED'):
+            self.prepare()
+        self.assertEqual(original.read_bytes(), b'original file at the configuration root')
+        self.assertEqual(source.read_bytes(), b'{"enabled":false}')
+
+    def test_structurally_invalid_receipts_cannot_claim_completed_migration(self):
+        self.write(self.working, 'configs/old.json', b'{"enabled":false}')
+        base = {'schema_version': 1, 'initialized': True, 'sources': [],
+                'roots': {}, 'conflicts': [], 'capture': None, 'pending': None}
+        from selfhost.user_data import FIXED_USER_ROOTS
+        invalid = [
+            {**base, 'schema_version': True},
+            {**base, 'roots': {name: {} for name in FIXED_USER_ROOTS}},
+            {**base, 'capture': [{'source': '../../outside'}]},
+            {**base, 'pending': {'roots': list(FIXED_USER_ROOTS)}},
+            {**base, 'sources': [{'kind': 'working', 'path': '../../outside', 'tree': {}}]},
+        ]
+        for state in invalid:
+            with self.subTest(state=state):
+                original = json.dumps(state).encode()
+                receipt = self.write(self.root, 'data/state/NoNo/user-data.json', original)
+                with self.assertRaises(RuntimeError):
+                    self.prepare()
+                self.assertEqual(receipt.read_bytes(), original)
+                self.assertFalse((self.user / 'configs/old.json').exists())
+
+    def test_legacy_accepted_receipt_preserves_deletions_and_keeps_custom_sources(self):
+        from selfhost.portable_protocol import collect_tree
+        from ok.util.file import get_user_data_path
+        transaction = '1234567890abcdef-12345'
+        original_app = self.root / f'data/backups/NoNo/{transaction}/original/data/apps/NoNo'
+        self.write(original_app, 'working/configs/deleted.json', b'{"old":true}')
+        self.write(original_app, 'working/captures/old.bin', b'protected custom capture')
+        files, directories = collect_tree(original_app)
+        accepted = {'schema_version': 1, 'transaction_id': transaction, 'bundle_id': 'a' * 64}
+        proof = {**accepted, 'complete': True,
+                 'originals': {'data/apps/NoNo': {'kind': 'directory',
+                                                'stamp': {'files': files, 'directories': directories}}}}
+        self.write(self.root, 'data/state/NoNo/accepted.json', json.dumps(accepted).encode())
+        self.write(self.root, f'data/backups/NoNo/{transaction}/protection.json', json.dumps(proof).encode())
+        context = self.prepare()
+        self.assertFalse((self.user / 'configs/deleted.json').exists())
+        self.assertEqual((Path(get_user_data_path('captures')) / 'old.bin').read_bytes(), b'protected custom capture')
+        context.close()
+        (self.root / 'data/state/NoNo/user-data.json').unlink()
+        self.write(self.root, 'data/state/NoNo/accepted.json', json.dumps({**accepted, 'schema_version': True}).encode())
+        with self.assertRaisesRegex(RuntimeError, 'USER_PREVIOUS_RECEIPT_INVALID'):
+            self.prepare()
+        self.write(self.root, 'data/state/NoNo/accepted.json',
+                   json.dumps({**accepted, 'user_data_schema_version': 1}).encode())
+        with self.assertRaisesRegex(RuntimeError, 'USER_RECEIPT_MISSING'):
+            self.prepare()
+
+    def test_portable_directory_move_keeps_relative_receipts_and_late_migration(self):
+        from ok.util.file import get_user_data_path
+        self.write(self.working, 'configs/old.json', b'{"enabled":false}')
+        self.write(self.working, 'captures/old.bin', b'move-safe original')
+        context = self.prepare()
+        context.close()
+        previous = self.root
+        destination = self.root.parent / 'moved NoNo'
+        self.root.rename(destination)
+        self.root = destination
+        self.working = destination / 'data/apps/NoNo/working'
+        self.user = destination / 'data/user/NoNo'
+        os.environ['NONO_USER_DATA_ROOT'] = str(self.user)
+        shutil.rmtree(self.working / 'captures')
+        self.prepare()
+        self.assertEqual((Path(get_user_data_path('captures')) / 'old.bin').read_bytes(), b'move-safe original')
+        receipt = (self.root / 'data/state/NoNo/user-data.json').read_text(encoding='utf-8')
+        self.assertNotIn(str(previous), receipt)
+
+    def test_receiver_rejects_pipe_handles_as_borrowed_locks(self):
+        core = Path(__file__).resolve().parents[1] / 'selfhost/user_data.py'
+        result = subprocess.run([sys.executable, '-I', '-S', '-X', 'utf8', str(core),
+                                 '--receive', str(self.root), '--transaction', 'fake'],
+                                input='', capture_output=True, text=True, encoding='utf-8', timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(self.user.exists())
+
+    def test_real_main_imports_existing_accounts_and_team_after_migration(self):
+        repo = Path(__file__).resolve().parents[1]
+        from selfhost.portable import process_environment, hidden_process_options
+        for broken in (False, True):
+            with self.subTest(broken=broken):
+                portable = self.root / str(broken)
+                working = portable / 'data/apps/NoNo/working'
+                (working / 'selfhost').mkdir(parents=True)
+                for relative in ('main.py', 'selfhost/__init__.py', 'selfhost/user_data.py'):
+                    shutil.copy2(repo / relative, working / relative)
+                account = self.write(working, 'configs/MultiAccountConfig.json',
+                                     b'{broken' if broken else b'{"accounts":["synthetic"],"enabled":false}')
+                team = 'Alpha__Beta__Gamma'
+                for name in ('Alpha', 'Beta', 'Gamma'):
+                    self.write(working, f'configs/custom_teams/{team}/{name}.py', f'class {name}: pass\n'.encode())
+                    self.write(working, f'configs/custom_teams/{team}/{name}.import.py', f'class {name}: pass\n'.encode())
+                self.write(working, f'configs/custom_teams/{team}/team.json', b'{"code_mode":"import"}')
+                marker = portable / 'configuration-imported'
+                (working / 'config.py').write_text(
+                    'import json,sys\nfrom pathlib import Path\n'
+                    f'Path({str(marker)!r}).write_bytes(b"imported")\nsys.path.append({str(repo)!r})\n'
+                    'from ok.util.config import Config\n'
+                    'from src.char.CustomCharLoader import list_custom_teams,get_team_code_mode,get_team_import_file\n'
+                    'accounts=Config("MultiAccountConfig", {"accounts":[],"enabled":True})\n'
+                    'team=list_custom_teams()[0]\n'
+                    'print(json.dumps({"accounts":dict(accounts),"team":team,"mode":get_team_code_mode(team),'
+                    '"code":get_team_import_file(team,"Alpha").read_text()}))\nraise SystemExit(0)\n', encoding='utf-8')
+                result = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(working / 'main.py')],
+                                        cwd=working, env=process_environment(), capture_output=True, text=True,
+                                        encoding='utf-8', timeout=30, **hidden_process_options())
+                if broken:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(account.read_bytes(), b'{broken')
+                    self.assertFalse((portable / 'data/user/NoNo/configs/MultiAccountConfig.json').exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    observed = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertEqual(observed['accounts'], {'accounts': ['synthetic'], 'enabled': False})
+                    self.assertEqual(observed['team'], ['Alpha', 'Beta', 'Gamma'])
+                    self.assertEqual(observed['mode'], 'import')
+                    self.assertEqual(observed['code'], 'class Alpha: pass\n')
+
+    def test_schedule_cache_and_pending_plugin_recovery_consume_migrated_data(self):
+        from ok.core.plugin_staging import apply_pending_plugin_changes, pending_plugin_changes
+        from ok.util.windows_schedule import WindowsScheduleCache, ScheduleTaskInfo
+        task = ScheduleTaskInfo(name='旧计划', path='\\NoNo\\旧计划', enabled=True,
+                                task_identifier='ok_tasks.SyntheticTask', last_result=7)
+        self.write(self.working, '.ok_cache/schedule_tasks_cache.json',
+                   json.dumps({'legacy-task': task.to_dict()}, ensure_ascii=False).encode())
+        self.write(self.working, 'ok_import/sample/current.py', b'unconfirmed version')
+        self.write(self.working, 'ok_import/.plugin-staging/sample/previous/current.py', b'previous version')
+        operation = {'namespace': 'sample', 'action': 'update', 'phase': 'validating', 'had_previous': True}
+        self.write(self.working, 'ok_import/.plugin-staging/sample/operation.json', json.dumps(operation).encode())
+        self.prepare()
+        cache = WindowsScheduleCache({'config_folder': str(self.user / 'configs')})
+        self.assertEqual(cache.get_all(), [task])
+        self.assertEqual(pending_plugin_changes()['sample']['phase'], 'validating')
+        result = apply_pending_plugin_changes()
+        self.assertEqual(result['sample']['phase'], 'failed')
+        self.assertEqual((self.user / 'ok_import/sample/current.py').read_bytes(), b'previous version')
+        self.assertEqual((self.user / 'ok_import/.plugin-staging/sample/incoming/current.py').read_bytes(),
+                         b'unconfirmed version')
+
+
+
+class TestUserTaskImportRecovery(unittest.TestCase):
+    def test_failed_binding_restores_old_modules_and_paths(self):
+        from ok import og
+        from ok.core.task_manager import TaskManager
+
+        for legacy_kind in ('missing', 'namespace', 'regular'):
+            with self.subTest(legacy_kind=legacy_kind), \
+                    tempfile.TemporaryDirectory(prefix='任务导入回滚-') as temporary:
+                root = Path(temporary).resolve()
+                user = root / 'user'
+                tasks = user / 'ok_tasks'
+                working = root / 'working'
+                legacy = root / 'previous' / 'ok_tasks'
+                working.mkdir()
+                (working / 'ConsumerReviewAppModule.py').write_text("VALUE = '应用模块'\n", encoding='utf-8')
+                self._write_helpers(tasks, '稳定值')
+                (tasks / '__init__.py').write_text(self._initializer(fail=True), encoding='utf-8')
+                paths = [str(working), *sys.path]
+                if legacy_kind != 'missing':
+                    self._write_helpers(legacy, '旧版值')
+                    if legacy_kind == 'regular':
+                        (legacy / '__init__.py').write_text("VALUE = '旧包'\n", encoding='utf-8')
+                    paths[1:1] = [str(legacy.parent), str(legacy)]
+                with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(user)}), \
+                        patch.object(sys, 'path', paths), patch.dict(sys.modules), \
+                        patch.object(og, 'config', {'custom_tasks': True}), \
+                        patch.object(TaskManager, 'load_imported_tasks'):
+                    self._clear_probe_modules()
+                    if legacy_kind != 'missing':
+                        importlib.import_module('ok_tasks.helpers.nested')
+                        importlib.import_module('ConsumerReviewBareHelper')
+                    previous_paths = list(sys.path)
+                    previous_modules = {name: module for name, module in sys.modules.items()
+                                        if self._is_task_probe(name)}
+                    with self.assertRaisesRegex(RuntimeError, '合成包初始化失败'):
+                        TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                    self.assertEqual(sys.path, previous_paths)
+                    current_modules = {name: module for name, module in sys.modules.items()
+                                       if self._is_task_probe(name)}
+                    self.assertEqual(current_modules, previous_modules)
+                    if legacy_kind != 'missing':
+                        self.assertIs(sys.modules['ok_tasks'].helpers, previous_modules['ok_tasks.helpers'])
+                        self.assertEqual(list(sys.modules['ok_tasks.helpers'].__path__),
+                                         [str(legacy / 'helpers')])
+                    # 失败包顺带导入的普通应用模块不属于任务绑定回滚范围。
+                    self.assertEqual(sys.modules['ConsumerReviewAppModule'].VALUE, '应用模块')
+
+    def test_failed_binding_retries_namespace_and_bare_helpers(self):
+        from ok import og
+        from ok.core.task_manager import TaskManager
+
+        with tempfile.TemporaryDirectory(prefix='任务导入回滚-') as temporary:
+            root = Path(temporary).resolve()
+            user = root / 'user'
+            tasks = user / 'ok_tasks'
+            working = root / 'working'
+            working.mkdir()
+            (working / 'ConsumerReviewAppModule.py').write_text("VALUE = '应用模块'\n", encoding='utf-8')
+            self._write_helpers(tasks, '失败尝试的旧值')
+            (tasks / '__init__.py').write_text(self._initializer(fail=True), encoding='utf-8')
+            with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(user)}), \
+                    patch.object(sys, 'path', [str(working), *sys.path]), patch.dict(sys.modules), \
+                    patch.object(og, 'config', {'custom_tasks': True}), \
+                    patch.object(TaskManager, 'load_imported_tasks'):
+                self._clear_probe_modules()
+                with self.assertRaisesRegex(RuntimeError, '合成包初始化失败'):
+                    TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                self._write_helpers(tasks, '更正后的稳定值')
+                (tasks / '__init__.py').write_text(self._initializer(fail=False), encoding='utf-8')
+                manager = TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                self.assertEqual(manager.task_errors, {})
+                self.assertEqual(sys.modules['ok_tasks'].OBSERVED, ('更正后的稳定值', '更正后的稳定值'))
+
+    def test_failed_bare_package_restores_nested_namespace_before_retry(self):
+        from ok import og
+        from ok.core.task_manager import TaskManager
+
+        for imported_leaf in (False, True):
+            with self.subTest(imported_leaf=imported_leaf), \
+                    tempfile.TemporaryDirectory(prefix='任务导入回滚-') as temporary:
+                root = Path(temporary).resolve()
+                user = root / 'user'
+                tasks = user / 'ok_tasks'
+                bare_package = tasks / 'ConsumerReviewBarePackage'
+                (bare_package / 'helpers').mkdir(parents=True)
+                nested = bare_package / 'helpers/nested.py'
+                nested.write_text("VALUE = '失败前'\n", encoding='utf-8')
+                (tasks / '__init__.py').write_text('import ConsumerReviewBarePackage\n', encoding='utf-8')
+                import_statement = ('from .helpers.nested import VALUE\n' if imported_leaf
+                                    else 'from . import helpers\n')
+                (bare_package / '__init__.py').write_text(
+                    import_statement + "raise RuntimeError('合成辅助包失败')\n", encoding='utf-8')
+                with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(user)}), \
+                        patch.object(sys, 'path', list(sys.path)), patch.dict(sys.modules), \
+                        patch.object(og, 'config', {'custom_tasks': True}), \
+                        patch.object(TaskManager, 'load_imported_tasks'):
+                    self._clear_probe_modules()
+                    previous_paths = list(sys.path)
+                    with self.assertRaisesRegex(RuntimeError, '合成辅助包失败'):
+                        TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                    self.assertEqual(sys.path, previous_paths)
+                    self.assertFalse(any(self._is_task_probe(name) for name in sys.modules))
+                    nested.write_text("VALUE = '更正后的稳定值'\n", encoding='utf-8')
+                    (bare_package / '__init__.py').write_text(
+                        'from .helpers.nested import VALUE\n', encoding='utf-8')
+                    TaskManager(SimpleNamespace(), SimpleNamespace(debug=False))
+                    self.assertEqual(sys.modules['ConsumerReviewBarePackage'].VALUE, '更正后的稳定值')
+                    self.assertIs(sys.modules['ConsumerReviewBarePackage'].helpers,
+                                  sys.modules['ConsumerReviewBarePackage.helpers'])
+
+    @staticmethod
+    def _write_helpers(tasks, value):
+        (tasks / 'helpers').mkdir(parents=True, exist_ok=True)
+        (tasks / 'helpers/nested.py').write_text(f'VALUE = {value!r}\n', encoding='utf-8')
+        (tasks / 'ConsumerReviewBareHelper.py').write_text(f'VALUE = {value!r}\n', encoding='utf-8')
+
+    @staticmethod
+    def _initializer(*, fail):
+        source = ('import ConsumerReviewAppModule\n'
+                  'from .helpers.nested import VALUE as nested_value\n'
+                  'from ConsumerReviewBareHelper import VALUE as bare_value\n'
+                  'OBSERVED = (nested_value, bare_value)\n')
+        return source + ("raise RuntimeError('合成包初始化失败')\n" if fail else '')
+
+    @staticmethod
+    def _is_task_probe(name):
+        return (name == 'ok_tasks' or name.startswith('ok_tasks.') or name == 'ConsumerReviewBareHelper'
+                or name == 'ConsumerReviewBarePackage' or name.startswith('ConsumerReviewBarePackage.'))
+
+    @classmethod
+    def _clear_probe_modules(cls):
+        for name in tuple(sys.modules):
+            if cls._is_task_probe(name) or name == 'ConsumerReviewAppModule':
+                sys.modules.pop(name)
+        importlib.invalidate_caches()
+
+
+class TestTaskExportFailure(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_export_dialog_reports_unreadable_manifest_without_opening_dialog(self):
+        from ok.ui.qt.tasks.EditTaskTab import EditTaskTab
+
+        module = importlib.import_module('ok.ui.qt.tasks.EditTaskTab')
+        with tempfile.TemporaryDirectory(prefix='界面读取恢复-') as temporary:
+            root = Path(temporary).resolve()
+            tasks = root / 'ok_tasks'
+            tasks.mkdir()
+            (tasks / 'probe.py').write_text('pass\n', encoding='utf-8')
+            manifest = tasks / 'manifest.json'
+            original = b'{"unfinished":'
+            manifest.write_bytes(original)
+            page = SimpleNamespace(tr=lambda value: value, _success=Mock())
+            with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(root)}), \
+                    patch('ok.ui.qt.util.Alert.alert_error') as alert, \
+                    patch.object(module, 'Dialog') as dialog:
+                EditTaskTab.show_export_dialog(page)
+                alert.assert_called_once()
+                self.assertIn('CONFIG_JSON_INVALID', alert.call_args.args[0])
+                dialog.assert_not_called()
+                page._success.assert_not_called()
+            self.assertEqual(manifest.read_bytes(), original)
+
+    def test_export_dialog_reports_commit_failure_without_success_or_output(self):
+        from PySide6.QtWidgets import QWidget
+
+        from ok.ui.qt.tasks.EditTaskTab import EditTaskTab
+
+        module = importlib.import_module('ok.ui.qt.tasks.EditTaskTab')
+        with tempfile.TemporaryDirectory(prefix='界面读取恢复-') as temporary:
+            root = Path(temporary).resolve()
+            tasks = root / 'ok_tasks'
+            tasks.mkdir()
+            (tasks / 'probe.py').write_text('pass\n', encoding='utf-8')
+            manifest = tasks / 'manifest.json'
+            original = b'{"file_name":"probe","script_name":"probe","version":"1.0","extension":null}'
+            manifest.write_bytes(original)
+            page = QWidget()
+            page._success = Mock()
+            try:
+                with patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(root)}), \
+                        patch('ok.ui.qt.util.Alert.alert_error') as alert, \
+                        patch.object(module.Dialog, 'exec', return_value=True), \
+                        patch.object(module, 'reveal_in_explorer') as reveal, \
+                        patch('ok.core.script_packager.get_downloads_folder', return_value=str(root / 'exports')) as output, \
+                        patch('os.replace', side_effect=PermissionError('合成提交拒绝')):
+                    EditTaskTab.show_export_dialog(page)
+                    alert.assert_called_once()
+                    self.assertIn('合成提交拒绝', alert.call_args.args[0])
+                    page._success.assert_not_called()
+                    reveal.assert_not_called()
+                    output.assert_not_called()
+                self.assertEqual(manifest.read_bytes(), original)
+                self.assertFalse((root / 'exports').exists())
+            finally:
+                page.close()
+                page.deleteLater()
+                self.app.processEvents()
+
+
+class TestTemplateReadFailure(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        import cv2
+        import numpy as np
+        from ok import Config
+
+        self.temporary = tempfile.TemporaryDirectory(prefix='界面读取恢复-')
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.enterContext(patch.dict(os.environ, {'NONO_USER_DATA_ROOT': str(self.root)}))
+        self.enterContext(patch.object(Config, 'config_folder', str(self.root / 'configs')))
+        self.module = importlib.import_module('ok.ui.qt.tasks.TemplateTab')
+        self.pool = Mock()
+        self.enterContext(patch.object(self.module.QThreadPool, 'globalInstance', return_value=self.pool))
+        thumbnails = self.enterContext(patch.object(self.module, 'WindowsThumbnailReader'))
+        thumbnails.return_value.open.return_value = False
+        self.alert = self.enterContext(patch('ok.ui.qt.util.Alert.alert_error'))
+        folder = self.root / 'ok_templates'
+        folder.mkdir()
+        self.image_path = folder / '0.png'
+        self.coco_path = folder / 'coco_annotations.json'
+        encoded, pixels = cv2.imencode('.png', np.zeros((8, 8, 3), dtype=np.uint8))
+        self.assertTrue(encoded)
+        pixels.tofile(self.image_path)
+        self.write_data('初始标注')
+        self.tab = self.module.TemplateTab(None)
+        self.tab.load_initial_grid()
+        self.pool.start.call_args.args[0].run()
+        self.tab.on_card_clicked(str(self.image_path))
+        self.previous = (self.tab.coco_data, tuple(self.tab.image_cards),
+                         tuple(item['path'] for item in self.tab._image_items), self.tab.selected_image)
+
+    def tearDown(self):
+        self.tab.close()
+        self.tab.deleteLater()
+        self.app.processEvents()
+
+    def write_data(self, marker):
+        self.coco_path.write_text(json.dumps({
+            'images': [{'id': 1, 'file_name': '0.png', 'width': 8, 'height': 8}],
+            'annotations': [], 'categories': [], 'info': {'marker': marker},
+        }), encoding='utf-8')
+
+    def assert_previous_display(self):
+        self.assertIs(self.tab.coco_data, self.previous[0])
+        self.assertEqual(tuple(self.tab.image_cards), self.previous[1])
+        self.assertEqual(tuple(item['path'] for item in self.tab._image_items), self.previous[2])
+        self.assertEqual(self.tab.selected_image, self.previous[3])
+
+    def test_template_read_failures_keep_display_and_allow_retry(self):
+        original = self.coco_path.read_bytes()
+        self.coco_path.write_bytes(b'{"unfinished":')
+        calls_before = self.pool.start.call_count
+        self.tab.load_initial_grid()
+        self.alert.assert_called_once()
+        self.assertEqual(self.pool.start.call_count, calls_before)
+        self.assert_previous_display()
+        self.assertFalse(self.tab._loaded)
+        self.assertEqual(self.coco_path.read_bytes(), b'{"unfinished":')
+
+        for failure in ('invalid', 'permission'):
+            with self.subTest(failure=failure):
+                self.coco_path.write_bytes(original)
+                self.alert.reset_mock()
+                self.tab.load_initial_grid()
+                runnable = self.pool.start.call_args.args[0]
+                self.assert_previous_display()
+                if failure == 'invalid':
+                    self.coco_path.write_bytes(b'{"unfinished":')
+                    runnable.run()
+                else:
+                    original_open = open
+
+                    def open_file(path, *args, **kwargs):
+                        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == self.coco_path:
+                            raise PermissionError('合成模板读取拒绝')
+                        return original_open(path, *args, **kwargs)
+
+                    with patch('builtins.open', open_file):
+                        runnable.run()
+                self.alert.assert_called_once()
+                self.assert_previous_display()
+                self.assertFalse(self.tab._loaded)
+                self.assertFalse(self.tab._grid_loading)
+                self.assertTrue(self.tab.progress_container.isHidden())
+                self.assertEqual(self.coco_path.read_bytes(),
+                                 b'{"unfinished":' if failure == 'invalid' else original)
+
+        self.alert.reset_mock()
+        self.write_data('重试成功')
+        self.tab.load_initial_grid()
+        self.pool.start.call_args.args[0].run()
+        self.alert.assert_not_called()
+        self.assertTrue(self.tab._loaded)
+        self.assertEqual(self.tab.coco_data['info']['marker'], '重试成功')
+        self.assertEqual(len(self.tab.image_cards), 1)
+
+    def test_outdated_template_read_failure_does_not_replace_current_load(self):
+        self.write_data('第一次加载')
+        self.tab.load_initial_grid()
+        previous_load = self.pool.start.call_args.args[0]
+        self.write_data('第二次加载')
+        self.tab.load_initial_grid()
+        current_load = self.pool.start.call_args.args[0]
+        self.coco_path.write_bytes(b'{"unfinished":')
+        previous_load.run()
+        self.alert.assert_not_called()
+        self.assert_previous_display()
+        self.assertTrue(self.tab._grid_loading)
+        self.write_data('第二次加载')
+        current_load.run()
+        self.assertEqual(self.tab.coco_data['info']['marker'], '第二次加载')
+        self.assertEqual(len(self.tab.image_cards), 1)
+        self.assertFalse(self.tab._grid_loading)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import shutil
@@ -26,7 +27,21 @@ def canonical(value: object) -> bytes:
 def adaptation_inputs() -> dict[str, str]:
     files = [*LAUNCHER_ROOT.glob("patches/*.patch"), *LAUNCHER_ROOT.glob("adapters/*.rs"),
              LAUNCHER_ROOT / "Cargo.lock"]
-    return {path.relative_to(LAUNCHER_ROOT).as_posix(): sha256(path) for path in sorted(files)}
+    inputs = {path.relative_to(LAUNCHER_ROOT).as_posix(): sha256(path) for path in sorted(files)}
+    inputs['../selfhost/user_data.py'] = sha256(LAUNCHER_ROOT.parent / 'selfhost/user_data.py')
+    return inputs
+
+
+def user_data_roots() -> tuple[str, ...]:
+    # 从共享核心的字面量生成 Rust 名单，不导入或执行被打包的 Python 代码。
+    source = (LAUNCHER_ROOT.parent / 'selfhost/user_data.py').read_text(encoding='utf-8')
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'FIXED_USER_ROOTS'
+                                               for target in node.targets):
+            roots = ast.literal_eval(node.value)
+            if isinstance(roots, tuple) and roots and all(isinstance(name, str) for name in roots):
+                return roots
+    raise RuntimeError('共享用户目录合同缺失。')
 
 
 def record_pin() -> dict:
@@ -93,6 +108,8 @@ def apply(root: Path, kind: str) -> None:
         }
         content = "// 由固定源码适配 hook 生成，用于校验 EXE 与便携载荷是否配套。\n"
         content += "".join(f'pub(crate) const {key}: &str = "{value}";\n' for key, value in constants.items())
+        content += 'pub(crate) const USER_ROOTS: &[&str] = &[\n'
+        content += ''.join(f'    {json.dumps(name)},\n' for name in user_data_roots()) + '];\n'
         (root / "src-tauri/src/nono_build.rs").write_text(content, encoding="utf-8", newline="\n")
         (root / ".nono-source-proof.json").write_text(
             json.dumps({"schema_version": 1, "source_files": source_files, **constants},

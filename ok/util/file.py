@@ -17,7 +17,7 @@ def _reject_nonfinite_json(value):
 def read_json_file(file_path, *, strict=False) -> dict | None:
     """严格模式用于用户配置：只有文件不存在才能回退默认值。"""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             data = json.load(f, parse_constant=_reject_nonfinite_json if strict else None)
     except FileNotFoundError:
         return None
@@ -109,7 +109,18 @@ def get_user_data_path(*files, base_path=None):
         return legacy_path
     if not os.path.isabs(user_root):
         raise ValueError('用户数据根目录必须是绝对路径（USER_DATA_ROOT_INVALID）')
-    relative = os.path.join(*files)
+    migration = sys.modules.get('selfhost.user_data')
+    if os.environ.get('NONO_RUNTIME_LEASE', '').startswith(f'{os.getpid()}:'):
+        # 原生 -m/-c 入口也已完成握手；首次动态目录请求接续经核验的宿主读租约。
+        if migration is None:
+            from selfhost import user_data as migration
+        if migration.current_project_path() is None:
+            migration.bootstrap_user_data()
+    project = (migration.current_project_path() if migration else None) or os.getcwd()
+    # MCP 可显式查询其它项目；外部 base_path 不能被当前实例的稳定目录遮蔽。
+    if base_path is not None and os.path.normcase(os.path.realpath(base_path)) != os.path.normcase(os.path.realpath(project)):
+        return legacy_path
+    relative = os.path.join(*files) if files else '.'
     if os.path.isabs(relative):
         return legacy_path
     root = os.path.normpath(user_root)
@@ -120,6 +131,8 @@ def get_user_data_path(*files, base_path=None):
             return legacy_path
     except ValueError:
         return legacy_path
+    if migration is not None:
+        migration.prepare_requested_root(os.path.relpath(candidate, root), base_path=base_path)
     return candidate
 
 
@@ -266,13 +279,13 @@ def clear_folder(folder_path):
     # Delete all files in the folder
     try:
         shutil.rmtree(folder_path)
-    except OSError as e:
+    except OSError:
         # Retry mechanism: Windows sometimes locks the folder briefly
         # logger.error(f"Error removing tree: {e}. Retrying in 1s...")
         time.sleep(1)
         try:
             shutil.rmtree(folder_path)
-        except Exception as e2:
+        except Exception:
             # logger.error(f"Failed to delete folder: {e2}")
             # If we can't delete the folder, fall back to the old method
             # (clearing contents manually) only as a last resort.
@@ -282,7 +295,7 @@ def clear_folder(folder_path):
     try:
         os.makedirs(folder_path)
         # logger.info(f"Successfully cleared (recreated) {folder_path}")
-    except Exception as e:
+    except Exception:
         pass
         # logger.error(f"Deleted folder but failed to recreate it: {e}")
 

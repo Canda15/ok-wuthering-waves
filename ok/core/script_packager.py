@@ -6,7 +6,7 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from ok.util.file import get_downloads_folder, get_user_data_path
+from ok.util.file import get_downloads_folder, get_user_data_path, read_json_file, write_json_file
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
@@ -27,30 +27,22 @@ def get_ok_import_folder():
 
 
 def load_manifest(folder=None):
-    """Load manifest.json from the given folder (default: ok_tasks)."""
+    """仅在任务清单不存在时使用空清单，损坏或读取失败交给调用者处理。"""
     if folder is None:
         folder = get_ok_tasks_folder()
     manifest_path = os.path.join(folder, MANIFEST_FILE)
-    if os.path.exists(manifest_path):
-        try:
-            with open(manifest_path, 'r', encoding='utf-8-sig') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load manifest: {e}")
-    return {}
+    manifest = read_json_file(manifest_path, strict=True)
+    return {} if manifest is None else manifest
 
 
 def save_manifest(manifest, folder=None):
-    """Save manifest.json to the given folder (default: ok_tasks)."""
+    """原子提交任务清单，保存失败时保留已有字节并向上传递错误。"""
+    if not isinstance(manifest, dict):
+        raise ValueError('任务清单必须是 JSON 对象（TASK_MANIFEST_OBJECT_REQUIRED）')
     if folder is None:
         folder = get_ok_tasks_folder()
-    os.makedirs(folder, exist_ok=True)
     manifest_path = os.path.join(folder, MANIFEST_FILE)
-    try:
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to save manifest: {e}")
+    write_json_file(manifest_path, manifest)
 
 
 def get_task_files(folder=None):

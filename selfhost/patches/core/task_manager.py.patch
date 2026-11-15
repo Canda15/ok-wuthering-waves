@@ -1,6 +1,14 @@
 --- a/core/task_manager.py
 +++ b/core/task_manager.py
-@@ -12,6 +12,7 @@
+@@ -2,6 +2,7 @@
+ import glob
+ import hashlib
+ import importlib
++import importlib.machinery
+ import importlib.util
+ import inspect
+ import os.path
+@@ -12,6 +13,7 @@
  
  from ok import og
  from ok.core.events import communicate
@@ -8,7 +16,7 @@
  from ok.task.task import BaseTask, TriggerTask
  from ok.util.clazz import init_class_by_name
  from ok.util.logger import Logger
-@@ -30,7 +31,7 @@
+@@ -30,7 +32,7 @@
          self.custom_tasks_enabled = og.config.get('custom_tasks', False)
          self.task_folder = None
          if self.custom_tasks_enabled:
@@ -17,3 +25,113 @@
              if not os.path.exists(self.task_folder):
                  os.makedirs(self.task_folder)
          self.has_custom = self.custom_tasks_enabled or (self.task_folder and os.path.exists(self.task_folder))
+@@ -61,12 +63,93 @@
+ 
+     def load_user_tasks(self):
+         if self.task_folder and os.path.exists(self.task_folder):
+-            if self.task_folder not in sys.path:
+-                sys.path.append(self.task_folder)
++            self._bind_user_task_imports()
+             python_files = glob.glob(os.path.join(self.task_folder, '*.py'))
+             logger.info(f"Found tasks: {python_files}")
+             for python_file in python_files:
+                 self.load_single_user_task(python_file)
++
++    def _bind_user_task_imports(self):
++        """把自定义任务包和裸模块限定到当前任务根，隔离升级前的工作副本。"""
++        task_root = Path(self.task_folder).resolve()
++        package = sys.modules.get('ok_tasks')
++        package_paths = [Path(path).resolve() for path in getattr(package, '__path__', ())]
++        roots = {path for path in package_paths if path.name.casefold() == 'ok_tasks'}
++        for entry in sys.path:
++            if not isinstance(entry, str):
++                continue
++            path = Path(entry or os.getcwd()).resolve()
++            if path.name.casefold() == 'ok_tasks':
++                roots.add(path)
++            elif (path / 'ok_tasks').is_dir():
++                roots.add((path / 'ok_tasks').resolve())
++        old_roots = roots - {task_root}
++        rebind_package = package is None or package_paths != [task_root]
++
++        def from_roots(module, search_roots):
++            source = getattr(module, '__file__', None)
++            module_paths = getattr(module, '__path__', ())
++            if isinstance(getattr(module, '__loader__', None), importlib.machinery.NamespaceLoader):
++                # CPython 在父包导入失败后仍保留 namespace；读取其已记录路径，避免重新解析缺失父包。
++                module_paths = getattr(module_paths, '_path', module_paths)
++            locations = ([source] if source else []) + list(module_paths)
++            return any(Path(location).resolve().is_relative_to(root)
++                       for location in locations for root in search_roots)
++
++        def detach_modules(modules):
++            attributes = []
++            for name, module in modules:
++                sys.modules.pop(name, None)
++                parent_name, _, attribute = name.rpartition('.')
++                parent = sys.modules.get(parent_name)
++                if parent is not None and getattr(parent, attribute, None) is module:
++                    delattr(parent, attribute)
++                    attributes.append((parent, attribute, module))
++            return attributes
++
++        stale_modules = []
++        for name, module in tuple(sys.modules.items()):
++            # 父包上次初始化失败时可能已被移除，不能先迭代其 namespace 子包路径。
++            if ((rebind_package and (name == 'ok_tasks' or name.startswith('ok_tasks.')))
++                    or from_roots(module, old_roots)):
++                stale_modules.append((name, module))
++        # 先取得全部 namespace 路径；先删父包会让子包重新解析 __path__ 时找不到父模块。
++        previous_modules = dict(sys.modules)
++        previous_paths = list(sys.path)
++        detached_attributes = detach_modules(stale_modules)
++        try:
++            # 仅保留任务目录的裸导入兼容性，不把整个用户根加入应用模块的搜索范围。
++            sys.path[:] = [entry for entry in sys.path
++                           if not isinstance(entry, str) or Path(entry or os.getcwd()).resolve() not in old_roots]
++            if not any(isinstance(entry, str) and Path(entry or os.getcwd()).resolve() == task_root
++                       for entry in sys.path):
++                sys.path.append(str(task_root))
++            importlib.invalidate_caches()
++            if rebind_package:
++                initializer = task_root / '__init__.py'
++                if initializer.is_file():
++                    self._load_source_module('ok_tasks', initializer)
++                else:
++                    # 固定 namespace 的搜索位置，避免 Python 从旧 working 再合并同名目录。
++                    spec = importlib.machinery.ModuleSpec('ok_tasks', loader=None, is_package=True)
++                    spec.submodule_search_locations = [str(task_root)]
++                    sys.modules['ok_tasks'] = importlib.util.module_from_spec(spec)
++        except BaseException:
++            # 初始化失败会留下已导入的子包和裸模块；只撤销本次任务绑定，保留其它应用导入。
++            failed_modules = []
++            for name, module in tuple(sys.modules.items()):
++                if name in previous_modules and previous_modules[name] is module:
++                    continue
++                if (name == 'ok_tasks' or name.startswith('ok_tasks.')
++                        or from_roots(module, old_roots | {task_root})):
++                    failed_modules.append((name, module))
++            detach_modules(failed_modules)
++            sys.modules.update(stale_modules)
++            for parent, attribute, module in detached_attributes:
++                setattr(parent, attribute, module)
++            sys.path[:] = previous_paths
++            importlib.invalidate_caches()
++            raise
+ 
+     def load_single_user_task(self, python_file, import_namespace=None, task_class=None, register=True):
+         instance = None
+@@ -532,7 +615,12 @@
+             return None
+ 
+         module_name = os.path.splitext(os.path.basename(file_path))[0]
+-        module = self._load_source_module(module_name, file_path)
++        if (module_name == '__init__' and self.task_folder
++                and Path(file_path).resolve().parent == Path(self.task_folder).resolve()):
++            # 包初始化已在绑定阶段执行，其中定义的任务类也只使用这一份模块状态。
++            module = sys.modules['ok_tasks']
++        else:
++            module = self._load_source_module(module_name, file_path)
+ 
+         for cls_name in classes:
+             cls_obj = getattr(module, cls_name, None)

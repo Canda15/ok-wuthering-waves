@@ -73,7 +73,7 @@
       "format": "unified_diff",
       "payload": "patches/core/script_packager.py.patch",
       "before_sha256": "ff3d07e27fc292e1e23fe1c5e0f761da1b26eafc2efe95e5632f78f01f90c8e0",
-      "after_sha256": "7e232549b0fea1efbfb4ae648b46865d111feb3e16d302ab6e9c215584339236"
+      "after_sha256": "72e7866c5d4d0c65c2ee36009d65bf619be0be9b87d2050de8b4d5f94bc9c677"
     },
     {
       "path": "core/start_controller.py",
@@ -89,7 +89,7 @@
       "format": "unified_diff",
       "payload": "patches/core/task_manager.py.patch",
       "before_sha256": "038648736a90c965b8832f0d145797ba6072571de091a40ad383935862128a20",
-      "after_sha256": "79476bd3eed19e7082c72d39e17af1424a88ec78b2b4115016951c3c28c141ec"
+      "after_sha256": "c9dadd5d3f423e00d90ff7f2682bb5ce50f1c5c4289ff0edb7b4acc327e80272"
     },
     {
       "path": "core/template_store.py",
@@ -97,7 +97,7 @@
       "format": "unified_diff",
       "payload": "patches/core/template_store.py.patch",
       "before_sha256": "1fb26460d82a7f46f1f25a37716ce174214564ac47a39f53331323660f9c0d77",
-      "after_sha256": "190641bfe42923007183214ecd26d2611c12e54c65692f1fa6e93ec8482e46df"
+      "after_sha256": "e6853c2d56a040d74c515f7557efe82818997b712fa002fd0e2c466fe44ae283"
     },
     {
       "path": "device/DeviceManager.py",
@@ -388,12 +388,20 @@
       "after_sha256": "10a4dd9b139082c4c45f8427bc830c9d2998c411fd4f409f9529276f7afc9749"
     },
     {
+      "path": "ui/qt/tasks/EditTaskTab.py",
+      "operation": "modify",
+      "format": "unified_diff",
+      "payload": "patches/ui/qt/tasks/EditTaskTab.py.patch",
+      "before_sha256": "16a3db9c34ad7aff4d58141f3f05695284ea4420481dcd170143aef19574646f",
+      "after_sha256": "0a6dd0c714d4c87554c2ee4d2d7d9d17673278eddafaa491b344b51f90115ee3"
+    },
+    {
       "path": "ui/qt/tasks/TemplateTab.py",
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/ui/qt/tasks/TemplateTab.py.patch",
       "before_sha256": "d4b5a53d2d382fb5c7695c41869c931aeb298d13127c0bbbcb9b61ae5bdad6ef",
-      "after_sha256": "8f6b350bcfbc905189ef8a5227c8878eea5da7d25831f695b96bfeb1b22f9c68"
+      "after_sha256": "62e7eea6e0f08181943d5920a127348f66118c22a91fb926cd8b31a3588c1a90"
     },
     {
       "path": "ui/qt/tasks/schedule_index_sync.py",
@@ -441,7 +449,7 @@
       "format": "unified_diff",
       "payload": "patches/util/file.py.patch",
       "before_sha256": "8d4d3a9fe6b62fb3f17107c29ec0b816c61a69eff15803bf6297e26f8996b715",
-      "after_sha256": "604290bcab6f660f54eb0e711cb5214eeb1a6b5bf88c80a3c895119ce7acf0c0"
+      "after_sha256": "d486939b1fa784360835c665febab86106fd724c810266e26edb5f3c3fbdb513"
     },
     {
       "path": "util/logger.py",

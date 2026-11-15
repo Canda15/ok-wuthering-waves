@@ -950,7 +950,11 @@ class {class_name}({base_class}):
             alert_error(self.tr("No tasks to export."))
             return
 
-        manifest = load_manifest()
+        try:
+            manifest = load_manifest()
+        except Exception as error:
+            alert_error(f"{self.tr('Export failed')}: {error}")
+            return
         dialog = Dialog(self, self.tr('Export Script'), ok_text=self.tr('Export'), cancel_text=self.tr('Cancel'),
                         width=480)
         panel = dialog.panel
@@ -1009,7 +1013,11 @@ class {class_name}({base_class}):
             alert_error(self.tr('Please select at least one task to export.'))
             return
 
-        success, message, output_path = export_script(selected, file_name, script_name, version)
+        try:
+            success, message, output_path = export_script(selected, file_name, script_name, version)
+        except Exception as error:
+            alert_error(f"{self.tr('Export failed')}: {error}")
+            return
         if success:
             self._success(self.tr('Script exported successfully to Downloads folder.'))
             reveal_in_explorer(output_path)

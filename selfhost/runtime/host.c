@@ -11,6 +11,7 @@
 #define PATH_CAPACITY 32768
 
 typedef int (__cdecl *PythonMain)(int, wchar_t **);
+typedef void (__cdecl *PythonSetHome)(const wchar_t *);
 static HANDLE runtime_lease = INVALID_HANDLE_VALUE;
 
 static BOOL checked_directory_chain(const wchar_t *path)
@@ -70,6 +71,92 @@ static BOOL ensure_portable_directory(const wchar_t *root, const wchar_t *relati
     return SUCCEEDED(StringCchCopyW(destination, capacity, current));
 }
 
+static BOOL migrate_and_acquire_runtime(const wchar_t *project, const wchar_t *lease_path)
+{
+    static wchar_t executable[PATH_CAPACITY];
+    static wchar_t command[PATH_CAPACITY];
+    SECURITY_ATTRIBUTES attributes = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    STARTUPINFOW startup = {0};
+    PROCESS_INFORMATION process = {0};
+    HANDLE input_read = NULL, input_write = NULL, output_read = NULL, output_write = NULL;
+    HANDLE error_output = NULL;
+    HANDLE inherited_error = GetStdHandle(STD_ERROR_HANDLE);
+    BY_HANDLE_FILE_INFORMATION information;
+    DWORD count, exit_code;
+    char signal;
+    BOOL success = FALSE;
+
+    if (GetModuleFileNameW(NULL, executable, _countof(executable)) == 0 ||
+        FAILED(StringCchPrintfW(command, _countof(command), L"\"%s\" --nono-bootstrap-helper", executable)) ||
+        !CreatePipe(&input_read, &input_write, &attributes, 0) ||
+        !CreatePipe(&output_read, &output_write, &attributes, 0) ||
+        !SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0)) {
+        goto cleanup;
+    }
+    if (inherited_error != NULL && inherited_error != INVALID_HANDLE_VALUE) {
+        if (!DuplicateHandle(GetCurrentProcess(), inherited_error, GetCurrentProcess(), &error_output,
+                             0, TRUE, DUPLICATE_SAME_ACCESS)) {
+            goto cleanup;
+        }
+    } else {
+        error_output = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (error_output == INVALID_HANDLE_VALUE) {
+            error_output = NULL;
+            goto cleanup;
+        }
+    }
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = input_read;
+    startup.hStdOutput = output_write;
+    startup.hStdError = error_output;
+    /* 辅助进程仍使用 NoNo.exe 身份，只能进入固定标准库脚本，不能执行任意业务参数。 */
+    if (!CreateProcessW(executable, command, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, project, &startup, &process)) {
+        goto cleanup;
+    }
+    CloseHandle(input_read);
+    input_read = NULL;
+    CloseHandle(output_write);
+    output_write = NULL;
+    CloseHandle(error_output);
+    error_output = NULL;
+    if (!ReadFile(output_read, &signal, 1, &count, NULL) || count != 1 || signal != 'R') {
+        goto cleanup;
+    }
+    /* 辅助仍持 receive 独占及 runtime 共享；先接续共享租约，再回执释放接收锁。 */
+    runtime_lease = CreateFileW(lease_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (runtime_lease == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(runtime_lease, &information) ||
+        (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        information.nNumberOfLinks != 1) {
+        goto cleanup;
+    }
+    signal = 'A';
+    if (!WriteFile(input_write, &signal, 1, &count, NULL) || count != 1 ||
+        WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(process.hProcess, &exit_code) || exit_code != 0) {
+        goto cleanup;
+    }
+    success = TRUE;
+cleanup:
+    if (input_read != NULL) CloseHandle(input_read);
+    if (input_write != NULL) CloseHandle(input_write);
+    if (output_read != NULL) CloseHandle(output_read);
+    if (output_write != NULL) CloseHandle(output_write);
+    if (error_output != NULL) CloseHandle(error_output);
+    if (process.hThread != NULL) CloseHandle(process.hThread);
+    if (process.hProcess != NULL) CloseHandle(process.hProcess);
+    if (!success && runtime_lease != INVALID_HANDLE_VALUE) {
+        CloseHandle(runtime_lease);
+        runtime_lease = INVALID_HANDLE_VALUE;
+    }
+    return success;
+}
+
 static BOOL portable_user_environment(const wchar_t *project)
 {
     const wchar_t suffix[] = L"\\data\\apps\\NoNo\\working";
@@ -79,9 +166,9 @@ static BOOL portable_user_environment(const wchar_t *project)
     static wchar_t state[PATH_CAPACITY];
     static wchar_t pending[PATH_CAPACITY];
     static wchar_t lease_path[PATH_CAPACITY];
+    wchar_t lease_identity[96];
     size_t length = wcslen(project);
     DWORD resolved;
-    BY_HANDLE_FILE_INFORMATION lease_information;
 
     /* 源码开发宿主使用原来的项目路径；仅正式便携布局启用稳定根和安装租约。 */
     if (length < _countof(suffix) - 1 ||
@@ -101,19 +188,14 @@ static BOOL portable_user_environment(const wchar_t *project)
         FAILED(StringCchPrintfW(pending, _countof(pending), L"%s\\receive.pending", state))) {
         return FALSE;
     }
-    /* 读租约可在本应用辅助子进程间共享；接收器的独占租约禁止迁移时启动业务。 */
-    runtime_lease = CreateFileW(lease_path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (runtime_lease == INVALID_HANDLE_VALUE) {
-        return FALSE;
-    }
-    if (!GetFileInformationByHandle(runtime_lease, &lease_information) ||
-        (lease_information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        lease_information.nNumberOfLinks != 1 ||
+    if (!migrate_and_acquire_runtime(project, lease_path) ||
         GetFileAttributesW(pending) != INVALID_FILE_ATTRIBUTES ||
         !ensure_portable_directory(root, L"data\\user\\NoNo", user, _countof(user)) ||
-        _wputenv_s(L"NONO_USER_DATA_ROOT", user) != 0) {
-        CloseHandle(runtime_lease);
+        FAILED(StringCchPrintfW(lease_identity, _countof(lease_identity), L"%lu:%llu",
+                               GetCurrentProcessId(), (unsigned long long)(UINT_PTR)runtime_lease)) ||
+        _wputenv_s(L"NONO_USER_DATA_ROOT", user) != 0 ||
+        _wputenv_s(L"NONO_RUNTIME_LEASE", lease_identity) != 0) {
+        if (runtime_lease != INVALID_HANDLE_VALUE) CloseHandle(runtime_lease);
         runtime_lease = INVALID_HANDLE_VALUE;
         return FALSE;
     }
@@ -170,10 +252,12 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previous,
     wchar_t **python_arguments;
     HMODULE library;
     PythonMain python_main;
+    PythonSetHome python_set_home;
     DWORD length;
     int argument_count;
     int result;
     int i;
+    BOOL bootstrap_helper;
 
     UNREFERENCED_PARAMETER(instance);
     UNREFERENCED_PARAMETER(previous);
@@ -196,10 +280,20 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previous,
     }
     *separator = L'\0';
 
-    if (!SetCurrentDirectoryW(project)) {
+    if (!checked_directory_chain(project) || !SetCurrentDirectoryW(project)) {
         return startup_error(L"无法进入程序目录，请重新解压完整的 NoNo 便携包。");
     }
-    if (!portable_user_environment(project)) {
+    arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    if (arguments == NULL) {
+        return startup_error(L"无法读取启动参数，请关闭后重新启动 NoNo。");
+    }
+    bootstrap_helper = argument_count > 1 && wcscmp(arguments[1], L"--nono-bootstrap-helper") == 0;
+    if (bootstrap_helper && (argument_count != 2 ||
+        GetFileType(GetStdHandle(STD_INPUT_HANDLE)) != FILE_TYPE_PIPE ||
+        GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE)) {
+        return startup_error(L"用户数据保护入口只能由宿主通过固定握手调用。");
+    }
+    if (!bootstrap_helper && !portable_user_environment(project)) {
         return startup_error(L"便携环境正在迁移或路径不安全，请退出后从根目录重新启动 NoNo。");
     }
     if (FAILED(StringCchPrintfW(candidate, _countof(candidate), L"%s\\..\\python", project)) ||
@@ -208,6 +302,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previous,
     }
     length = GetFullPathNameW(candidate, _countof(runtime), runtime, NULL);
     if (length == 0 || length >= _countof(runtime) ||
+        !checked_directory_chain(runtime) ||
         FAILED(StringCchPrintfW(library_path, _countof(library_path), L"%s\\python3.dll", runtime))) {
         return startup_error(L"无法定位程序运行时，请重新解压完整的 NoNo 便携包。");
     }
@@ -228,19 +323,26 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previous,
 #pragma warning(push)
 #pragma warning(disable: 4191)
     python_main = (PythonMain)GetProcAddress(library, "Py_Main");
+    python_set_home = (PythonSetHome)GetProcAddress(library, "Py_SetPythonHome");
 #pragma warning(pop)
-    if (python_main == NULL) {
+    if (python_main == NULL || python_set_home == NULL) {
         return startup_error(L"程序运行时不兼容，请重新下载完整的 NoNo 便携包。");
     }
 
-    arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
-    if (arguments == NULL) {
-        return startup_error(L"无法读取启动参数，请关闭后重新启动 NoNo。");
-    }
+    /* -I 会忽略 PYTHONHOME；使用稳定 ABI 固定受检运行时，辅助入口不加载 site。 */
+    python_set_home(runtime);
     /* 计划任务、提权重启及子进程继续兼容 sys.executable main.py / -m / -c。
      * 普通启动则自动加入 main.py，应用的 -t、-e、-h 等参数保持原样。
      */
-    if (argument_count > 1 && python_invocation(arguments[1])) {
+    if (bootstrap_helper) {
+        wchar_t *bootstrap_arguments[] = {
+            arguments[0], L"-I", L"-S", L"-B", L"-X", L"utf8", script, L"--native-bootstrap", project, NULL
+        };
+        if (FAILED(StringCchPrintfW(script, _countof(script), L"%s\\selfhost\\user_data.py", project))) {
+            return startup_error(L"用户数据保护入口路径过长。");
+        }
+        result = python_main(9, bootstrap_arguments);
+    } else if (argument_count > 1 && python_invocation(arguments[1])) {
         result = python_main(argument_count, arguments);
     } else {
         python_arguments = LocalAlloc(LMEM_FIXED, ((size_t)argument_count + 2) * sizeof(wchar_t *));

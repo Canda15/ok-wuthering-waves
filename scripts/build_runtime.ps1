@@ -42,8 +42,9 @@ $libraries = @(
 )
 New-Item -ItemType Directory -Path $buildPath -Force | Out-Null
 $iconPath = (Join-Path $projectPath 'icons\icon.ico').Replace('\', '/')
+$manifestPath = (Join-Path $sourcePath 'host.manifest').Replace('\', '/')
 [IO.File]::WriteAllText((Join-Path $buildPath 'runtime_resources.h'),
-    "#define APP_ICON `"$iconPath`"`n", [Text.UTF8Encoding]::new($false))
+    "#define APP_ICON `"$iconPath`"`n#define APP_MANIFEST `"$manifestPath`"`n", [Text.UTF8Encoding]::new($false))
 $resourcePath = Join-Path $buildPath 'host.res'
 $resourceArguments = @('/nologo', '/c65001', '/fo', $resourcePath)
 foreach ($include in $includes) { $resourceArguments += @('/I', $include) }

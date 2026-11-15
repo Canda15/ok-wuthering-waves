@@ -9,6 +9,8 @@ import stat
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from selfhost.user_data import FIXED_USER_ROOTS
+
 APP_NAME = "NoNo"
 ORIGIN = "https://github.com/Canda15/nono-update.git"
 MANIFEST_KEYS = {
@@ -19,9 +21,7 @@ MANIFEST_KEYS = {
 LAUNCHER_KEYS = {
     "version", "source_sha", "action_sha", "adaptation_sha256", "source_tree_sha256", "exe_sha256",
 }
-PRIVATE_WORKING_DIRS = {
-    "configs", "ok_tasks", "ok_import", "ok_templates", "screenshots", "logs",
-}
+PRIVATE_WORKING_DIRS = set(FIXED_USER_ROOTS)
 
 
 def canonical_json(value: object) -> bytes:
@@ -183,7 +183,7 @@ def required_files(app_name: str, bundle_id: str) -> set[str]:
         *(f"{incoming}/{relative}" for relative in (
             "repo/HEAD", "repo/config", "working/main.py", "working/config.py",
             "working/requirements.txt", "working/pyappify.yml", "working/selfhost/NoNo.exe",
-            "working/selfhost/ok_pin.json", "python/python.exe", "python/python3.dll",
+            "working/selfhost/ok_pin.json", "working/selfhost/user_data.py", "python/python.exe", "python/python3.dll",
             "python/python312.dll", "app-seed.json", "root/pyappify.yml", "root/build-info.json",
         )),
     }

@@ -28,7 +28,7 @@ PRIVATE_ENVIRONMENT = {
     "GITHUB_TOKEN", "GH_TOKEN", "CNB_TOKEN", "OK_GH", "SIGNPATH_API_TOKEN",
     "GEMINI_API_KEY", "AI_API_KEY", "MIRRORCHYANUPLOADTOKEN", "ACTIONS_RUNTIME_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
-    "NONO_USER_DATA_ROOT", "__COMPAT_LAYER",
+    "NONO_USER_DATA_ROOT", "NONO_RUNTIME_LEASE", "__COMPAT_LAYER",
 }
 
 PROBE_IMPORTS = ("ok", "selfhost", "pyappify", "ok.device.interaction_methods.foreground_input")
@@ -172,7 +172,8 @@ def prepare_snapshot(source: Path, destination: Path, version: str, build_root: 
     }
     framework_tracked = run(["git", "-C", str(source), "ls-files", "-z", "--", "ok",
                              ".update_repo_gitignore"], source).split("\0")
-    required_sources = {"main.py", "config.py", "requirements.txt", "pyappify.yml", "ok/__init__.py"}
+    required_sources = {"main.py", "config.py", "requirements.txt", "pyappify.yml", "ok/__init__.py",
+                        "selfhost/user_data.py"}
     required_framework = {
         relative for relative in framework_tracked if relative.startswith("ok/")
         and not IGNORED_DIR_NAMES & set(PurePosixPath(relative).parts)
@@ -543,6 +544,8 @@ def verify_package_reception(bundle: Path, manifest: dict, build_root: Path) -> 
         run([str(target / "NoNo.exe"), "--nono-receive-only"], target, timeout=1200)
         if app_json.read_bytes() != before:
             raise RuntimeError("同包重复接收覆盖了后来修改的用户偏好。")
+        # 一套安装及重复覆盖全部通过后再回收，避免两套完整运行时同时占用构建磁盘。
+        remove_tree(build_root, target.parent)
 
 
 def build_portable(source: Path, *, source_sha: str | None = None, release_tag: str | None = None,

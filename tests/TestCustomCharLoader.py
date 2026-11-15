@@ -14,13 +14,14 @@ from src.char.CustomCharLoader import (
     TEAM_CODE_MODE_BUILTIN, TEAM_CODE_MODE_IMPORT, TEAM_CODE_STATE_NONE, changed_import_members,
     clear_custom_char_cache, clear_team_char_cache, create_custom_team, delete_custom_team,
     drifted_team_members, export_custom_team,
-    get_custom_char_file, get_team_char_file, get_team_code_mode, get_team_import_file,
-    import_custom_team, inspect_team_archive, list_custom_teams, load_custom_char_class,
+    get_custom_char_file, get_custom_char_modes_file,
+    get_team_char_file, get_team_code_mode, get_team_import_file,
+    import_custom_team, inspect_team_archive, list_custom_teams, load_custom_char_class, load_custom_char_modes,
     normalize_custom_teams, normalize_team_code,
     read_builtin_char_code, read_team_char_code, read_team_import_code, read_team_manifest,
-    remove_custom_char_code, save_custom_char_code, save_team_char_code, save_team_code_as_import,
+    remove_custom_char_code, save_custom_char_code, save_custom_char_modes, save_team_char_code, save_team_code_as_import,
     save_team_import_code, set_custom_char_enabled, set_team_code_mode, switch_all_teams_code_mode,
-    switch_team_code_mode, team_code_state,
+    switch_team_code_mode, team_code_state, write_team_manifest,
 )
 from src.char.Mortefi import Mortefi
 from src.char.Verina import Verina
@@ -69,6 +70,53 @@ class Mortefi(BuiltinMortefi):
 
         self.assertIs(load_custom_char_class(Mortefi), Mortefi)
 
+    def test_invalid_custom_char_modes_fail_before_changing_code_or_defaults(self):
+        path = get_custom_char_modes_file()
+        code = get_custom_char_file(Mortefi)
+        original_code = read_builtin_char_code(Mortefi).encode('utf-8')
+        code.write_bytes(original_code)
+        for original in (b'{\r\n"unfinished":', b'[]', b'{"Mortefi": {"use_custom": NaN}}'):
+            with self.subTest(original=original):
+                path.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    load_custom_char_class(Mortefi)
+                with self.assertRaises(ValueError):
+                    set_custom_char_enabled(Chixia, True)
+                with self.assertRaises(ValueError):
+                    remove_custom_char_code(Mortefi)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(code.read_bytes(), original_code)
+
+    def test_custom_char_modes_keep_bytes_on_io_failure_and_preserve_unknown_values(self):
+        path = get_custom_char_modes_file()
+        modes = {'Mortefi': {'use_custom': False, 'extension': {'count': 0, 'value': None}},
+                 'Chixia': {'use_custom': True}}
+        original = json.dumps(modes, ensure_ascii=False).encode('utf-8')
+        path.write_bytes(original)
+        with patch('builtins.open', side_effect=PermissionError('合成读取拒绝')), \
+                patch('io.open', side_effect=PermissionError('合成读取拒绝')):
+            with self.assertRaises(PermissionError):
+                load_custom_char_modes()
+        with patch('os.replace', side_effect=PermissionError('合成原子提交失败')):
+            with self.assertRaises(PermissionError):
+                set_custom_char_enabled(Mortefi, True)
+        self.assertEqual(path.read_bytes(), original)
+        with self.assertRaises(ValueError):
+            save_custom_char_modes({'Mortefi': {'use_custom': float('nan')}})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+        code_path = get_custom_char_file(Mortefi)
+        original_code = self._team_code('原有源码').encode('utf-8').replace(b'\n', b'\r\n', 1)
+        code_path.write_bytes(original_code)
+        with patch('os.replace', side_effect=PermissionError('合成原子提交失败')):
+            with self.assertRaises(PermissionError):
+                save_custom_char_code(Mortefi, self._team_code('待保存源码'))
+        self.assertEqual(code_path.read_bytes(), original_code)
+        self.assertEqual(path.read_bytes(), original)
+        set_custom_char_enabled(Mortefi, True)
+        modes['Mortefi']['use_custom'] = True
+        self.assertEqual(load_custom_char_modes(), modes)
+
     def test_remove_custom_char_code_deletes_file_and_uses_builtin_class(self):
         code = """
 from src.char.Mortefi import Mortefi as BuiltinMortefi
@@ -93,11 +141,19 @@ class Mortefi(BuiltinMortefi):
     custom_marker = True
 """
         save_custom_char_code(Mortefi, code, use_custom=True)
+        code_path = get_custom_char_file(Mortefi)
+        modes_path = get_custom_char_modes_file()
+        # 源码和模式的 BOM、混合换行及未知字段在失败回滚后都应保持原字节。
+        original_code = b'\xef\xbb\xbf' + code.encode('utf-8').replace(b'\n', b'\r\n', 1)
+        original_modes = b'\xef\xbb\xbf{"Mortefi":{"use_custom":true,"extension":null}}\r\n'
+        code_path.write_bytes(original_code)
+        modes_path.write_bytes(original_modes)
 
         with self.assertRaises(RuntimeError):
             save_custom_char_code(Mortefi, "class NotMortefi: pass", use_custom=True)
 
-        self.assertEqual(get_custom_char_file(Mortefi).read_text(encoding="utf-8"), code)
+        self.assertEqual(code_path.read_bytes(), original_code)
+        self.assertEqual(modes_path.read_bytes(), original_modes)
         self.assertTrue(load_custom_char_class(Mortefi).custom_marker)
 
     def test_team_code_only_applies_to_matching_team(self):
@@ -193,24 +249,31 @@ class Mortefi(BuiltinMortefi):
         self.assertEqual(second_task.chars[0].team_marker, "second")
         self.assertIsNot(type(first_task.chars[0]), type(second_task.chars[0]))
 
-    def test_list_custom_teams_skips_unreadable_team_folder(self):
+    def test_list_custom_teams_reports_unreadable_team_folder(self):
         valid_team = (Mortefi, Chixia, Verina)
         create_custom_team(valid_team)
         unreadable_folder = Path(self.temp_dir.name) / "custom_teams" / "Aemeath__Augusta__Baizhi"
         unreadable_folder.mkdir()
-        original_is_file = Path.is_file
+        original_stat = Path.stat
 
-        def is_file(path):
-            if path.parent == unreadable_folder:
+        def stat(path, *args, **kwargs):
+            if path == unreadable_folder:
                 raise PermissionError(5, "Access is denied", str(path))
-            return original_is_file(path)
+            return original_stat(path, *args, **kwargs)
 
-        with patch.object(Path, "is_file", is_file):
-            teams = list_custom_teams()
+        with patch.object(Path, 'stat', stat):
+            with self.assertRaises(PermissionError):
+                list_custom_teams()
 
-        self.assertEqual(teams, [tuple(sorted(
-            (cls.__name__ for cls in valid_team), key=str.casefold
-        ))])
+        with patch.object(Path, 'iterdir', side_effect=PermissionError('合成工坊目录读取失败')):
+            with self.assertRaises(PermissionError):
+                list_custom_teams()
+        # 普通辅助目录和导入暂存目录仍不构成工坊队伍。
+        (unreadable_folder.parent / '.Chixia__Mortefi__Verina-temporary').mkdir()
+        (unreadable_folder.parent / 'Chixia__Mortefi__Verina.backup').mkdir()
+        (unreadable_folder.parent / 'notes').mkdir()
+        self.assertEqual(list_custom_teams(), [tuple(sorted(
+            (cls.__name__ for cls in valid_team), key=str.casefold))])
 
     def test_export_detected_team_without_saved_team_uses_builtin_code(self):
         team = (Mortefi, Chixia, Verina)
@@ -264,6 +327,10 @@ class Mortefi(BuiltinMortefi):
         team = (Mortefi, Chixia, Verina)
         create_custom_team(team)
         manifest_before = read_team_manifest(team)
+        # 旧版清单允许 team 为数组；切换模式不能重建清单并丢失扩展字段。
+        manifest_before['team'] = [char.__name__ for char in team]
+        manifest_before['extension'] = {'enabled': False, 'count': 0, 'value': None}
+        write_team_manifest(team, manifest_before)
 
         set_team_code_mode(team, TEAM_CODE_MODE_IMPORT)
         self.assertEqual(get_team_code_mode(team), TEAM_CODE_MODE_IMPORT)
@@ -271,6 +338,51 @@ class Mortefi(BuiltinMortefi):
         self.assertEqual(get_team_code_mode(team), TEAM_CODE_MODE_BUILTIN)
         self.assertEqual(read_team_manifest(team)["code_mode"], TEAM_CODE_MODE_BUILTIN)
         self.assertEqual(read_team_manifest(team)["team"], manifest_before["team"])
+        self.assertEqual(read_team_manifest(team)['extension'], manifest_before['extension'])
+
+    def test_bad_team_manifest_fails_before_saving_code_or_mode(self):
+        team = (Mortefi, Chixia, Verina)
+        folder = create_custom_team(team)
+        path = folder / 'team.json'
+        codes = {file: file.read_bytes() for file in folder.glob('*.py')}
+        for original in (b'{\r\n"unfinished":', b'[]', b'{"extension": NaN}'):
+            with self.subTest(original=original):
+                path.write_bytes(original)
+                with self.assertRaises(ValueError):
+                    read_team_manifest(team)
+                with self.assertRaises(ValueError):
+                    team_code_state(team)
+                with self.assertRaises(ValueError):
+                    normalize_custom_teams()
+                with self.assertRaises(ValueError):
+                    set_team_code_mode(team, TEAM_CODE_MODE_IMPORT)
+                with self.assertRaises(ValueError):
+                    save_team_code_as_import(team, {Mortefi.__name__: self._team_code('合成修改')})
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual({file: file.read_bytes() for file in folder.glob('*.py')}, codes)
+
+    def test_team_manifest_io_failure_preserves_the_whole_team(self):
+        team = (Mortefi, Chixia, Verina)
+        folder = create_custom_team(team)
+        path = folder / 'team.json'
+        # 混合换行与 BOM 都属于用户原字节，失败回滚不能经过文本换行转换。
+        original = b'\xef\xbb\xbf{\r\n"name": "legacy",\n"extension": {"enabled": false, "value": null}}'
+        path.write_bytes(original)
+        source = get_team_char_file(team, Mortefi)
+        source.write_bytes(source.read_bytes().replace(b'\r\n', b'\n'))
+        snapshots = {file: file.read_bytes() for file in folder.iterdir()}
+        with patch('builtins.open', side_effect=PermissionError('合成读取拒绝')), \
+                patch('io.open', side_effect=PermissionError('合成读取拒绝')):
+            with self.assertRaises(PermissionError):
+                set_team_code_mode(team, TEAM_CODE_MODE_IMPORT)
+        self.assertEqual(path.read_bytes(), original)
+        with patch('os.replace', side_effect=PermissionError('合成原子提交失败')):
+            with self.assertRaises(PermissionError):
+                save_team_code_as_import(team, {Mortefi.__name__: self._team_code('合成修改')})
+        self.assertEqual({file: file.read_bytes() for file in folder.iterdir()}, snapshots)
+        with self.assertRaises(ValueError):
+            write_team_manifest(team, {'extension': float('nan')})
+        self.assertEqual(path.read_bytes(), original)
 
     def test_team_code_state_requires_every_imported_copy(self):
         team = (Mortefi, Chixia, Verina)
@@ -353,6 +465,10 @@ class Mortefi(BuiltinMortefi):
     def test_switch_team_code_mode_rolls_the_whole_team_back_on_failure(self):
         team = (Mortefi, Chixia, Verina)
         self._import_team(team)
+        source = get_team_char_file(team, Mortefi)
+        original = source.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n', 1)
+        source.write_bytes(original)
+        snapshots = {path: path.read_bytes() for path in source.parent.iterdir()}
 
         with patch("src.char.CustomCharLoader._load_team_char_class_from_file",
                    side_effect=[None, RuntimeError("broken member")]):
@@ -362,6 +478,12 @@ class Mortefi(BuiltinMortefi):
         for char_cls in team:
             self.assertEqual(read_team_char_code(team, char_cls), self._char_code(char_cls, "imported"))
         self.assertEqual(get_team_code_mode(team), TEAM_CODE_MODE_IMPORT)
+        self.assertEqual({path: path.read_bytes() for path in source.parent.iterdir()}, snapshots)
+
+        # 单个队伍成员的保存入口也必须遵守相同的原字节回滚边界。
+        with self.assertRaises(RuntimeError):
+            save_team_char_code(team, Mortefi, 'class Mortefi: pass')
+        self.assertEqual({path: path.read_bytes() for path in source.parent.iterdir()}, snapshots)
 
     def test_switch_team_code_mode_refuses_a_never_imported_team(self):
         team = (Mortefi, Chixia, Verina)

@@ -3,6 +3,8 @@
 #include "runtime_resources.h"
 
 1 ICON APP_ICON
+// 必须内嵌进 EXE，单独生成清单文件不能保证启动器和辅助进程采用它。
+1 RT_MANIFEST APP_MANIFEST
 
 1 VERSIONINFO
 FILEVERSION 1,0,0,0

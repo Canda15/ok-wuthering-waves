@@ -4,12 +4,14 @@ import inspect
 import json
 import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from pathlib import Path
 
 from ok import Logger
 from ok.util.config import Config
+from ok.util.file import read_json_file, write_json_file
 
 logger = Logger.get_logger(__name__)
 
@@ -104,9 +106,7 @@ def create_custom_team(team):
             (folder / f"{class_name}.py").write_text(
                 read_builtin_char_code(classes[class_name]), encoding="utf-8"
             )
-        (folder / TEAM_MANIFEST_FILE).write_text(
-            json.dumps(_default_team_manifest(class_names), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        write_team_manifest(class_names, _default_team_manifest(class_names))
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
         raise
@@ -127,25 +127,26 @@ def delete_custom_team(team):
 def list_custom_teams():
     root = get_custom_team_root()
     try:
-        if not root.exists():
-            return []
         folders = list(root.iterdir())
-    except OSError as e:
-        logger.warning(f"list custom teams failed for {root}: {e}")
+    except FileNotFoundError:
         return []
     teams = []
     for folder in folders:
+        if folder.name.startswith('.') or folder.name.casefold().endswith('.backup'):
+            continue
         try:
-            if not folder.is_dir():
-                continue
             class_names = tuple(folder.name.split("__"))
             class_names = normalize_team(class_names)
-            if all((folder / f"{name}.py").is_file() for name in class_names):
-                teams.append(class_names)
         except ValueError:
             continue
-        except OSError as e:
-            logger.warning(f"skip unreadable custom team folder {folder}: {e}")
+        try:
+            # 只有明确不存在才可忽略；is_dir/is_file 在部分 Python 版本会吞掉访问拒绝。
+            if not stat.S_ISDIR(folder.stat().st_mode):
+                continue
+            if all(stat.S_ISREG((folder / f"{name}.py").stat().st_mode) for name in class_names):
+                teams.append(class_names)
+        except FileNotFoundError:
+            continue
     return sorted(teams, key=lambda team: tuple(name.casefold() for name in team))
 
 
@@ -163,7 +164,8 @@ def save_team_char_code(team, char_cls, code):
         raise ValueError(f"{class_name} is not in this team")
     path = get_team_char_file(class_names, class_name)
     _validate_character_code(code, class_name, path)
-    old_code = path.read_text(encoding="utf-8") if path.exists() else None
+    # 失败回滚须保留原换行和 BOM，不能经过文本读取的换行转换。
+    old_code = path.read_bytes() if path.exists() else None
     try:
         path.write_text(code, encoding="utf-8")
         clear_team_char_cache(class_names, class_name)
@@ -172,7 +174,7 @@ def save_team_char_code(team, char_cls, code):
         if old_code is None:
             path.unlink(missing_ok=True)
         else:
-            path.write_text(old_code, encoding="utf-8")
+            path.write_bytes(old_code)
         clear_team_char_cache(class_names, class_name)
         raise
     return path
@@ -180,13 +182,8 @@ def save_team_char_code(team, char_cls, code):
 
 def read_team_manifest(team):
     path = get_custom_team_folder(team) / TEAM_MANIFEST_FILE
-    manifest = None
-    if path.exists():
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            logger.warning(f"read_team_manifest failed path={path}: {e!r}")
-    if not isinstance(manifest, dict):
+    manifest = read_json_file(path, strict=True)
+    if manifest is None:
         class_names = normalize_team(team)
         manifest = {
             "name": " ".join(get_english_char_name(name) for name in class_names),
@@ -199,9 +196,10 @@ def read_team_manifest(team):
 
 
 def write_team_manifest(team, manifest):
+    if not isinstance(manifest, dict):
+        raise ValueError('工坊队伍清单必须是 JSON 对象（TEAM_MANIFEST_OBJECT_REQUIRED）')
     path = get_custom_team_folder(team) / TEAM_MANIFEST_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_file(path, manifest)
     return path
 
 
@@ -249,9 +247,10 @@ def team_code_state(team):
     to equal the built in code is still the imported code of that team.
     """
     class_names = normalize_team(team)
+    mode = get_team_code_mode(class_names)
     if not all(get_team_import_file(class_names, name).is_file() for name in class_names):
         return TEAM_CODE_STATE_NONE
-    return get_team_code_mode(class_names)
+    return mode
 
 
 def normalize_team_code(team):
@@ -280,11 +279,7 @@ def normalize_team_code(team):
 def normalize_custom_teams():
     normalized = {}
     for team in list_custom_teams():
-        try:
-            filled = normalize_team_code(team)
-        except Exception as e:
-            logger.error(f"normalize team code failed for {team}: {e}")
-            continue
+        filled = normalize_team_code(team)
         if filled:
             logger.info(f"filled missing imported copies of {team}: {filled}")
             normalized[team] = filled
@@ -405,6 +400,9 @@ def _write_team_code(team, codes, import_codes=None, mode=None):
     ends up half switched.
     """
     class_names = normalize_team(team)
+    # 清单损坏时在写角色源码之前失败，避免先覆盖代码再用默认模式重建旧数据。
+    if mode is not None:
+        read_team_manifest(class_names)
     char_classes = _team_char_classes(class_names)
     writes = {}
     for class_name, code in codes.items():
@@ -415,10 +413,8 @@ def _write_team_code(team, codes, import_codes=None, mode=None):
         path = get_team_import_file(class_names, class_name)
         _validate_character_code(code, class_name, path)
         writes[path] = code
-    touched = list(writes)
-    if mode is not None:
-        touched.append(get_custom_team_folder(class_names) / TEAM_MANIFEST_FILE)
-    backups = {path: path.read_text(encoding="utf-8") if path.is_file() else None for path in touched}
+    # 模式在最后原子提交，失败时清单仍是原件；只回滚之前已写入的代码字节。
+    backups = {path: path.read_bytes() if path.is_file() else None for path in writes}
     try:
         for path, code in writes.items():
             path.write_text(code, encoding="utf-8")
@@ -433,7 +429,7 @@ def _write_team_code(team, codes, import_codes=None, mode=None):
             if old is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_text(old, encoding="utf-8")
+                path.write_bytes(old)
         clear_team_char_cache(class_names)
         raise
 
@@ -582,9 +578,7 @@ def import_custom_team(archive_info):
             (temp_folder / f"{class_name}{TEAM_IMPORT_SUFFIX}").write_text(code, encoding="utf-8")
         manifest = dict(archive_info["manifest"])
         manifest["code_mode"] = TEAM_CODE_MODE_IMPORT
-        (temp_folder / TEAM_MANIFEST_FILE).write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        write_json_file(temp_folder / TEAM_MANIFEST_FILE, manifest)
         backup = folder.with_name(folder.name + ".backup")
         if backup.exists():
             shutil.rmtree(backup)
@@ -643,19 +637,15 @@ def _get_class_name(char_cls_or_name):
 
 def load_custom_char_modes():
     path = get_custom_char_modes_file()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error(f"load custom char modes failed: {e}")
-        return {}
-    return data if isinstance(data, dict) else {}
+    data = read_json_file(path, strict=True)
+    return {} if data is None else data
 
 
 def save_custom_char_modes(modes):
+    if not isinstance(modes, dict):
+        raise ValueError('角色模式必须是 JSON 对象（CUSTOM_CHAR_MODES_OBJECT_REQUIRED）')
     path = get_custom_char_modes_file()
-    path.write_text(json.dumps(modes, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_file(path, modes)
 
 
 def is_custom_char_enabled(char_cls_or_name):
@@ -677,8 +667,9 @@ def has_custom_char_code(char_cls_or_name):
 
 def remove_custom_char_code(char_cls_or_name):
     path = get_custom_char_file(char_cls_or_name)
-    path.unlink(missing_ok=True)
+    # 模式不可读或不可保存时保留源码，防止删除成功后才发现用户配置损坏。
     set_custom_char_enabled(char_cls_or_name, False)
+    path.unlink(missing_ok=True)
     return path
 
 
@@ -707,8 +698,9 @@ def read_custom_or_builtin_char_code(char_cls):
 
 def save_custom_char_code(char_cls, code, use_custom=True):
     path = get_custom_char_file(char_cls)
-    old_code = path.read_text(encoding="utf-8") if path.exists() else None
-    old_enabled = is_custom_char_enabled(char_cls)
+    old_code = path.read_bytes() if path.exists() else None
+    # 先检查模式可读性；模式在最后原子提交，失败时不应再次重写未变更的原件。
+    is_custom_char_enabled(char_cls)
     compile(code, str(path), "exec")
     try:
         path.write_text(code, encoding="utf-8")
@@ -720,8 +712,8 @@ def save_custom_char_code(char_cls, code, use_custom=True):
         if old_code is None:
             path.unlink(missing_ok=True)
         else:
-            path.write_text(old_code, encoding="utf-8")
-        set_custom_char_enabled(char_cls, old_enabled)
+            path.write_bytes(old_code)
+        clear_custom_char_cache(char_cls)
         raise
     return path
 

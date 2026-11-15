@@ -515,6 +515,13 @@ pub(crate) struct ExclusiveLease {
     _pins: DirectoryPins,
 }
 
+impl ExclusiveLease {
+    pub(crate) fn child_stdio(&self) -> Result<std::process::Stdio> {
+        // 标准句柄继承同一文件对象，子进程核验真实锁路径，不依赖可伪造的跳过锁标记。
+        Ok(std::process::Stdio::from(self._file.try_clone()?))
+    }
+}
+
 pub(crate) fn exclusive_lease(root: &Path, name: &str) -> Result<ExclusiveLease> {
     ensure!(
         matches!(name, "receive.lock" | "runtime.lock"),

@@ -1,4 +1,3 @@
-import json
 import os
 from time import perf_counter
 from typing import TypedDict
@@ -211,6 +210,7 @@ class ScreenshotRunnable(QRunnable):
 
 class ImageLoaderSignals(QObject):
     finished = Signal(list, int)
+    failed = Signal(str, int)
 
 class ImageLoaderRunnable(QRunnable):
     def __init__(self, coco_data, seq):
@@ -321,7 +321,7 @@ class ImageLoaderRunnable(QRunnable):
             self.signals.finished.emit(results, self.seq)
         except Exception as e:
             logger.error(f"Image search failed: {e}")
-            self.signals.finished.emit([], self.seq)
+            self.signals.failed.emit(str(e), self.seq)
 
 
 class ImageCard(QFrame):
@@ -534,6 +534,8 @@ class TemplateTab(QWidget):
         self._visible_image_paths = []
         self.markup_window = None
         self.coco_data: CocoData = {"images": [], "annotations": [], "categories": []}
+        self._pending_coco_data: CocoData | None = None
+        self._has_loaded_grid = False
         self._loaded = False
         self._grid_loading = False
         self._capturing = False
@@ -548,7 +550,6 @@ class TemplateTab(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         if not self._loaded:
-            self._loaded = True
             self.load_initial_grid()
 
     def init_ui(self):
@@ -640,37 +641,66 @@ class TemplateTab(QWidget):
     def load_initial_grid(self):
         """Load image data and thumbnails once for this tab session."""
         logger.info("Loading template grid")
-        self._grid_load_started_at = perf_counter()
+        self._load_sequence += 1
+        current_seq = self._load_sequence
         coco_load_started_at = perf_counter()
-        self.coco_data = load_coco()
+        try:
+            coco_data = load_coco()
+        except Exception as error:
+            logger.error(f"读取模板标注失败：{error}")
+            self._on_load_failed(str(error), current_seq)
+            return
         logger.info(
             f"Template grid timing | load COCO: {(perf_counter() - coco_load_started_at) * 1000:.1f} ms")
+        # 标注和卡片一起在后台读取成功后提交；失败时继续显示上一份完整结果。
+        self._pending_coco_data = coco_data
+        self._grid_load_started_at = coco_load_started_at
+
+        self.scroll_area.setVisible(False)
+        self.empty_widget.setVisible(False)
+        self.progress_container.setVisible(True)
+        self._grid_loading = True
+        self._loaded = True
+        self.search_box.setEnabled(False)
+        self._update_selection_buttons()
+
+        runnable = ImageLoaderRunnable(coco_data, current_seq)
+        runnable.signals.finished.connect(self._on_load_finished)
+        runnable.signals.failed.connect(self._on_load_failed)
+        QThreadPool.globalInstance().start(runnable)
+
+    def _on_load_failed(self, error, seq):
+        if seq != self._load_sequence:
+            return
+        self._pending_coco_data = None
+        self._grid_load_started_at = None
+        self._grid_loading = False
+        self._loaded = False
+        self.progress_container.setVisible(False)
+        self.search_box.setEnabled(True)
+        if self._has_loaded_grid:
+            self.apply_filter()
+        else:
+            # 首次读取失败不是空模板库，不能显示“尚无模板”的成功空态。
+            self.scroll_area.setVisible(True)
+            self.empty_widget.setVisible(False)
+            self._update_selection_buttons()
+        from ok.ui.qt.util.Alert import alert_error
+        alert_error(f"{self.tr('Error')}: {error}")
+
+    def _on_load_finished(self, items, seq):
+        if seq != self._load_sequence or self._pending_coco_data is None:
+            return
+
+        self.coco_data = self._pending_coco_data
+        self._pending_coco_data = None
+        self._has_loaded_grid = True
         self.image_cards.clear()
         self._cards_by_path.clear()
         self._image_items.clear()
         self._items_by_path.clear()
         self._visible_image_paths.clear()
         self.flow_widget.clear_items()
-
-        self.scroll_area.setVisible(False)
-        self.empty_widget.setVisible(False)
-        self.progress_container.setVisible(True)
-        self._grid_loading = True
-        self.search_box.setEnabled(False)
-        self.screenshot_btn.setEnabled(False)
-        self.center_screenshot_btn.setEnabled(False)
-
-        self._load_sequence += 1
-        current_seq = self._load_sequence
-
-        runnable = ImageLoaderRunnable(self.coco_data, current_seq)
-        runnable.signals.finished.connect(self._on_load_finished)
-        QThreadPool.globalInstance().start(runnable)
-
-    def _on_load_finished(self, items, seq):
-        if seq != getattr(self, '_load_sequence', 0):
-            return
-
         self.progress_container.setVisible(False)
         self._grid_loading = False
         self.search_box.setEnabled(True)

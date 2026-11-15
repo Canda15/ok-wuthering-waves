@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 import threading
 from pathlib import Path
-from ok.util.file import get_user_data_path
+from ok.util.file import get_user_data_path, read_json_file, write_json_file
 
 
 TEMPLATE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
@@ -38,35 +35,28 @@ class CocoTemplateStore:
 
     def load(self):
         with self._lock:
-            if not self.coco_path.is_file():
-                return {key: list(value) for key, value in EMPTY_COCO.items()}
-            try:
-                data = json.loads(self.coco_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                return {key: list(value) for key, value in EMPTY_COCO.items()}
-            return {
-                "images": list(data.get("images") or []),
-                "annotations": list(data.get("annotations") or []),
-                "categories": list(data.get("categories") or []),
-            }
+            data = read_json_file(self.coco_path, strict=True)
+            return self._validated_data({} if data is None else data)
+
+    @staticmethod
+    def _validated_data(data):
+        if not isinstance(data, dict):
+            raise ValueError('模板标注必须是 JSON 对象（TEMPLATE_COCO_INVALID）')
+        normalized = dict(data)
+        for key in EMPTY_COCO:
+            items = data.get(key, [])
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError(f'模板标注字段 {key} 必须是对象数组（TEMPLATE_COCO_INVALID）')
+            normalized[key] = list(items)
+        return normalized
 
     def save(self, data):
         with self._lock:
-            normalized = {
-                "images": sorted(data.get("images") or [], key=lambda item: int(item.get("id", 0))),
-                "annotations": sorted(data.get("annotations") or [], key=lambda item: int(item.get("id", 0))),
-                "categories": sorted(data.get("categories") or [], key=lambda item: int(item.get("id", 0))),
-            }
-            handle, temporary = tempfile.mkstemp(prefix=".coco-", suffix=".json", dir=self.folder)
-            try:
-                with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                    json.dump(normalized, stream, ensure_ascii=False, indent=2)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, self.coco_path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            # 保留 info、licenses 等已有扩展字段，不因修改标注而重建并裁掉用户元数据。
+            normalized = self._validated_data(data)
+            for key in EMPTY_COCO:
+                normalized[key].sort(key=lambda item: int(item.get('id', 0)))
+            write_json_file(self.coco_path, normalized)
             return normalized
 
     @staticmethod
@@ -208,23 +198,31 @@ class CocoTemplateStore:
 
     def next_image_name(self):
         with self._lock:
-            used = {int(path.stem) for path in self.folder.iterdir() if path.stem.isdigit() and path.suffix.lower() in TEMPLATE_EXTENSIONS}
-            for image in self.load()["images"]:
-                stem = Path(str(image.get("file_name", ""))).stem
-                if stem.isdigit():
-                    used.add(int(stem))
-            index = 0
-            while index in used:
-                index += 1
-            return f"{index}.png"
+            return self._next_image_name(self.load())
+
+    def _next_image_name(self, data):
+        used = {int(path.stem) for path in self.folder.iterdir() if path.stem.isdigit() and path.suffix.lower() in TEMPLATE_EXTENSIONS}
+        for image in data['images']:
+            stem = Path(str(image.get('file_name', ''))).stem
+            if stem.isdigit():
+                used.add(int(stem))
+        index = 0
+        while index in used:
+            index += 1
+        return f'{index}.png'
 
     def save_frame(self, frame):
         import cv2
         with self._lock:
-            path = self.image_path(self.next_image_name())
-            if not cv2.imwrite(str(path), frame):
-                raise RuntimeError("Failed to save template image")
+            # 先验证原标注，再发布新图片；失败时不能留下掩盖坏清单的新增内容。
             data = self.load()
-            self.ensure_image(data, path)
-            self.save(data)
+            path = self.image_path(self._next_image_name(data))
+            try:
+                if not cv2.imwrite(str(path), frame):
+                    raise RuntimeError('保存模板图片失败')
+                self.ensure_image(data, path)
+                self.save(data)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
             return path
