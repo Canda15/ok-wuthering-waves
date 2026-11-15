@@ -2711,7 +2711,10 @@ class TestUserDataMigration(unittest.TestCase):
 
     def test_real_main_imports_existing_accounts_and_team_after_migration(self):
         repo = Path(__file__).resolve().parents[1]
-        from selfhost.portable import process_environment, hidden_process_options
+        from selfhost.portable import diagnostic_tail, process_environment, hidden_process_options
+        # 模拟 CI 先安装的普通 src 包，避免本机未安装项目时掩盖源码被遮蔽的问题。
+        installed = self.root / 'installed-site-packages'
+        self.write(installed, 'src/__init__.py', b'')
         for broken in (False, True):
             with self.subTest(broken=broken):
                 portable = self.root / str(broken)
@@ -2727,15 +2730,24 @@ class TestUserDataMigration(unittest.TestCase):
                     self.write(working, f'configs/custom_teams/{team}/{name}.import.py', f'class {name}: pass\n'.encode())
                 self.write(working, f'configs/custom_teams/{team}/team.json', b'{"code_mode":"import"}')
                 marker = portable / 'configuration-imported'
+                sources = {
+                    'ok.util.config': repo / 'ok/util/config.py',
+                    'src': repo / 'src/__init__.py',
+                    'src.char.CustomCharLoader': repo / 'src/char/CustomCharLoader.py',
+                    'selfhost.user_data': working / 'selfhost/user_data.py',
+                }
                 (working / 'config.py').write_text(
                     'import json,sys\nfrom pathlib import Path\n'
-                    f'Path({str(marker)!r}).write_bytes(b"imported")\nsys.path.append({str(repo)!r})\n'
+                    f'Path({str(marker)!r}).write_bytes(b"imported")\n'
+                    f'sys.path.insert(0,{str(installed)!r})\nsys.path.insert(0,{str(repo)!r})\n'
                     'from ok.util.config import Config\n'
                     'from src.char.CustomCharLoader import list_custom_teams,get_team_code_mode,get_team_import_file\n'
                     'accounts=Config("MultiAccountConfig", {"accounts":[],"enabled":True})\n'
                     'team=list_custom_teams()[0]\n'
+                    f'sources={{name:str(Path(sys.modules[name].__file__).resolve()) for name in {tuple(sources)!r}}}\n'
                     'print(json.dumps({"accounts":dict(accounts),"team":team,"mode":get_team_code_mode(team),'
-                    '"code":get_team_import_file(team,"Alpha").read_text()}))\nraise SystemExit(0)\n', encoding='utf-8')
+                    '"code":get_team_import_file(team,"Alpha").read_text(),"sources":sources}))\n'
+                    'raise SystemExit(0)\n', encoding='utf-8')
                 result = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(working / 'main.py')],
                                         cwd=working, env=process_environment(), capture_output=True, text=True,
                                         encoding='utf-8', timeout=30, **hidden_process_options())
@@ -2745,8 +2757,12 @@ class TestUserDataMigration(unittest.TestCase):
                     self.assertEqual(account.read_bytes(), b'{broken')
                     self.assertFalse((portable / 'data/user/NoNo/configs/MultiAccountConfig.json').exists())
                 else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # ok 的异常钩子写入 stdout，失败时必须保留两路有界、脱敏诊断。
+                    self.assertEqual(result.returncode, 0,
+                                     f'标准输出尾部：\n{diagnostic_tail(result.stdout)}\n'
+                                     f'标准错误尾部：\n{diagnostic_tail(result.stderr)}')
                     observed = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertEqual(observed['sources'], {name: str(path.resolve()) for name, path in sources.items()})
                     self.assertEqual(observed['accounts'], {'accounts': ['synthetic'], 'enabled': False})
                     self.assertEqual(observed['team'], ['Alpha', 'Beta', 'Gamma'])
                     self.assertEqual(observed['mode'], 'import')
