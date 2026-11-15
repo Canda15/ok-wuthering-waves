@@ -14,6 +14,15 @@ from src.task.task_icons import task_icon
 
 logger = Logger.get_logger(__name__)
 
+# 只接受按钮本身的文字，不能把退出说明中的“重新挑战”当成点击目标。
+_RECHALLENGE_LABEL = re.compile(
+    r'\s*(?:重新挑战|重新挑戰|再次挑战|再次挑戰|Rechallenge|Restart\s*Challenge|Challenge\s*Again)\s*', re.I)
+_RECHALLENGE_CONFIRM_PROMPT = re.compile(
+    r'\s*(?:(?:是否|确认|確認|确定|確定)(?:要|进行|進行)?(?:重新挑战|重新挑戰|再次挑战|再次挑戰)'
+    r'|Are you sure (?:you want )?to (?:restart|rechallenge)(?: (?:this|the) challenge)?'
+    r'|Restart (?:this|the) challenge)[？?]?\s*', re.I)
+_RECHALLENGE_CONFIRM_LABEL = re.compile(r'\s*(?:确认|確認|确定|確定|Confirm|OK)\s*', re.I)
+
 
 class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
     owns_switch_healer_config = True
@@ -241,8 +250,7 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             self._just_entered_boss_realm = False
         elif not self.in_combat():
             if self._in_realm and not self.in_world():
-                self.esc_world_confirm()
-                self.sleep(.1)
+                self._restart_echo_realm()
             else:
                 if self._has_treasure:
                     self.wait_until(lambda: self.find_treasure_icon() or self.in_combat(target=True)
@@ -253,6 +261,99 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                         self.handle_boss_restart_after_treasure()
                     else:
                         self.scroll_and_click_buttons()
+
+    def _find_echo_rechallenge_state(self):
+        """在同一前台代次内区分重挑战、专属确认和无弹窗的副本画面。"""
+        epoch = getattr(self, '_foreground_epoch', 0)
+        texts = self.ocr()
+        restart = [box for box in texts if _RECHALLENGE_LABEL.fullmatch(box.name)]
+        confirm = [box for box in texts if _RECHALLENGE_CONFIRM_LABEL.fullmatch(box.name)]
+        question = any(_RECHALLENGE_CONFIRM_PROMPT.fullmatch(box.name) for box in texts)
+        dialog = self.find_one([
+            'claim_cancel_button_hcenter_vcenter',
+            'cancel_button_hcenter_vcenter', 'cancel_button_highlight_hcenter_vcenter',
+            'confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter',
+        ])
+        if question:
+            result = ('confirm', confirm[0]) if dialog and len(confirm) == 1 else ('unknown', None)
+        elif restart:
+            result = ('restart', restart[0]) if dialog and len(restart) == 1 else ('unknown', None)
+        elif dialog:
+            # 未识别的弹窗即使露出背景 HUD，也不能被当作副本加载完成。
+            result = 'unknown', None
+        elif self.in_world():
+            result = 'world', None
+        elif self._in_realm and self.in_team_and_world():
+            # 周本上下文由传送/刷取流程确认；不能要求肉鸽等玩法的退出图标也出现在周本。
+            result = 'realm', None
+        else:
+            result = 'unknown', None
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('副本重挑战识别期间画面已刷新')
+        return result
+
+    def _restart_echo_realm(self, time_out=120):
+        """区分重开尝试和可证实的完成，失焦后先观察结果，不盲目重发。"""
+        deadline = self.business_time() + time_out
+        attempted = None
+        completed_epoch = None
+        opened_epoch = None
+        cleared_realm_seen = False
+
+        def fail(message):
+            try:
+                self.screenshot('副本重新挑战失败')
+            except ForegroundInputInterrupted:
+                # 已确定的失败不能因为诊断截图遇到失焦而变成下一次重开尝试。
+                raise ForegroundInputError(message) from None
+            raise ForegroundInputError(message)
+
+        def has_current_health():
+            # 这里只做血条/首领标记识别；in_combat 会锁敌和发输入，不能用来证明重开。
+            epoch = getattr(self, '_foreground_epoch', 0)
+            result = bool(self.check_health_bar())
+            if epoch != getattr(self, '_foreground_epoch', 0):
+                raise ForegroundInputInterrupted('副本重挑战血条识别期间画面已刷新')
+            return result
+
+        while self.business_time() < deadline:
+            try:
+                self.next_frame()
+                state, control = self._find_echo_rechallenge_state()
+                epoch = getattr(self, '_foreground_epoch', 0)
+                remaining = deadline - self.business_time()
+                if remaining <= 0:
+                    break
+                if state == 'world':
+                    fail('重新挑战过程中已返回大世界，无法确认副本重开，已停止刷取')
+                if state == 'realm':
+                    if attempted is not None:
+                        # 中断后的普通 HUD 也可能来自用户关闭的旧副本，不能单凭它报成功。
+                        if completed_epoch == epoch or (cleared_realm_seen and has_current_health()):
+                            return True
+                    else:
+                        cleared_realm_seen = cleared_realm_seen or not has_current_health()
+                        if opened_epoch != epoch:
+                            # Esc 被守卫提前中断时没有打开菜单；恢复后以新画面重新决定。
+                            opened = self.send_key('esc', after_sleep=0)
+                            if opened is True and epoch == getattr(self, '_foreground_epoch', 0):
+                                opened_epoch = epoch
+                elif state == 'restart' and attempted is None:
+                    # 记录尝试以免重发；只有完整返回且代次未变，才记为本次调用已完成。
+                    attempted = 'restart'
+                    completed = self.click(control, after_sleep=0)
+                    if completed is True and epoch == getattr(self, '_foreground_epoch', 0):
+                        completed_epoch = epoch
+                elif state == 'confirm' and attempted == 'restart':
+                    attempted = 'confirm'
+                    completed_epoch = None
+                    completed = self.click(control, after_sleep=0)
+                    if completed is True and epoch == getattr(self, '_foreground_epoch', 0):
+                        completed_epoch = epoch
+                self.sleep(min(0.1, max(0, deadline - self.business_time())))
+            except ForegroundInputInterrupted:
+                self.wait_foreground_frame()
+        fail('无法确认副本重新挑战的按钮或完成结果，已停止刷取')
 
     def _pick_round_echo(self):
         if self.pick_echo():

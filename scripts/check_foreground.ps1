@@ -33,6 +33,7 @@ $testFiles = @(
     'tests/TestOneTimeCombatRestart.py',
     'tests/TestDomainRecoveryLoop.py',
     'tests/TestFarmEchoTeleport.py',
+    'tests/TestFarmEchoPickup.py',
     'tests/TestSkipDialogConfirm.py',
     'tests/TestBaseCombatTask.py',
     'tests/TestCombatCheck.py',
