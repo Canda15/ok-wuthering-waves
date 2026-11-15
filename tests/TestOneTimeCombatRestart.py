@@ -1,7 +1,7 @@
 import unittest
 from contextlib import nullcontext
 from copy import deepcopy
-from itertools import count
+from itertools import count, product
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -416,7 +416,7 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         task = self.make_task()
         for text, completed in (
             ('0', False), ('3500', False), ('5999', False), ('6000', True),
-            ('6,000', True), ('3500/6000', False), ('6000/6000', True),
+            ('6,000', True), ('3500/6000', False), ('6000/6000', True), ('6001', True),
         ):
             with self.subTest(text=text):
                 task.ocr.return_value = [
@@ -431,17 +431,54 @@ class TestGardenForegroundRecovery(unittest.TestCase):
         self.assertTrue(task.is_garden_done(['6000/6000']))
         self.assertTrue(task.is_garden_done(['已达到上限']))
 
+    def test_missing_current_points_reads_the_same_frame_region_once(self):
+        for points in ('0', '8', '3500', '6000', '6001'):
+            with self.subTest(points=points):
+                task = self.make_task()
+                frame = task.frame
+                task.ocr.side_effect = [
+                    [Box(2219, 1286, 104, 45, name='6000')],
+                    [Box(496, 1210, 180, 55, name=points)],
+                ]
+
+                self.assertEqual(int(points) >= 6000, task.is_weekly_garden_completed())
+
+                self.assertEqual(2, task.ocr.call_count)
+                first, local = task.ocr.call_args_list
+                self.assertIs(first.kwargs['frame'], frame)
+                self.assertIs(local.kwargs['frame'], frame)
+                self.assertEqual(local.args, (.102, .793, .284, .956))
+                task.click.assert_not_called()
+
     def test_missing_or_ambiguous_current_points_stops(self):
-        for current in (
-            [Box(2219, 1286, 104, 45, name='6000')],
-            [Box(496, 1210, 40, 55, name='O')],
-            [Box(496, 1210, 40, 55, name='0'), Box(550, 1210, 160, 55, name='6000')],
+        for current, expected_reads in (
+            ([Box(2219, 1286, 104, 45, name='6000')], 2),
+            ([Box(496, 1210, 40, 55, name='O')], 1),
+            ([Box(496, 1210, 40, 55, name='0'), Box(550, 1210, 160, 55, name='6000')], 1),
         ):
             with self.subTest(current=current):
                 task = self.make_task()
                 task.ocr.return_value = current
                 with self.assertRaisesRegex(ForegroundInputError, '当前游历值'):
                     task.is_weekly_garden_completed()
+                self.assertEqual(expected_reads, task.ocr.call_count)
+                task.click.assert_not_called()
+                task.screenshot.assert_called_once_with('garden_result_unknown')
+
+    def test_local_points_still_require_a_unique_numeric_value_inside_the_region(self):
+        for local in (
+            [], [Box(496, 1210, 40, 55, name='O')],
+            [Box(496, 1210, 40, 55, name='0'), Box(550, 1210, 160, 55, name='6000')],
+            [Box(2219, 1286, 104, 45, name='6000')],
+        ):
+            with self.subTest(local=local):
+                task = self.make_task()
+                task.ocr.side_effect = [[], local]
+
+                with self.assertRaisesRegex(ForegroundInputError, '当前游历值'):
+                    task.is_weekly_garden_completed()
+
+                self.assertEqual(2, task.ocr.call_count)
                 task.click.assert_not_called()
                 task.screenshot.assert_called_once_with('garden_result_unknown')
 
@@ -478,8 +515,8 @@ class TestGardenForegroundRecovery(unittest.TestCase):
                 task.screenshot.assert_not_called()
 
     def test_daily_points_read_receives_nested_foreground_resume(self):
-        for points, resumed in (('0', False), ('6000', False), ('0', True), ('6000', True)):
-            with self.subTest(points=points, resumed=resumed):
+        for points, resumed, full_frame_missing in product(('0', '6000'), (False, True), (False, True)):
+            with self.subTest(points=points, resumed=resumed, full_frame_missing=full_frame_missing):
                 task = self.make_task()
                 executor = task.executor
                 daily = DailyTask.__new__(DailyTask)
@@ -495,6 +532,8 @@ class TestGardenForegroundRecovery(unittest.TestCase):
                 executor.task_context.side_effect = lambda inner: TaskExecutor.task_context(executor, inner)
 
                 def read_points(*args, **kwargs):
+                    if full_frame_missing and not args:
+                        return []
                     if resumed:
                         # 导航上下文已退出，积分读取仍需注册内层实例，才能丢弃恢复前的 OCR 结果。
                         executor.frame = Mock(shape=(1440, 2560, 3))
@@ -516,6 +555,7 @@ class TestGardenForegroundRecovery(unittest.TestCase):
                     daily.run_task_by_class.assert_called_once_with(GardenTask)
                 else:
                     daily.run_task_by_class.assert_not_called()
+                self.assertEqual(2 if full_frame_missing else 1, task.ocr.call_count)
                 self.assertEqual([], executor._task_context_stack)
                 self.assertIs(daily, executor.current_task)
                 task.screenshot.assert_not_called()
@@ -720,7 +760,22 @@ class TestGardenWeeklyPage(TaskTestCase):
             with self.subTest(scale=scale):
                 frame = cv2.resize(original, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                 self.task.executor.feature_set.check_size(frame)
+                self.assertEqual(0, self.task._read_weekly_garden_points(frame))
                 self.assertIsNone(self.task._find_weekly_reward(frame))
+
+    def test_missing_current_digits_stops_despite_visible_page_and_reward_scale(self):
+        original = self.task.frame.copy()
+        missing = original.copy()
+        # 仅用邻近背景遮住当前数字，页面锚点、游历值标签和右侧六档刻度保持原样。
+        missing[1200:1276, 480:680] = original[1120:1196, 600:800]
+        for scale in (.5, .75, 1):
+            with self.subTest(scale=scale):
+                frame = cv2.resize(missing, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                self.assertTrue(self.task._is_weekly_garden_page(frame=frame))
+                with patch.object(self.task, 'screenshot') as screenshot:
+                    with self.assertRaisesRegex(ForegroundInputError, '当前游历值'):
+                        self.task._find_weekly_reward(frame)
+                screenshot.assert_called_once_with('garden_result_unknown')
 
     def test_synthetic_reward_hints_keep_slot_and_scale_geometry(self):
         original = self.task.frame.copy()

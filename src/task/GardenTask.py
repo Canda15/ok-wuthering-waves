@@ -394,14 +394,22 @@ class GardenTask(WWOneTimeTask, BaseWWTask):
     def _read_weekly_garden_points(self, frame, numbers=None):
         epoch = getattr(self, '_foreground_epoch', 0)
         height, width = frame.shape[:2]
-        # 保留整帧文字上下文，避免 0/O 歧义；卡片介绍和奖励刻度不参与当前积分判断。
+
+        def in_current_area(box):
+            return (.102 * width <= box.x and box.x + box.width <= .284 * width
+                    and .793 * height <= box.y and box.y + box.height <= .956 * height)
+
+        # 优先保留整帧识别结果；卡片介绍和奖励刻度不参与当前积分判断。
         if numbers is None:
             numbers = self.ocr(frame=frame, match=re.compile(r'\d'))
-        current = [box for box in numbers
-                   if .102 * width <= box.x and box.x + box.width <= .284 * width
-                   and .793 * height <= box.y and box.y + box.height <= .956 * height]
-        if epoch != getattr(self, '_foreground_epoch', 0):
-            raise ForegroundInputInterrupted('乐园周常画面已更新，需要重新读取积分')
+        self._check_weekly_frame_epoch(epoch)
+        current = [box for box in numbers if in_current_area(box)]
+        if not current:
+            # OCR v6 的整帧检测会漏掉单独的 0；只在同一帧原积分框补读一次。
+            # 已有但矛盾或非法的候选仍须报错，不能用局部结果覆盖成成功。
+            local = self.ocr(.102, .793, .284, .956, frame=frame, match=re.compile(r'\d'))
+            self._check_weekly_frame_epoch(epoch)
+            current = [box for box in local if in_current_area(box)]
         self.log_info(self.tr('Garden current: {current}').format(current=current))
         points = {int(progress.group(1).replace(',', '')) for box in current
                   if (progress := re.fullmatch(r'(\d[\d,]*)(?:\s*/\s*6,?000)?', box.name.strip()))}
