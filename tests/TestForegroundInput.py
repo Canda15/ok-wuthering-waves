@@ -1871,6 +1871,57 @@ class TestMcpForegroundPreparation(InputFixture):
 
 
 class TestRunnerIsolation(unittest.TestCase):
+    def test_定时诊断在线程内重复抓取真实调用栈(self):
+        sampled = threading.Event()
+        callers = []
+        original_dump = test_runner.faulthandler.dump_traceback
+        with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as output:
+            def record_dump(**kwargs):
+                original_dump(file=output, **kwargs)
+                callers.append(threading.current_thread())
+                if len(callers) >= 2:
+                    sampled.set()
+
+            with patch('run_test.faulthandler.dump_traceback', side_effect=record_dump) as dump, \
+                    patch('run_test.faulthandler.dump_traceback_later') as native_timer:
+                with test_runner._periodic_tracebacks(interval=0.01) as worker:
+                    self.assertTrue(sampled.wait(2), '定时诊断未输出调用栈。')
+                self.assertFalse(worker.is_alive())
+                self.assertGreaterEqual(len(callers), 2)
+                self.assertTrue(all(caller is worker for caller in callers))
+                dump.assert_called_with(all_threads=True)
+                native_timer.assert_not_called()
+            output.seek(0)
+            self.assertIn('record_dump', output.read())
+
+    def test_定时诊断退出立即停止且保留原异常(self):
+        for expected_error in (None, RuntimeError('预期的测试入口异常')):
+            with self.subTest(error=expected_error):
+                finished = threading.Event()
+                workers = []
+                errors = []
+
+                def leave_context():
+                    try:
+                        with test_runner._periodic_tracebacks() as worker:
+                            workers.append(worker)
+                            if expected_error is not None:
+                                raise expected_error
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        finished.set()
+
+                # 即使未来误用不可取消的 120 秒 sleep，回归也须有界失败。
+                caller = threading.Thread(target=leave_context, daemon=True)
+                caller.start()
+                self.assertTrue(finished.wait(2), '退出诊断上下文仍在等待定时周期。')
+                caller.join(timeout=1)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(errors, [] if expected_error is None else [expected_error])
+                self.assertEqual(len(workers), 1)
+                self.assertFalse(workers[0].is_alive())
+
     @staticmethod
     def cleanup_error(code):
         error = OSError('预期的临时目录清理错误')
@@ -2046,6 +2097,12 @@ class RunnerProbe(unittest.TestCase):
     def test_result(self):
         self.assertTrue(installed_before_tests)
         mode = os.environ['NONO_RUNNER_PROBE_CASE']
+        if mode == 'diagnostic_error':
+            with patch('run_test.faulthandler.dump_traceback',
+                       side_effect=RuntimeError('预期的诊断线程异常')):
+                with run_test._periodic_tracebacks(interval=0.01) as worker:
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
         if mode == 'gc_cleanup':
             temporary = tempfile.TemporaryDirectory(dir=os.environ['NONO_USER_DATA_ROOT'])
             root = Path(temporary.name)
@@ -2071,11 +2128,21 @@ class RunnerProbe(unittest.TestCase):
 '''
         with tempfile.TemporaryDirectory(prefix='NoNo-入口回归-') as directory:
             (Path(directory) / 'isolated_runner_probe.py').write_text(source, encoding='utf-8')
+            # 隔离的 Python 启动钩子覆盖父子进程，旧入口会在运行测试前明确失败。
+            (Path(directory) / 'sitecustomize.py').write_text('''import faulthandler
+
+def reject_native_timer(*args, **kwargs):
+    raise AssertionError('测试入口不能调用原生定时抓栈。')
+
+faulthandler.dump_traceback_later = reject_native_timer
+faulthandler.cancel_dump_traceback_later = reject_native_timer
+''', encoding='utf-8')
             environment = os.environ.copy()
             environment['PYTHONPATH'] = directory
             environment['QT_QPA_PLATFORM'] = 'offscreen'
             for mode, expected in (
-                    ('normal', 0), ('assertion', 1), ('thread', 1), ('late_thread', 1), ('gc_cleanup', 1)):
+                    ('normal', 0), ('assertion', 1), ('thread', 1), ('late_thread', 1),
+                    ('gc_cleanup', 1), ('diagnostic_error', 1)):
                 with self.subTest(mode=mode):
                     environment['NONO_RUNNER_PROBE_CASE'] = mode
                     result = subprocess.run(
@@ -2095,6 +2162,10 @@ class RunnerProbe(unittest.TestCase):
                         # GC 的异常不会让 unittest 失败，必须由父入口读取独立错误标记。
                         self.assertIn('\nOK\n', output)
                         self.assertIn('临时目录自动清理失败', output)
+                    if mode == 'diagnostic_error':
+                        self.assertIn('\nOK\n', output)
+                        self.assertIn('预期的诊断线程异常', output)
+                        self.assertIn('后台线程发生未捕获异常', output)
 
 
 if __name__ == '__main__':

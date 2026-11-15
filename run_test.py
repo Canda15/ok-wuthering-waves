@@ -10,6 +10,7 @@ import threading
 import time
 import warnings
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -85,6 +86,25 @@ class _TestTemporaryDirectory(tempfile.TemporaryDirectory):
         self._cleanup_owned(self._owner)
 
 
+@contextmanager
+def _periodic_tracebacks(interval=120):
+    # CPython 3.12 原生定时器可能与线程退出竞争；Python 线程持有 GIL 后同步抓栈。
+    stopped = threading.Event()
+
+    def dump_periodically():
+        while not stopped.wait(interval):
+            faulthandler.dump_traceback(all_threads=True)
+
+    worker = threading.Thread(target=dump_periodically, name='测试定时诊断', daemon=True)
+    worker.start()
+    try:
+        yield worker
+    finally:
+        # 唤醒等待并完整结束线程，避免收尾后仍访问 stderr。
+        stopped.set()
+        worker.join()
+
+
 def translate_for_test(task, message):
     # 替身和 TaskTestCase 可以在尚未构造应用时创建任务。
     app = getattr(task, '_app', None)
@@ -112,7 +132,11 @@ def run_tests(directory, arguments):
     threading.excepthook = record_background_error
     sys.argv = ['run_test.py', *arguments]
     faulthandler.enable()
-    faulthandler.dump_traceback_later(120, repeat=True)
+    with _periodic_tracebacks():
+        _run_test_suite(directory)
+
+
+def _run_test_suite(directory):
     # 部分截图测试强制 debug=True，旧框架会清空默认截图目录。
     # 必须在导入测试模块前隔离全部写入路径，不能只替换配置目录。
     from ok import Config
@@ -139,7 +163,6 @@ def run_tests(directory, arguments):
         from ok.test import ok as test_runtime
         if test_runtime is not None and not test_runtime.exit_event.is_set():
             test_runtime.quit()
-        faulthandler.cancel_dump_traceback_later()
 
 
 def main():
