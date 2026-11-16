@@ -351,6 +351,9 @@ class ExecutorOperation:
     def ensure_in_front(self):
         if self.is_adb():
             self.executor.device_manager.adb_ensure_in_front()
+        elif self.executor.is_background_input:
+            # 后台模式只等待目标及有效新帧；兼容旧任务调用而不改变系统焦点。
+            self.executor.wait_foreground_frame()
         elif self.hwnd:
             if not self.hwnd.bring_to_front():
                 self.logger.warning("ensure_in_front: bring_to_front failed, continuing")
@@ -1318,9 +1321,11 @@ class BaseTask(OCR):
         pass
 
     def disable(self):
+        # 先让持锁长按看见取消，避免清理线程等待整个手势完成后才能停止。
+        self._enabled = False
+        self.executor._wake_executor()
         if self.executor.current_task is self:
             self.executor.release_inputs()
-        self._enabled = False
         self.executor.remove_onetime_task(self)
         self.executor._wake_executor()
         communicate.task.emit(self)

@@ -17,14 +17,26 @@
          paths = sorted((directory / 'connections').glob('*.json'))
          paths.append(directory / 'connection.json')  # Also support older servers.
          for path in paths:
-@@ -276,6 +277,10 @@
-             if not controller.start_device(initial_refresh_done=True):
-                 raise RuntimeError('Target device could not be started; inspect the application log')
-         else:
-+            # 首次选中设备只排队绑定，须等捕获回退结束后再诊断，不能误判为不支持。
-+            manager.wait_for_binding(
-+                time_out=controller.start_timeout,
-+                cancel_check=lambda: executor.check_enabled(check_pause=False))
-             error = controller.check_device_error()
-             if error:
-                 raise RuntimeError(error)
+@@ -267,18 +268,11 @@
+     def _prepare_device(self):
+         executor = self.runtime.task_executor
+         executor.check_enabled()
+-        manager = self.runtime.device_manager
+-        manager.do_refresh(True)
+-        if manager.get_preferred_device() is None:
+-            raise RuntimeError('No target device selected in the project configuration')
+         controller = self.runner.app.start_controller
+-        if controller.start_exe:
+-            if not controller.start_device(initial_refresh_done=True):
+-                raise RuntimeError('Target device could not be started; inspect the application log')
+-        else:
+-            error = controller.check_device_error()
+-            if error:
+-                raise RuntimeError(error)
++        # 设备准备也服务于截图，只连接现有游戏，不建立输入激活请求。
++        controller.connect_existing_device(
++            prepare_only=executor.current_task is not None,
++            cancel_check=lambda: executor.check_enabled(check_pause=False))
+         executor.check_enabled()
+ 
+     def start(self):

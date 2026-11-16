@@ -1,6 +1,7 @@
 import itertools
 import threading
 import time
+import weakref
 from concurrent.futures import Future
 from contextlib import contextmanager
 
@@ -8,10 +9,11 @@ from ok.device.interaction_methods.foreground_input import (
     ForegroundInputError, ForegroundInputInterrupted, release_shared_foreground_input,
 )
 from ok.device.interaction_methods.nono import NonoInteraction
+from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction
 
 from ok.core.events import communicate
 from ok.core.notifications import alert_info
-from ok.task.exceptions import FinishedException, TaskDisabledException, WaitFailedException, CaptureException, \
+from ok.task.exceptions import FinishedException, TaskDisabledException, WaitFailedException, CaptureException, CaptureBusyException, \
     HotkeyConfigException, ExecutorBusyException
 from ok.util.GlobalConfig import basic_options
 from ok.util.logger import Logger, config_logger
@@ -108,6 +110,10 @@ class TaskExecutor:
         self._focus_wait_total = 0.0
         self._needs_foreground_frame = False
         self._notify_foreground_resume = False
+        self._start_prepare_lock = threading.RLock()
+        self._preparing_start = False
+        self._queued_start_requests = {}
+        self._prepared_start_requests = weakref.WeakKeyDictionary()
         self._snapshot_enabled = False
         self._frame_snapshot = None
         self.paused = True
@@ -290,21 +296,21 @@ class TaskExecutor:
         # copying without blocking queue operations on a potentially large image.
         return (snapshot[0].copy(), snapshot[1]) if snapshot is not None else None
 
-    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0):
+    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0, *, frame=None):
         if supported_ratio is None or min_size is None:
             return True, '0x0'
         logger.info('start check_frame_and_resolution')
-        self.device_manager.update_resolution_for_hwnd()
-        start = time.time()
-        frame = None
-        while frame is None and (time.time() - start) < time_out:
-            frame = self.method.get_frame()
-            time.sleep(0.1)
         if frame is None:
-            logger.error(f'check_frame_and_resolution failed can not get frame after {time_out} {time.time() - start}')
-            return False, '0x0'
-        width = self.method.width
-        height = self.method.height
+            self.device_manager.update_resolution_for_hwnd()
+            start = time.time()
+            while frame is None and (time.time() - start) < time_out:
+                frame = self.method.get_frame()
+                time.sleep(0.1)
+            if frame is None:
+                logger.error(f'check_frame_and_resolution failed can not get frame after {time_out} {time.time() - start}')
+                return False, '0x0'
+        # 显式开始已完成有界首帧，直接验证该帧，避免诊断重新等待截图或挪动窗口。
+        height, width = frame.shape[:2]
         actual_ratio = 0
         if height == 0:
             actual_ratio = 0
@@ -364,14 +370,26 @@ class TaskExecutor:
             raise TaskDisabledException()
         # 观察器不在执行器线程；MCP/通知作业的 ignore_pause 仍适用于它持有的输入。
         paused = self.paused and not self.debug_mode and not (job is not None and job.ignore_pause)
-        if not allow_pause and (paused or task is not None and task.paused):
+        if not allow_pause and (paused or task is not None and task.paused
+                                or getattr(self, '_preparing_start', False)):
             raise ForegroundInputInterrupted('任务已暂停，持有输入已清理')
+
+    @property
+    def is_background_input(self):
+        return isinstance(self.interaction, PostMessageTestInteraction)
 
     @property
     def foreground_waiting(self):
         interaction = self.interaction
         scheduled = self.current_task is not None or any(task.enabled for task in self.get_all_tasks())
-        return (isinstance(interaction, NonoInteraction) and not interaction.should_capture()
+        if not isinstance(interaction, (NonoInteraction, PostMessageTestInteraction)):
+            return False
+        try:
+            ready = interaction.should_capture()
+        except ForegroundInputError:
+            # 界面状态查询不能吞掉执行器的失败处理，也不应把异常抛进 Qt 定时回调。
+            ready = False
+        return ((not ready or getattr(self, '_foreground_waiting', False))
                 and (getattr(self, '_foreground_waiting', False) or not self.paused and scheduled))
 
     @property
@@ -386,22 +404,28 @@ class TaskExecutor:
 
     def _foreground_ready(self):
         interaction = self.interaction
-        needs_foreground = isinstance(interaction, NonoInteraction)
-        ready = not needs_foreground or interaction.should_capture()
+        if (getattr(self, '_preparing_start', False)
+                and getattr(self, '_start_prepare_thread', None) != threading.get_ident()):
+            return False
+        guarded = isinstance(interaction, (NonoInteraction, PostMessageTestInteraction))
+        ready = not guarded or interaction.should_capture()
+        if isinstance(interaction, PostMessageTestInteraction):
+            ready = ready and self.method is not None and self.method.connected()
         if not ready:
             if not getattr(self, '_foreground_waiting', False):
                 self._foreground_waiting = True
                 self._focus_wait_started = time.monotonic()
                 self.release_inputs(raise_on_error=True)
                 self.reset_scene(check_enabled=False)
-                logger.info('目标失焦，已释放输入并等待真实前台')
+                logger.info('目标窗口暂不可用，已释放输入并等待恢复' if isinstance(interaction, PostMessageTestInteraction)
+                            else '目标失焦，已释放输入并等待真实前台')
             return False
         resumed = getattr(self, '_foreground_waiting', False)
-        if resumed:
+        if resumed and not isinstance(interaction, PostMessageTestInteraction):
             self._focus_wait_total = getattr(self, '_focus_wait_total', 0.0) + time.monotonic() - self._focus_wait_started
             self._focus_wait_started = None
             self._foreground_waiting = False
-        if needs_foreground and (resumed or interaction.needs_refresh):
+        if guarded and (resumed or interaction.needs_refresh):
             if not interaction.refresh_target(force=True):
                 return False
             self.reset_scene(check_enabled=False)
@@ -411,7 +435,7 @@ class TaskExecutor:
 
     def _capture_generation(self):
         interaction = self.interaction
-        generation = interaction.target_generation if isinstance(interaction, NonoInteraction) else None
+        generation = interaction.target_generation if isinstance(interaction, (NonoInteraction, PostMessageTestInteraction)) else None
         return id(self.method), generation
 
     @contextmanager
@@ -452,6 +476,10 @@ class TaskExecutor:
             remaining = max(0, deadline - time.monotonic())
             if not interaction.prepare_foreground(request_focus=request_focus, time_out=remaining, cancel_check=check):
                 return False
+        elif isinstance(interaction, PostMessageTestInteraction):
+            # 通知返回和内部恢复调用旧入口时只能刷新，不能产生外部激活机会。
+            if not interaction.refresh_target(force=True):
+                return False
         elif interaction is None:
             return False
         elif request_focus:
@@ -460,6 +488,123 @@ class TaskExecutor:
         self._frame_target_generation = None
         self._needs_foreground_frame = True
         return True
+
+    def prepare_start(self, request, *, time_out=5, cancel_check=None):
+        """外部开始的唯一准备边界；业务暂停期间直接获取有界首帧。"""
+        deadline = time.monotonic() + max(0, time_out)
+        check = cancel_check or (lambda: self.check_input_cancelled(allow_pause=True))
+
+        def check_request():
+            if self.exit_event.is_set() or getattr(request, 'cancelled', False) or check():
+                raise TaskDisabledException()
+
+        lock = getattr(self, '_start_prepare_lock', None)
+        if lock is None:
+            lock = self._start_prepare_lock = threading.RLock()
+        while not lock.acquire(timeout=min(0.05, max(0, deadline - time.monotonic()))):
+            check_request()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('等待开始准备超时')
+        try:
+            self._preparing_start = True
+            self._start_prepare_thread = threading.get_ident()
+            self._wake_executor()
+            check_request()
+            self.release_inputs(raise_on_error=True)
+            wait = getattr(self.device_manager, 'wait_for_binding', None)
+            if callable(wait):
+                wait(time_out=max(0, deadline - time.monotonic()), cancel_check=check_request)
+            check_request()
+            interaction = self.interaction
+            if interaction is None or self.method is None:
+                raise CaptureException('尚未连接游戏，请先手动打开游戏')
+            prepared = getattr(self, '_prepared_start_requests', None)
+            if prepared is None:
+                prepared = self._prepared_start_requests = weakref.WeakKeyDictionary()
+            if prepared.get(request) is not interaction:
+                mode = ('post_message_test' if isinstance(interaction, PostMessageTestInteraction)
+                        else 'nono' if isinstance(interaction, NonoInteraction) else type(interaction).__name__)
+                logger.info(f'准备开始请求：{request.request_id}，来源：{request.source}，输入方式：{mode}')
+                if isinstance(interaction, PostMessageTestInteraction):
+                    interaction.prepare_start(request, cancel_check=check_request)
+                elif isinstance(interaction, NonoInteraction):
+                    if not interaction.prepare_foreground(request_focus=True,
+                            time_out=max(0, deadline - time.monotonic()), cancel_check=check_request):
+                        raise TimeoutError('无法取得游戏前台，请手动切回游戏后重新开始')
+                else:
+                    interaction.on_run()
+                # 抓帧失败也不重复进行同一请求的模式准备，后台额度由请求本身再保证一次。
+                prepared[request] = interaction
+            self.reset_scene(check_enabled=False)
+            self._frame_target_generation = None
+            self._needs_foreground_frame = True
+            self._notify_foreground_resume = self.current_task is not None
+            while True:
+                check_request()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('开始准备未取得游戏新画面，请恢复游戏窗口后重新开始')
+                if self.interaction is not interaction:
+                    raise ForegroundInputError('开始准备期间输入方式或目标已改变，请重新开始')
+                if self._foreground_ready() and self.can_capture():
+                    generation = self._capture_generation()
+                    # WGC 的 busy_wait 仅约束锁；probe 才把等待新帧也纳入调用方期限。
+                    probe = getattr(self.method, 'get_frame_for_probe', None)
+                    try:
+                        frame = (probe(min(NEXT_FRAME_BUSY_WAIT, remaining)) if callable(probe)
+                                 else self.method.get_frame(busy_wait=min(NEXT_FRAME_BUSY_WAIT, remaining)))
+                    except CaptureBusyException:
+                        frame = None
+                    check_request()
+                    if (frame is not None and self.interaction is interaction
+                            and generation == self._capture_generation() and interaction.should_capture()):
+                        if frame.shape[-1] == 4:
+                            frame = frame[:, :, :3]
+                        self._publish_frame(frame, generation)
+                        return True
+                self._wait_for_activity(min(0.05, max(0, deadline - time.monotonic())))
+        except BaseException as error:
+            # 模式已激活但首帧未完成也属于失败请求；旧额度不能变成隐式输入授权。
+            request.cancel()
+            prepared = getattr(self, '_prepared_start_requests', {})
+            prepared.pop(request, None)
+            self.release_inputs()
+            self.reset_scene(check_enabled=False)
+            if isinstance(error, ForegroundInputInterrupted):
+                # 开始失败需要新的外部请求，不能落入普通任务的自动安全恢复分支。
+                raise ForegroundInputError(f'开始准备未完成，请恢复游戏窗口后重新开始：{error}') from error
+            raise
+        finally:
+            self._preparing_start = False
+            self._start_prepare_thread = None
+            lock.release()
+            self._wake_executor()
+
+    def _publish_frame(self, frame, generation):
+        """准备与普通取帧共用发布顺序，恢复回调只能看到新代次画面。"""
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            raise CaptureException('截图尺寸无效')
+        self._frame = frame
+        self._frame_target_generation = generation
+        self._last_frame_time = time.time()
+        self._needs_foreground_frame = False
+        if isinstance(self.interaction, PostMessageTestInteraction) and getattr(self, '_foreground_waiting', False):
+            self._focus_wait_total = getattr(self, '_focus_wait_total', 0.0) + time.monotonic() - self._focus_wait_started
+            self._focus_wait_started = None
+            self._foreground_waiting = False
+        if getattr(self, '_snapshot_enabled', False):
+            with self.lock:
+                self._frame_snapshot = (frame.copy(), self._last_frame_time)
+        if self.blur_overlay_processor:
+            self.blur_overlay_processor.next_frame(frame)
+        if getattr(self, '_notify_foreground_resume', False) and self.current_task is not None:
+            if self.is_executor_thread():
+                self._notify_foreground_resume = False
+                self._notify_tasks_resumed()
+            else:
+                # 人工恢复在启动线程准备；任务的恢复异常必须在原执行栈抛出才能退出旧轮转。
+                self._needs_foreground_frame = True
 
     def wait_foreground_frame(self, time_out=None, deadline=None):
         """安全检查点等待新帧；外部期限与取消有效，运行中绝不置前。"""
@@ -477,7 +622,8 @@ class TaskExecutor:
         raise TaskDisabledException()
 
     def next_frame(self, time_out=6, *, deadline=None):
-        self.reset_scene(check_enabled=False)
+        if not (self.blocked_by_pause() or self.current_task is not None and self.current_task.paused):
+            self.reset_scene(check_enabled=False)
         if time_out is not None:
             own_deadline = time.monotonic() + max(0, time_out)
             deadline = min(deadline, own_deadline) if deadline is not None else own_deadline
@@ -487,7 +633,8 @@ class TaskExecutor:
             if remaining is not None and remaining <= 0:
                 return None
             paused = self.blocked_by_pause() or self.current_task is not None and self.current_task.paused
-            ready = self._foreground_ready()
+            # 暂停中的旧执行栈不能刷新/清空启动线程正在准备的新帧。
+            ready = not paused and self._foreground_ready()
             if not paused and ready and self.can_capture():
                 generation = self._capture_generation()
                 busy_wait = min(NEXT_FRAME_BUSY_WAIT, remaining) if remaining is not None else NEXT_FRAME_BUSY_WAIT
@@ -495,25 +642,15 @@ class TaskExecutor:
                 self.check_enabled(check_pause=False)
                 if (frame is not None and generation == self._capture_generation()
                         and self.interaction.should_capture()):
-                    height, width = frame.shape[:2]
-                    if height <= 0 or width <= 0:
-                        raise CaptureException('截图尺寸无效')
-                    self._frame = frame
-                    self._frame_target_generation = generation
-                    self._last_frame_time = time.time()
-                    self._needs_foreground_frame = False
-                    if getattr(self, '_snapshot_enabled', False):
-                        snapshot = (frame.copy(), self._last_frame_time)
-                        with self.lock:
-                            self._frame_snapshot = snapshot
-                    if self.blur_overlay_processor:
-                        self.blur_overlay_processor.next_frame(frame)
-                    if getattr(self, '_notify_foreground_resume', False):
-                        task = self.current_task
-                        if task is not None:
-                            self._notify_foreground_resume = False
-                            self._notify_tasks_resumed()
+                    self._publish_frame(frame, generation)
                     return self._frame
+                if isinstance(self.interaction, PostMessageTestInteraction):
+                    # 后台失帧不允许继续盲操作，也不应耗尽任务的普通业务期限。
+                    if not getattr(self, '_foreground_waiting', False):
+                        self._foreground_waiting = True
+                        self._focus_wait_started = time.monotonic()
+                    self._needs_foreground_frame = True
+                    self.release_inputs(raise_on_error=True)
                 if frame is not None:
                     # 抓帧期间目标变化，丢弃旧代次，下一轮刷新后再取帧。
                     self.release_inputs()
@@ -535,6 +672,7 @@ class TaskExecutor:
     def frame(self):
         while not self.exit_event.is_set():
             if (not self.blocked_by_pause() and self._foreground_ready() and self._frame is not None
+                    and not getattr(self, '_needs_foreground_frame', False)
                     and self._frame_target_generation == self._capture_generation()):
                 return self._frame
             self.next_frame()
@@ -546,6 +684,8 @@ class TaskExecutor:
         debug_mode ignores pause everywhere; a job ignores it only for its own
         code on the executor thread.
         """
+        if getattr(self, '_preparing_start', False):
+            return True
         if not self.paused or self.debug_mode:
             return False
         job = self.current_job
@@ -577,16 +717,17 @@ class TaskExecutor:
 
     def sleep(self, timeout: float):
         """业务等待排除失焦时间，恢复后取得新帧；取消检查不依赖输入守卫。"""
-        self.reset_scene(check_enabled=False)
+        if not (self.blocked_by_pause() or self.current_task is not None and self.current_task.paused):
+            self.reset_scene(check_enabled=False)
         if timeout <= 0:
             return
         deadline = self.business_time() + timeout
         self.pause_end_time = time.time() + timeout
         while not self.exit_event.is_set():
             self.check_enabled(check_pause=False)
-            ready = self._foreground_ready()
-            if (self.blocked_by_pause() or self.current_task is not None and self.current_task.paused
-                    or self.interaction is None or not ready):
+            paused = self.blocked_by_pause() or self.current_task is not None and self.current_task.paused
+            ready = not paused and self._foreground_ready()
+            if paused or self.interaction is None or not ready:
                 self._wait_for_activity(0.05)
                 continue
             if getattr(self, '_needs_foreground_frame', False):
@@ -646,21 +787,28 @@ class TaskExecutor:
         if task is not None:
             if self.current_task != task:
                 raise Exception(f"Can only pause current task {self.current_task}")
+            # 后台手势持有会话锁，先发布暂停让它的检查点退出，再等待清理锁。
+            task._paused = True
+            self._wake_executor()
             self.release_inputs()
         elif not self.paused:
-            self.release_inputs()
             self.paused = True
             self._wake_executor()
+            self.release_inputs()
             communicate.executor_paused.emit(self.paused)
             self.reset_scene(check_enabled=False)
             self.pause_start = time.time()
             return True
 
     def stop_current_task(self):
-        self.release_inputs()
         if task := self.current_task:
+            task._enabled = False
+            self._wake_executor()
+            self.cancel_start_request(task)
             task.disable()
             task.unpause()
+        else:
+            self.release_inputs()
 
     def _start_thread_locked(self):
         if self.thread is None:
@@ -882,7 +1030,45 @@ class TaskExecutor:
         self._wake_executor()
         return True
 
+    def has_start_request(self, task):
+        with self.lock:
+            return task in getattr(self, '_queued_start_requests', {})
+
+    def queue_start_request(self, task, request):
+        """把外部意图与队列项一起保留，不能打断正在执行的键鼠手势。"""
+        with self.lock:
+            requests = getattr(self, '_queued_start_requests', None)
+            if requests is None:
+                requests = self._queued_start_requests = {}
+            if task in requests:
+                return False
+            if getattr(request, 'cancelled', False) or self.exit_event.is_set():
+                return False
+            requests[task] = request
+        self._wake_executor()
+        return True
+
+    def cancel_start_request(self, task=None):
+        with self.lock:
+            requests = getattr(self, '_queued_start_requests', {})
+            if task is None:
+                cancelled = list(requests.items())
+                requests.clear()
+            else:
+                request = requests.pop(task, None)
+                cancelled = [(task, request)] if request is not None else []
+            for queued_task, _ in cancelled:
+                # 删除请求与禁用队列项必须同步，否则已启用任务可能绕过开始准备。
+                queued_task._enabled = False
+                if queued_task in self.onetime_task_queue:
+                    self.onetime_task_queue.remove(queued_task)
+        for queued_task, request in cancelled:
+            request.cancel()
+            communicate.task.emit(queued_task)
+        return bool(cancelled)
+
     def remove_onetime_task(self, task):
+        self.cancel_start_request(task)
         if task not in self.onetime_tasks:
             return False
         removed = False
@@ -919,6 +1105,9 @@ class TaskExecutor:
                 if onetime_task.enabled:
                     logger.info(f'get queued onetime_task {onetime_task.name}')
                     return onetime_task, True, False
+                request = getattr(self, '_queued_start_requests', {}).pop(onetime_task, None)
+                if request is not None:
+                    request.cancel()
         for onetime_task in self.onetime_tasks:
             if onetime_task.enabled:
                 logger.info(f'get one enabled onetime_task {onetime_task.name}')
@@ -952,7 +1141,11 @@ class TaskExecutor:
         return min(delays, default=default)
 
     def _prepare_task_for_run(self, is_trigger_task, request_focus=False):
-        """保留首帧前准备；只有显式请求才允许 PC 后端置前一次。"""
+        """只消费排队时已存在的外部请求，内部轮询不会创建激活机会。"""
+        with self.lock:
+            request = getattr(self, '_queued_start_requests', {}).pop(self.current_task, None)
+        if request is not None:
+            return self.prepare_start(request)
         wait = getattr(self.device_manager, 'wait_for_binding', None)
         if callable(wait):
             wait(cancel_check=lambda: self.check_input_cancelled(allow_pause=True))
@@ -962,6 +1155,8 @@ class TaskExecutor:
                 interaction.on_run()
             else:
                 interaction.refresh_target()
+        elif isinstance(interaction, PostMessageTestInteraction):
+            interaction.refresh_target()
         elif not is_trigger_task and interaction is not None:
             interaction.on_run()
 
@@ -1076,9 +1271,10 @@ class TaskExecutor:
 
     def stop(self):
         logger.info('stop')
-        self.release_inputs()
         self.exit_event.set()
         self._wake_executor()
+        self.cancel_start_request()
+        self.release_inputs()
 
     def destroy(self):
         lock = getattr(self, '_destroy_lock', None)
@@ -1088,6 +1284,8 @@ class TaskExecutor:
             if getattr(self, '_destroyed', False):
                 return
             self._destroyed = True
+        self.exit_event.set()
+        self._wake_executor()
         logger.info('Executor destroy')
         self.release_inputs()
         with self.lock:

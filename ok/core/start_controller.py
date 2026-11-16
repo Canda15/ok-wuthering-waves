@@ -4,28 +4,23 @@ import time
 from ok import Handler, og
 from ok import Logger
 from ok.device.capture import BaseWindowsCaptureMethod, BrowserCaptureMethod
+from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction
 from ok.core.events import communicate
 from ok.core.notifications import alert_error, alert_info
-from ok.util.process import is_admin, execute, WINDOWS_START_METHOD_START
+from ok.core.start_request import StartRequest
+from ok.task.exceptions import TaskDisabledException
 
 logger = Logger.get_logger(__name__)
 
 
 class StartController:
-    STARTED_WINDOW_MIN_SIZE = (100, 100)
-    STARTED_WINDOW_STABLE_SECONDS = 5
-    STARTED_WINDOW_POLL_INTERVAL = 0.2
-
     def __init__(self, app_config, exit_event):
         self.config = app_config
         self.exit_event = exit_event
         self.handler = Handler(exit_event, __name__)
         self.start_timeout = app_config.get('start_timeout', 60)
-        windows_config = app_config.get('windows') or {}
-        self.window_stable_seconds = windows_config.get(
-            'window_stable_seconds', self.STARTED_WINDOW_STABLE_SECONDS)
-        self.start_exe = windows_config.get('start_exe', True)
-        self.start_method = windows_config.get('start_method', WINDOWS_START_METHOD_START)
+        # 保留旧属性供扩展读取，但任何配置值都不能恢复自动开游戏。
+        self.start_exe = False
         self.starting = False
 
     @property
@@ -37,81 +32,88 @@ class StartController:
 
     @property
     def _pending(self):
-        """Tasks requested by :meth:`start` that are not enabled yet, in request order."""
         state = self.__dict__.get('_pending_state')
         if state is None:
-            state = self.__dict__['_pending_state'] = (threading.Lock(), [])
+            state = self.__dict__['_pending_state'] = (threading.RLock(), {})
         return state
 
     def is_task_pending(self, task):
-        """Whether ``task`` waits for the game to launch before it is queued."""
-        lock, tasks = self._pending
+        """等待连接和已排队到执行器的外部请求均可取消。"""
+        lock, requests = self._pending
         with lock:
-            return task in tasks
+            if task in requests:
+                return True
+        return og.executor.has_start_request(task)
 
-    def _add_pending(self, task):
-        if task is None or isinstance(task, int):
-            return
-        lock, tasks = self._pending
+    def _register_request(self, task, source):
+        lock, requests = self._pending
         with lock:
-            if task not in tasks:
-                tasks.append(task)
-        communicate.task.emit(task)
+            if task in requests or (task is not None and og.executor.has_start_request(task)):
+                return None
+            request = StartRequest(source)
+            requests[task] = request
+            self.starting = True
+        if task is not None and not isinstance(task, int):
+            communicate.task.emit(task)
+        logger.info(f'收到开始请求：{request.request_id}，来源：{request.source}')
+        return request
 
-    def _discard_pending(self, task):
-        if task is None or isinstance(task, int):
-            return False
-        lock, tasks = self._pending
+    def _discard_pending(self, task, request):
+        lock, requests = self._pending
         with lock:
-            if task not in tasks:
-                return False
-            tasks.remove(task)
-        communicate.task.emit(task)
-        return True
-
-    def cancel_task(self, task):
-        """Drop a task that waits for the game to launch.
-
-        If the launch in progress was started for that task, stop waiting for
-        the game too. Returns whether the task was pending.
-        """
-        if not self._discard_pending(task):
-            return False
-        logger.info(f'cancel pending start of {task}')
-        if self.__dict__.get('_active_task') is task:
-            self._cancel_requested.set()
-        return True
-
-    def cancel_start(self):
-        """Stop waiting for the game to launch and drop every task waiting for it.
-
-        The game process is left running.
-        """
-        logger.info('cancel_start requested')
-        self._cancel_requested.set()
-        lock, tasks = self._pending
-        with lock:
-            dropped = list(tasks)
-            tasks.clear()
-        for task in dropped:
+            if requests.get(task) is request:
+                del requests[task]
+            self.starting = bool(requests)
+        if task is not None and not isinstance(task, int):
             communicate.task.emit(task)
 
-    def _cancelled(self):
-        if self._cancel_requested.is_set():
-            logger.info('start cancelled while waiting for the game')
-            communicate.starting_emulator.emit(True, None, 0)
+    def cancel_task(self, task):
+        lock, requests = self._pending
+        with lock:
+            request = requests.pop(task, None)
+            if request is not None:
+                request.cancel()
+            self.starting = bool(requests)
+        queued = og.executor.cancel_start_request(task)
+        if request is not None and self.__dict__.get('_active_request') is request:
+            self._cancel_requested.set()
+        if request is not None or queued:
+            communicate.task.emit(task)
             return True
         return False
 
+    def cancel_start(self):
+        """取消尚未准备完的请求；不关闭游戏，也不产生任何激活。"""
+        self._cancel_requested.set()
+        lock, requests = self._pending
+        with lock:
+            dropped = list(requests.items())
+            requests.clear()
+            self.starting = False
+        for task, request in dropped:
+            request.cancel()
+            if task is not None and not isinstance(task, int):
+                communicate.task.emit(task)
+        og.executor.cancel_start_request()
+
     def _check_prepare_cancelled(self):
         if self.exit_event.is_set() or self._cancel_requested.is_set():
-            from ok.task.exceptions import TaskDisabledException
             raise TaskDisabledException()
+        if request := self.__dict__.get('_active_request'):
+            request.check_cancelled()
+        # 绑定和首帧准备会等待；等待期间 MCP 可能接管，不能只在入口判断一次。
+        if (owner := getattr(og.executor, 'exclusive_owner', None)) is not None:
+            raise RuntimeError(f'助手已由 {owner} 接管，本次开始请求已停止')
 
-    def _prepare_explicit_foreground(self):
-        if not og.executor.prepare_foreground(
-                request_focus=True, time_out=min(5, self.start_timeout), cancel_check=self._check_prepare_cancelled):
-            raise RuntimeError('目标尚未获得真实前台，请将游戏切回前台后重试启动')
+    def _prepare_explicit_start(self, request):
+        self._check_prepare_cancelled()
+        if not og.executor.prepare_start(
+                request, time_out=min(5, self.start_timeout), cancel_check=self._check_prepare_cancelled):
+            raise RuntimeError('游戏输入或画面尚未就绪，请检查游戏窗口后重试')
+        self._check_prepare_cancelled()
+        error = self.check_device_error(frame=og.executor.nullable_frame(), cancel_check=self._check_prepare_cancelled)
+        if error:
+            raise RuntimeError(error)
 
     def tr(self, message):
         app = getattr(og, "app", None)
@@ -124,247 +126,167 @@ class StartController:
             task._foreground_resume_pending = False
             task.info_clear()
             task.executor.enqueue_onetime_task(task)
-            logger.info(f"enabled task {task}")
+            logger.info(f"已启用任务：{task}")
         communicate.task.emit(task)
 
     def _resolve_task(self, task):
-        """Map a 0-based one-time task index to its task object.
-
-        CLI callers (``-t``/``-e``) pass an index. Pending entries are matched by
-        task identity, so an index has to be resolved before it is tracked there,
-        otherwise the launch would drop the request it was started for.
-        """
         if not isinstance(task, int):
             return task
-        executor = getattr(og, 'executor', None)
-        tasks = getattr(executor, 'onetime_tasks', None)
+        tasks = getattr(og.executor, 'onetime_tasks', None)
         try:
             return tasks[task]
         except (IndexError, TypeError):
-            # An invalid index is reported by _do_start the same way as before.
             return task
 
-    def start(self, task=None, exit_after=False):
-        """Launch the game if needed, then run ``task``.
-
-        Until the game is ready the task is pending: :meth:`is_task_pending`
-        reports it and :meth:`cancel_task` drops it.
-        """
-        self.starting = True
-        pending_task = self._resolve_task(task)
-        self._add_pending(pending_task)
-        try:
-            self.handler.post(lambda: self.do_start(pending_task, exit_after, from_queue=True))
-        except Exception:
-            self.starting = False
-            self._discard_pending(pending_task)
-            raise
-
-    def do_start(self, task=None, exit_after=False, from_queue=False):
-        if from_queue and task is not None and not isinstance(task, int) and not self.is_task_pending(task):
-            logger.info(f'do_start skipped, {task} was cancelled or already started')
+    def start(self, task=None, exit_after=False, *, source='开始按钮'):
+        """统一接收热键、鼠标和命令行请求，游戏必须已由用户打开。"""
+        task = self._resolve_task(task)
+        request = self._register_request(task, source)
+        if request is None:
             return False
-        if not from_queue:
-            # Direct callers (headless run_task) skip start(), so track the task here;
-            # otherwise _do_start would treat it as cancelled once the game is up.
-            task = self._resolve_task(task)
-            self._add_pending(task)
-        self.starting = True
-        self._cancel_requested.clear()
-        self.__dict__['_active_task'] = task
         try:
-            return self._do_start(task, exit_after)
-        finally:
-            self.__dict__['_active_task'] = None
-            self._discard_pending(task)
-            self.starting = False
+            self.handler.post(lambda: self.do_start(task, exit_after, from_queue=True, request=request))
+        except Exception:
+            request.cancel()
+            self._discard_pending(task, request)
+            raise
+        return True
 
-    def _do_start(self, task=None, exit_after=False):
-        if (owner := getattr(getattr(og, 'executor', None), 'exclusive_owner', None)) is not None:
-            logger.info(f'do_start refused, executor held by {owner}')
+    def do_start(self, task=None, exit_after=False, from_queue=False, *, request=None, source='无界面任务'):
+        task = self._resolve_task(task)
+        if from_queue:
+            lock, requests = self._pending
+            with lock:
+                if requests.get(task) is not request or request.cancelled:
+                    return False
+        else:
+            request = self._register_request(task, source)
+            if request is None:
+                return False
+        lock = self.__dict__.setdefault('_start_lock', threading.Lock())
+        with lock:
+            if request.cancelled:
+                self._discard_pending(task, request)
+                return False
+            self._cancel_requested.clear()
+            self.__dict__['_active_request'] = request
+            try:
+                return self._do_start(task, exit_after, request=request)
+            finally:
+                self.__dict__['_active_request'] = None
+                self._discard_pending(task, request)
+
+    def _do_start(self, task=None, exit_after=False, *, request=None):
+        request = request or StartRequest('显式开始')
+        executor = og.executor
+        if (owner := getattr(executor, 'exclusive_owner', None)) is not None:
             communicate.starting_emulator.emit(
                 True, self.tr('Cannot start: the app is controlled by {owner}').format(owner=owner), 0)
             return False
-        communicate.starting_emulator.emit(False, None, self.start_timeout)
-        tasks_to_enable = []
+        communicate.starting_emulator.emit(False, None, 0)
+        error_message = None
+        enabled_here = []
         try:
+            request.check_cancelled()
+            self._check_prepare_cancelled()
             if isinstance(task, int):
-                task = og.executor.onetime_tasks[task]
-                logger.info(f"enable param task {task}")
-
-            if task and task.enabled and task.paused:
-                logger.info(f"resume paused task {task}")
-                self._prepare_explicit_foreground()
-                if exit_after:
-                    task.exit_after_task = True
-                    communicate.task.emit(task)
-                task.unpause()
-                communicate.starting_emulator.emit(True, None, 0)
+                task = executor.onetime_tasks[task]
+            current = executor.current_task
+            # 同一任务已在运行时，重复按钮不应得到第二次激活机会。
+            if task is not None and task.enabled and not task.paused and not executor.paused:
                 return True
-
-            if task and og.executor.current_task and og.executor.current_task != task:
-                logger.info(f"queue task while another task is running {task}")
+            if task is None and not executor.paused and not (current and current.paused):
+                return True
+            if task and ((current and current is not task)
+                         or (not executor.paused and not (current is task and task.paused))):
+                # 正在执行的手势不被插入激活；新任务在其真正执行前消费请求。
+                if not executor.queue_start_request(task, request):
+                    request.check_cancelled()
+                    return True
                 if exit_after:
                     task.exit_after_task = True
+                if not task.enabled:
+                    enabled_here.append(task)
                 self._mark_task_enabled(task)
-                if og.executor.paused:
-                    self._prepare_explicit_foreground()
-                    og.executor.start()
-                communicate.starting_emulator.emit(True, None, 0)
+                # 取消可能与排队并发；不能在取消已清除额度后重新启用任务。
+                if request.cancelled:
+                    task.disable()
+                    request.check_cancelled()
+                # 排队另一个任务不等于恢复当前任务；暂停者等待自己的显式恢复请求。
                 return True
-        except Exception as e:
-            logger.error(f'do_start resume exception: {e}', e)
-            communicate.starting_emulator.emit(True, self.tr('Start failed: {error}').format(error=e), 0)
-            return False
 
-        try:
-            logger.info(f'do_start: call do_refresh {self.start_exe}')
-            og.device_manager.do_refresh(True)
-        except Exception as e:
-            logger.error(f'do_start do_refresh exception: {e}', e)
-            communicate.starting_emulator.emit(True, self.tr(str(e)), 0)
-            return False
-
-        try:
-            if self.start_exe:
-                if not self.start_device(initial_refresh_done=True):
-                    return False
-            else:
-                logger.info('windows.start_exe is False, skip start_device')
+            self.connect_existing_device(prepare_only=True, cancel_check=self._check_prepare_cancelled)
             self.check_auto_hdr()
             self.check_gpu_driver_post_processing()
-
-            def add_task_to_enable(enable_task):
-                if enable_task and enable_task not in tasks_to_enable:
-                    tasks_to_enable.append(enable_task)
-
-            for start_task in og.executor.get_all_tasks():
-                if getattr(start_task, 'enable_after_start', False):
-                    logger.info(f"enable_after_start task {start_task}")
-                    add_task_to_enable(start_task)
-
-            lock, pending = self._pending
-            with lock:
-                if task is not None and not isinstance(task, int) and task not in pending:
-                    logger.info(f'{task} was cancelled while the game was starting')
-                    task = None
-                waiting = list(pending)
-                pending.clear()
-
-            if task:
-                add_task_to_enable(task)
+            self._prepare_explicit_start(request)
+            if task and task.enabled and task.paused:
                 if exit_after:
                     task.exit_after_task = True
-            # Tasks requested during this launch run once the game is ready.
-            for waiting_task in waiting:
-                add_task_to_enable(waiting_task)
-
-            # 总启动即使只有触发任务，也须先等新绑定并核对一次真实前台。
-            self._prepare_explicit_foreground()
-            for task in tasks_to_enable:
-                self._mark_task_enabled(task)
-
-            og.executor.start()
-            communicate.starting_emulator.emit(True, None, 0)
-            return True
-        except Exception as e:
-            logger.error(f'do_start exception: {e}', e)
-            communicate.starting_emulator.emit(True, self.tr('Start failed: {error}').format(error=e), 0)
-            return False
-
-    def _wait_until_device_ready(self, refresh_first=True):
-        wait_until = time.time() + self.start_timeout
-        first_check = True
-        while not self.exit_event.is_set():
-            if self._cancelled():
-                return False
-            if refresh_first or not first_check:
-                og.device_manager.do_refresh(True)
-            first_check = False
-            error = self.check_device_error()
-            if error is None:
+                task.unpause()
                 return True
-            logger.error(f'waiting for game to start error {error}')
-            remaining_time = wait_until - time.time()
-            if remaining_time <= 0:
-                communicate.starting_emulator.emit(True, self.tr('Start game timeout!'), 0)
-                return False
-            communicate.starting_emulator.emit(False, None, int(remaining_time))
-            time.sleep(2)
-        return False
+            if task is None and current and current.paused:
+                current.unpause()
+                return True
+            tasks_to_enable = [item for item in executor.get_all_tasks()
+                               if getattr(item, 'enable_after_start', False)]
+            if task is not None and task not in tasks_to_enable:
+                tasks_to_enable.append(task)
+            if task and exit_after:
+                task.exit_after_task = True
+            self._check_prepare_cancelled()
+            for enable_task in tasks_to_enable:
+                if not enable_task.enabled:
+                    enabled_here.append(enable_task)
+                self._mark_task_enabled(enable_task)
+            self._check_prepare_cancelled()
+            executor.start()
+            return True
+        except TaskDisabledException:
+            request.cancel()
+            for enable_task in enabled_here:
+                enable_task.disable()
+            logger.info(f'开始请求已取消：{request.request_id}')
+            return False
+        except Exception as error:
+            request.cancel()
+            for enable_task in enabled_here:
+                enable_task.disable()
+            logger.error(f'开始请求失败：{request.request_id}，{error}', error)
+            error_message = self.tr('Start failed: {error}').format(error=error)
+            return False
+        finally:
+            communicate.starting_emulator.emit(True, error_message, 0)
 
-    def _wait_until_started_window_stable(self):
-        wait_until = time.monotonic() + self.start_timeout
-        stable_size = None
-        stable_since = None
-        min_width, min_height = self.STARTED_WINDOW_MIN_SIZE
-
-        while not self.exit_event.is_set():
-            if self._cancelled():
-                return False
-            hwnd_window = getattr(og.device_manager, 'hwnd_window', None)
-            if hwnd_window is not None:
-                hwnd_window.do_update_window_size()
-                size = (hwnd_window.width, hwnd_window.height)
-                if hwnd_window.hwnd and size[0] >= min_width and size[1] >= min_height:
-                    now = time.monotonic()
-                    if size != stable_size:
-                        logger.info(f'waiting for started window to stabilize, current size {size[0]}x{size[1]}')
-                        stable_size = size
-                        stable_since = now
-                    elif now - stable_since >= self.window_stable_seconds:
-                        logger.info(f'started window size stable for {self.window_stable_seconds}s: {size[0]}x{size[1]}')
-                        return True
-                else:
-                    stable_size = None
-                    stable_since = None
-
-            remaining_time = wait_until - time.monotonic()
-            if remaining_time <= 0:
-                communicate.starting_emulator.emit(True, self.tr('Start game timeout!'), 0)
-                return False
-            time.sleep(self.STARTED_WINDOW_POLL_INTERVAL)
-        return False
+    def connect_existing_device(self, *, initial_refresh_done=False, prepare_only=False, cancel_check=None):
+        """只连接用户已打开的游戏；设备缺失立即失败，不等待虚假的启动倒计时。"""
+        manager = og.device_manager
+        check_cancelled = cancel_check or self._check_prepare_cancelled
+        if check_cancelled() is True:
+            raise TaskDisabledException()
+        if not initial_refresh_done:
+            manager.do_refresh(True)
+        device = manager.get_preferred_device()
+        if not device or not device.get('connected'):
+            raise RuntimeError('请先手动打开游戏，并选择正确的游戏窗口')
+        # 首次发现窗口时，捕获初始化仍可能异步回退，须等绑定完成再诊断。
+        manager.wait_for_binding(time_out=min(5, self.start_timeout), cancel_check=check_cancelled)
+        if check_cancelled() is True:
+            raise TaskDisabledException()
+        error = self.check_device_error(prepare_only=prepare_only, cancel_check=check_cancelled)
+        if error:
+            raise RuntimeError(error)
+        return True
 
     def start_device(self, initial_refresh_done=False):
-        device = og.device_manager.get_preferred_device()
-        logger.info(f'start_device: {device}')
-
-        if device and not device['connected']:
-            if device['device'] == "windows" and not is_admin():
-                communicate.starting_emulator.emit(True,
-                                                   self.tr("PC version requires admin privileges, Please restart this app with admin privileges!"),
-                                                   0)
-                communicate.restart_admin.emit()
-                return False
-            path = og.device_manager.get_exe_path(device)
-            if path:
-                logger.info(f"starting game {path}")
-                args = None
-                dx11_config = og.global_config.get_config('Launch with DX11')
-                if dx11_config and dx11_config.get('Launch with DX11'):
-                    args = "-dx11 -d3d11 -force-d3d11"
-                if device['device'] == "windows":
-                    launch_arguments = (self.config.get('windows') or {}).get('launch_arguments')
-                    if callable(launch_arguments):
-                        launch_arguments = launch_arguments()
-                    if launch_arguments:
-                        args = f'{args or ""} {launch_arguments}'.strip()
-                if not execute(path, arguments=args, start_method=self.start_method):
-                    communicate.starting_emulator.emit(True, self.tr("Start game failed, please start game first"), 0)
-                    return False
-                if device['device'] == "windows" and not self._wait_until_started_window_stable():
-                    return False
-                if not self._wait_until_device_ready():
-                    return False
-            else:
-                communicate.starting_emulator.emit(True,
-                                                   self.tr('Game path does not exist, Please open game manually!'), 0)
-                return False
-        elif not self._wait_until_device_ready(refresh_first=not initial_refresh_done):
+        """兼容旧任务接口；只做连接检查，绝不创建或重启游戏进程。"""
+        try:
+            return self.connect_existing_device(initial_refresh_done=initial_refresh_done)
+        except TaskDisabledException:
             return False
-        communicate.starting_emulator.emit(True, None, 0)
-        return True
+        except Exception as error:
+            logger.error(f'连接已运行游戏失败：{error}')
+            communicate.starting_emulator.emit(True, self.tr(str(error)), 0)
+            return False
 
     def check_auto_hdr(self):
         if not (self.config.get('windows') or {}).get('check_auto_hdr', False):
@@ -426,7 +348,7 @@ class StartController:
                 None,
             )
 
-    def check_resolution(self):
+    def check_resolution(self, frame=None):
         error = None
         supported_resolution = self.config.get(
             'supported_resolution', {})
@@ -438,9 +360,10 @@ class StartController:
         is_windows_capture = isinstance(capture_method, BaseWindowsCaptureMethod)
         auto_resize_enabled = (
             not is_windows_capture
-            or og.global_config.get_config('Basic Options').get('Auto Resize Game Window', True)
+            or (not isinstance(og.device_manager.interaction, PostMessageTestInteraction)
+                and og.global_config.get_config('Basic Options').get('Auto Resize Game Window', True))
         )
-        supported, resolution = og.executor.check_frame_and_resolution(supported_ratio, min_size)
+        supported, resolution = og.executor.check_frame_and_resolution(supported_ratio, min_size, frame=frame)
         if not supported:
             resize_success = False
             if resize_to and is_windows_capture and auto_resize_enabled:
@@ -464,14 +387,16 @@ class StartController:
         elif error:
             alert_error(error, tray=True)
 
-    def check_device_error(self):
+    def check_device_error(self, *, prepare_only=False, frame=None, cancel_check=None):
         try:
+            if cancel_check is not None and cancel_check() is True:
+                raise TaskDisabledException()
             device = og.device_manager.get_preferred_device()
-            error_msg = self.tr("{} is not connected, please select the game window.").format(
-                device['nick'])
-            logger.info(f'test check_device_error msg: {error_msg}')
             if not device:
-                return self.tr('No game selected!')
+                return '请先手动打开游戏，并选择正确的游戏窗口'
+            error_msg = self.tr("{} is not connected, please select the game window.").format(
+                device.get('nick', '游戏'))
+            logger.info(f'test check_device_error msg: {error_msg}')
             if og.device_manager.capture_method is None:
                 return self.tr("Selected capture method is not supported by the game or your system!")
             if not og.device_manager.device_connected():
@@ -484,11 +409,15 @@ class StartController:
             if not og.device_manager.capture_method.connected():
                 logger.error(f'Game window is not connected {og.device_manager.capture_method}')
                 return error_msg
+            if prepare_only:
+                # nono 必须先完成显式置前，不能用尚在后台的截图否定一次合法开始。
+                return None
             if isinstance(og.device_manager.capture_method, BaseWindowsCaptureMethod):
 
                 if not og.device_manager.capture_method.hwnd_window.pos_valid:
                     hwnd_window = og.device_manager.capture_method.hwnd_window
-                    if hwnd_window.hwnd and hwnd_window.window_width > 0 and hwnd_window.window_height > 0:
+                    if (not isinstance(og.device_manager.interaction, PostMessageTestInteraction)
+                            and hwnd_window.hwnd and hwnd_window.window_width > 0 and hwnd_window.window_height > 0):
                         from ok.util.window import resize_window
                         logger.info(
                             f"Window pos invalid, trying to center window with size {hwnd_window.window_width}x{hwnd_window.window_height}")
@@ -497,7 +426,8 @@ class StartController:
                     if not og.device_manager.capture_method.hwnd_window.pos_valid:
                         return self.tr(
                             'Window is minimized or out of screen, and don\'t use full-screen exclusive mode!')
-            frame = self.try_capture_a_frame()
+            if frame is None:
+                frame = self.try_capture_a_frame(cancel_check=cancel_check)
             if frame is None:
                 logger.error('check_device_error: try_capture_a_frame returned None')
                 return self.tr('Capture failed, please check game window')
@@ -512,7 +442,7 @@ class StartController:
                 logger.info('check_device_error: feature_set is None')
 
             logger.info('check_device_error: checking resolution')
-            resolution_error = self.check_resolution()
+            resolution_error = self.check_resolution(frame=frame)
             if resolution_error:
                 logger.error(f'check_device_error: resolution_error: {resolution_error}')
                 return resolution_error
@@ -521,23 +451,28 @@ class StartController:
                 started = og.device_manager.adb_ensure_in_front()
                 if not started:
                     return self.tr("Can't start game, make sure the game is installed")
-        except FileNotFoundError as e:
-            raise e
+        except (FileNotFoundError, TaskDisabledException):
+            raise
         except Exception as e:
             logger.error(f'check_device_error exception: {str(e)}', e)
             return self.tr(str(e))
 
     @staticmethod
-    def try_capture_a_frame():
-        start = time.time()
+    def try_capture_a_frame(*, time_out=5, cancel_check=None):
+        deadline = time.monotonic() + max(0, time_out)
+        capture = og.device_manager.capture_method
         while True:
-            # A running executor may own the capture; wait for it rather than
-            # polling a lock it releases only briefly between frames.
-            frame = og.device_manager.capture_method.get_frame(busy_wait=1)
+            if cancel_check is not None and cancel_check() is True:
+                raise TaskDisabledException()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            # WGC 正常截图可长等；开始诊断采用短探测，取消不必等整段原生截图超时。
+            probe = getattr(capture, 'get_frame_for_probe', None)
+            frame = (probe(min(0.1, remaining)) if callable(probe)
+                     else capture.get_frame(busy_wait=min(0.1, remaining)))
+            if cancel_check is not None and cancel_check() is True:
+                raise TaskDisabledException()
             if frame is not None:
                 return frame
-            logger.info('try_capture_a_frame: frame is None, retrying...')
-            if time.time() - start > 5:
-                logger.error('time out try_capture_a_frame')
-                return None
-            time.sleep(0.1)
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))

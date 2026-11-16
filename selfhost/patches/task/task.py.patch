@@ -60,7 +60,17 @@
          self.executor.reset_scene()
          self.executor.interaction.swipe(from_x, from_y, to_x, to_y, ms, settle_time=settle_time)
          self.sleep(after_sleep)
-@@ -434,9 +440,9 @@
+@@ -345,6 +351,9 @@
+     def ensure_in_front(self):
+         if self.is_adb():
+             self.executor.device_manager.adb_ensure_in_front()
++        elif self.executor.is_background_input:
++            # 后台模式只等待目标及有效新帧；兼容旧任务调用而不改变系统焦点。
++            self.executor.wait_foreground_frame()
+         elif self.hwnd:
+             if not self.hwnd.bring_to_front():
+                 self.logger.warning("ensure_in_front: bring_to_front failed, continuing")
+@@ -434,9 +443,9 @@
              box = self.get_box_by_name(box)
  
          if not box:
@@ -72,7 +82,7 @@
              return
          x, y = box.relative_with_variance(relative_x, relative_y)
          return self.click(x, y, name=box.name, move_back=move_back, move=move, down_time=down_time,
-@@ -508,8 +514,10 @@
+@@ -508,8 +517,10 @@
  
      def send_key_up(self, key, after_sleep=0):
          key = self.validate_key(key)
@@ -85,7 +95,7 @@
          if after_sleep > 0:
              self.sleep(after_sleep)
  
-@@ -995,7 +1003,7 @@
+@@ -995,7 +1006,7 @@
              time_out=time_out, post_action=post_action,
              raise_if_not_found=raise_if_not_found, settle_time=settle_time)
          if not boxes and raise_if_not_found:
@@ -94,7 +104,7 @@
              boxes = self.ocr(x, y, to_x=to_x, to_y=to_y, width=width, height=height, box=box, name=name,
                               threshold=threshold, frame=frame, target_height=target_height, log=True, screenshot=True,
                               lib=lib)
-@@ -1044,11 +1052,24 @@
+@@ -1044,11 +1055,24 @@
          self.support_schedule_task = False
  
      def run_task_by_class(self, cls):
@@ -120,7 +130,7 @@
          except Exception as e:
              self.log_error(f'run_task_by_class {cls}', e)
              raise
-@@ -1072,7 +1093,7 @@
+@@ -1072,7 +1096,7 @@
          index = self.executor.onetime_tasks.index(self) + 1
          path = create_shortcut(None, f' {self.name}', arguments=f"-t {index}")
          if path:
@@ -129,7 +139,7 @@
              reveal_in_explorer(path)
  
      def sleep_check(self):
-@@ -1115,7 +1136,23 @@
+@@ -1115,7 +1139,23 @@
          if config is None:
              config = self.capture_config
          if config:
@@ -154,7 +164,7 @@
  
      def update_capture(self, config):
          return self.executor.device_manager.update_capture(config)
-@@ -1130,9 +1167,9 @@
+@@ -1130,9 +1170,9 @@
                  communicate.task.emit(self)
                  return
              self._enabled = True
@@ -165,12 +175,15 @@
              self.executor.enqueue_onetime_task(self)
              logger.info(f'enabled task {self}')
          communicate.task.emit(self)
-@@ -1281,6 +1318,8 @@
+@@ -1281,7 +1321,11 @@
          pass
  
      def disable(self):
++        # 先让持锁长按看见取消，避免清理线程等待整个手势完成后才能停止。
+         self._enabled = False
++        self.executor._wake_executor()
 +        if self.executor.current_task is self:
 +            self.executor.release_inputs()
-         self._enabled = False
          self.executor.remove_onetime_task(self)
          self.executor._wake_executor()
+         communicate.task.emit(self)

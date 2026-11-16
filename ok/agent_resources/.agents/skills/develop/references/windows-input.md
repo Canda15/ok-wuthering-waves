@@ -1,7 +1,8 @@
 # 通过 MCP 验证 Windows 前台输入
 
 截图正常但输入失败、权限被拒绝或手势中断时使用本指南。本应用 Windows
-始终使用共享前台系统键鼠，先诊断具体动作，不切回窗口消息或另建控制器。
+默认 nono 共享前台系统键鼠；明确选择 post_message_test 时按下文后台测试合同验证。
+先诊断具体动作，不自动切换模式或另建控制器。游戏始终由用户手动打开，助手只连接现有窗口。
 
 ## Separate permission, delivery, and recognition
 
@@ -67,6 +68,16 @@ counter or elimination result. Mouse motion alone is insufficient evidence.
   或失败都释放，只有仍保持程序切换且用户未切走时才恢复游戏并取得新帧。
 - 通过 MCP 重跑实际注册任务，分别记录离线替身、受控窗口和真实游戏验证。
   桌面通知只能使用替身或临时受控窗口测试，不向真实联系人发送消息。
+
+## 后台测试模式
+
+- `post_message_test` 通过公共任务接口发送窗口键鼠消息，nono 默认值及旧别名迁移不变。
+- 每个外部开始／恢复请求仅对主窗口发送一条 WA_ACTIVE，快捷键、鼠标和显式 MCP 运行同义。
+  按暂停／停止、普通动作、子任务、轮询、重绑和窗口恢复不会额外激活；日志核对实际尝试次数。
+- 最小化／隐藏释放持有并等待，恢复到同一目标后取得新帧继续。主窗口或进程身份改变需重新开始。
+  窗口焦点归零不代表后台消息失效，不能据此补发。
+- 分别验证普通键、长按、文本、点击、滚轮和拖拽。PostMessage 入队成功不是游戏响应证据，
+  也不能把单 ESC 实验当作所有控件可用。后台失败不得调用真实键鼠或逐操作激活兜底。
 
 Do not use Computer Use skills, plugins, or tools for input validation or desktop
 task-card testing. Keep capture and interaction in ok-script APIs and MCP. If the

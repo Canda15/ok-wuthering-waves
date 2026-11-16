@@ -997,13 +997,9 @@ class BaseWWTask(BaseTask):
                     self.log_info(self.tr('Click the Agree button!'))
                 return False
             if self.find_boxes(texts, match=[re.compile("游戏即将重启"), re.compile('遊戲即將重啟')]):
-                self.sleep(0.2)
-                self.log_info(self.tr('Game update completed; the game will restart'))
-                self.click(self.find_boxes(texts, match=["确认", "確認"]), after_sleep=60)
-                result = self.start_device()
-                self.log_info(self.tr('start_device end {result}').format(result=result))
-                self.sleep(30)
-                return False
+                # 确认按钮本身会重启游戏，必须在点击前停止，不能只禁止后续进程启动。
+                self.executor.release_inputs()
+                raise RuntimeError('游戏更新需要重启，请手动完成更新并打开游戏后重新开始任务')
 
             if start := self.find_boxes(texts, boundary='bottom_right', match=["开始游戏", re.compile("进入游戏")]):
                 if not self.find_boxes(texts, boundary='bottom_right', match=LOGIN_TEXTS):

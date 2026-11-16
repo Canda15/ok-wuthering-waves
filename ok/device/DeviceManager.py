@@ -10,6 +10,7 @@ import numpy as np
 from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method, NemuIpcCaptureMethod, \
     ADBCaptureMethod
 from ok.device.interaction import NonoInteraction, BrowserInteraction, ADBInteraction
+from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction
 from ok.task.exceptions import TaskDisabledException
 from ok.core.events import communicate
 from ok.util.collection import parse_ratio
@@ -44,7 +45,7 @@ def method_name(method):
 
 
 def normalize_pc_interaction(interaction):
-    """所有 PC 入口统一为 nono，历史标识仅用于迁移到同一前台方案。"""
+    """旧值继续迁移到 nono；实验后台必须由新标识明确选择。"""
     if isinstance(interaction, list):
         for item in interaction:
             normalize_pc_interaction(item)
@@ -54,12 +55,18 @@ def normalize_pc_interaction(interaction):
     if interaction is NonoInteraction:
         return 'nono'
     name = interaction.__name__ if isinstance(interaction, type) else interaction
+    if name == 'post_message_test' or interaction is PostMessageTestInteraction:
+        return 'post_message_test'
     accepted = {'nono', 'nonointeraction', 'pynput', 'pynputinteraction', 'postmessage', 'postmessageinteraction',
                 'genshin', 'genshininteraction', 'foregroundpostmessage',
                 'foregroundpostmessageinteraction', 'pydirect', 'pydirectinteraction'}
     if isinstance(name, str) and name.strip().lower() in accepted:
         return 'nono'
-    raise ValueError('不支持该 PC 输入方案，本应用仅使用前台系统键鼠')
+    raise ValueError('不支持该 PC 输入方案')
+
+
+PC_INTERACTIONS = {'nono': NonoInteraction, 'post_message_test': PostMessageTestInteraction}
+BACKGROUND_CAPTURE_METHODS = frozenset(('WGC', 'WGC_HDR', 'BitBlt_RenderFull'))
 
 
 class DeviceManager:
@@ -102,10 +109,12 @@ class DeviceManager:
             from ok.device.interaction_methods.foreground_input import get_shared_foreground_input
             if hasattr(exit_event, 'bind_stop'):
                 exit_event.bind_stop(get_shared_foreground_input())
-            self.windows_capture_config['interaction'] = normalize_pc_interaction(
-                self.windows_capture_config.get('interaction'))
-            normalize_pc_interaction(self.config.get('interaction'))
-            self.win_interaction_class = NonoInteraction
+            declared = self.windows_capture_config.get('interaction')
+            normalize_pc_interaction(declared)
+            if 'post_message_test' not in (declared if isinstance(declared, list) else [declared]):
+                self.windows_capture_config['interaction'] = normalize_pc_interaction(declared)
+            selected = normalize_pc_interaction(self.config.get('interaction'))
+            self.win_interaction_class = PC_INTERACTIONS[selected]
             self._save_pc_interaction()
             if isinstance(self.windows_capture_config.get('exe'), str):
                 self.windows_capture_config['exe'] = [self.windows_capture_config.get('exe')]
@@ -122,10 +131,9 @@ class DeviceManager:
 
     def _save_pc_interaction(self):
         try:
-            self.config['interaction'] = 'nono'
+            self.config['interaction'] = normalize_pc_interaction(self.win_interaction_class)
         except Exception as error:
-            # 保存失败也已经采用唯一前台类，不能降级到旧配置。
-            logger.warning(f'前台输入配置保存失败：{error}')
+            logger.warning(f'输入方式配置保存失败：{error}')
 
     @property
     def interaction(self):
@@ -135,16 +143,20 @@ class DeviceManager:
     def interaction(self, interaction):
         previous = getattr(self, '_interaction', None)
         if previous is not None and previous is not interaction:
-            self.release_input()
+            self.release_input(raise_on_error=True)
         self._interaction = interaction
 
-    def release_input(self):
+    def release_input(self, raise_on_error=False):
         interaction = self.interaction
         if interaction is not None:
             try:
                 interaction.release_all()
             except Exception as error:
                 logger.error(f'设备输入清理失败：{error}')
+                if raise_on_error:
+                    raise
+                return False
+        return True
 
     @property
     def capture_method(self):
@@ -154,7 +166,7 @@ class DeviceManager:
     def capture_method(self, capture):
         previous = getattr(self, '_capture_method', None)
         if previous is not None and previous is not capture:
-            self.release_input()
+            self.release_input(raise_on_error=True)
         self._capture_method = capture
 
     def stop_hwnd(self):
@@ -583,7 +595,10 @@ class DeviceManager:
         if kind == 'windows':
             configured = (self.windows_capture_config or {}).get('capture_method', [])
             methods = configured if isinstance(configured, list) else [configured]
-            return [method_name(item) for item in (methods or ['windows']) if item]
+            names = [method_name(item) for item in (methods or ['windows']) if item]
+            if normalize_pc_interaction(getattr(self, 'config', {}).get('interaction')) == 'post_message_test':
+                names = [name for name in names if name in BACKGROUND_CAPTURE_METHODS]
+            return names
         if kind == 'browser':
             return ['browser']
         methods = ['adb']
@@ -605,8 +620,9 @@ class DeviceManager:
             return []
         kind = device.get('device')
         if kind == 'windows':
-            normalize_pc_interaction((self.windows_capture_config or {}).get('interaction'))
-            return ['nono']
+            declared = (self.windows_capture_config or {}).get('interaction')
+            values = declared if isinstance(declared, list) else [declared]
+            return list(dict.fromkeys(['nono', *(normalize_pc_interaction(value) for value in values)]))
         if kind == 'browser':
             return ['BrowserInteraction']
         if kind == 'adb':
@@ -622,8 +638,11 @@ class DeviceManager:
             self.config.save_file()
 
     def set_capture(self, capture):
+        if (getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction
+                and capture not in BACKGROUND_CAPTURE_METHODS):
+            raise ValueError('后台测试只支持 WGC、WGC_HDR 或 BitBlt_RenderFull 捕获')
         if self.config.get("capture") != capture:
-            self.release_input()
+            self.release_input(raise_on_error=True)
             self.config['capture'] = capture
             self.start()
 
@@ -637,13 +656,19 @@ class DeviceManager:
             self.config['interaction'] = expected.__name__
             return
         interaction = normalize_pc_interaction(interaction)
-        changed = self.config.get('interaction') != interaction or self.win_interaction_class is not NonoInteraction
-        self.win_interaction_class = NonoInteraction
-        if self.windows_capture_config is not None:
-            self.windows_capture_config['interaction'] = interaction
-        self._save_pc_interaction()
-        if changed or not isinstance(self.interaction, NonoInteraction):
-            self.release_input()
+        interaction_class = PC_INTERACTIONS[interaction]
+        changed = self.config.get('interaction') != interaction or self.win_interaction_class is not interaction_class
+        executor = getattr(self, 'executor', None)
+        if changed and executor is not None and (not executor.paused or executor.current_task is not None):
+            raise RuntimeError('请先停止任务，再切换输入方式')
+        if changed or not isinstance(self.interaction, interaction_class):
+            self.release_input(raise_on_error=True)
+            self.win_interaction_class = interaction_class
+            # 配置声明保留可选列表，不能把用户选择反写成唯一可用方式。
+            if self.windows_capture_config is not None and not isinstance(self.windows_capture_config.get('interaction'), list):
+                self.windows_capture_config['interaction'] = normalize_pc_interaction(
+                    self.windows_capture_config.get('interaction'))
+            self._save_pc_interaction()
             self.start()
 
     def get_hwnd_name(self):
@@ -662,11 +687,18 @@ class DeviceManager:
 
     def use_windows_capture(self):
         selected_method = self.config.get('capture')
-        valid_methods = self.windows_capture_config.get('capture_method', [])
+        capture_config = self.windows_capture_config
+        valid_methods = capture_config.get('capture_method', [])
+        if getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction:
+            # 限制整个回退列表，防止 WGC 失败后退到含其它窗口的桌面截图。
+            valid_methods = [item for item in valid_methods if method_name(item) in BACKGROUND_CAPTURE_METHODS]
+            if not valid_methods:
+                raise ValueError('后台测试需要 WGC、WGC_HDR 或 BitBlt_RenderFull 捕获')
+            capture_config = {**capture_config, 'capture_method': valid_methods}
         if not selected_method or selected_method not in valid_methods:
              if valid_methods:
                  selected_method = valid_methods[0]
-        self.capture_method = update_capture_method(self.windows_capture_config, self.capture_method, self.hwnd_window,
+        self.capture_method = update_capture_method(capture_config, self.capture_method, self.hwnd_window,
                                                     exit_event=self.exit_event, selected_method=selected_method)
         if self.capture_method is None:
             logger.error('cant find a usable windows capture')
@@ -734,8 +766,9 @@ class DeviceManager:
 
         if preferred['device'] == 'windows':
             normalize_pc_interaction(self.windows_capture_config.get('interaction'))
-            normalize_pc_interaction(self.config.get('interaction'))
-            self.win_interaction_class = NonoInteraction
+            selected = normalize_pc_interaction(self.config.get('interaction'))
+            self.win_interaction_class = PC_INTERACTIONS[selected]
+            self._save_pc_interaction()
             title = self.windows_capture_config.get('title')
             exe = self.windows_capture_config.get('exe')
             if not exe and not title and preferred.get('real_hwnd'):
@@ -1099,7 +1132,8 @@ class DeviceManager:
             if 'capture_method' in win_config:
                 self.set_capture(win_config['capture_method'])
             else:
-                self.set_capture('windows')
+                methods = self.available_capture_methods(pc)
+                self.set_capture(methods[0] if self.win_interaction_class is PostMessageTestInteraction and methods else 'windows')
                 
             if 'resolution' in win_config:
                 resolution = win_config['resolution']

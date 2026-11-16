@@ -1,0 +1,703 @@
+"""后台测试输入：普通窗口消息不激活，每个外部开始请求仅激活主窗一次。"""
+
+import ctypes
+import logging
+import math
+import re
+import threading
+import time
+from contextlib import contextmanager
+from ctypes import wintypes
+from dataclasses import dataclass, field
+
+import win32gui
+import win32process
+import pywintypes
+from pynput.keyboard import Key, KeyCode
+from pynput.mouse import Button
+
+from ok.device.interaction_methods.base import BaseInteraction
+from ok.device.interaction_methods.foreground_input import (
+    ForegroundInputError, ForegroundInputInterrupted, KEY_ALIASES,
+)
+from ok.device.interaction_methods.keys import MOUSE_BUTTON_MAP, vk_key_dict
+from ok.task.exceptions import TaskDisabledException
+
+logger = logging.getLogger(__name__)
+
+WM_ACTIVATE = 0x0006
+WM_KEYDOWN, WM_KEYUP, WM_CHAR = 0x0100, 0x0101, 0x0102
+WM_MOUSEMOVE, WM_MOUSEWHEEL = 0x0200, 0x020A
+_BUTTON_MESSAGES = {
+    1: (0x0201, 0x0202, 0x0001), 2: (0x0204, 0x0205, 0x0002),
+    3: (0x0207, 0x0208, 0x0010), 4: (0x020B, 0x020C, 0x0020),
+    5: (0x020B, 0x020C, 0x0040),
+}
+_BUTTON_NAMES = {'left': 1, 'right': 2, 'middle': 3, 'x1': 4, 'x2': 5,
+                 **{name: value + 3 for name, value in MOUSE_BUTTON_MAP.items()}}
+_BUTTON_ENUMS = {Button.left: 1, Button.right: 2, Button.middle: 3, Button.x1: 4, Button.x2: 5}
+_INPUT_MESSAGES = frozenset({WM_KEYDOWN, WM_KEYUP, WM_CHAR, WM_MOUSEMOVE, WM_MOUSEWHEEL}
+                            | {message for down, up, _ in _BUTTON_MESSAGES.values() for message in (down, up)})
+
+
+@dataclass(frozen=True)
+class WindowIdentity:
+    hwnd: int
+    process_id: int
+    created_at: int
+    thread_id: int
+    class_name: str
+
+
+class Win32MessageBackend:
+    """只查询窗口和进程身份、投递消息；不操作系统焦点或真实键鼠。"""
+
+    def __init__(self):
+        self.user32 = ctypes.WinDLL('user32', use_last_error=True)
+        self.kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t)
+        self.user32.PostMessageW.restype = wintypes.BOOL
+        self.user32.GetKeyboardLayout.argtypes = (wintypes.DWORD,)
+        self.user32.GetKeyboardLayout.restype = wintypes.HANDLE
+        self.user32.MapVirtualKeyExW.argtypes = (wintypes.UINT, wintypes.UINT, wintypes.HANDLE)
+        self.user32.MapVirtualKeyExW.restype = wintypes.UINT
+        self.user32.VkKeyScanExW.argtypes = (wintypes.WCHAR, wintypes.HANDLE)
+        self.user32.VkKeyScanExW.restype = ctypes.c_short
+        self.kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+        self.kernel32.GetProcessTimes.restype = wintypes.BOOL
+        self.kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel32.CloseHandle.restype = wintypes.BOOL
+        self.last_error = 0
+
+    def identity(self, hwnd):
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return None
+        thread_id, process_id = win32process.GetWindowThreadProcessId(hwnd)
+        if not process_id or not thread_id:
+            return None
+        # 不能只存 PID：进程退出后 PID 可重用，创建时间也必须参与每次发送前的核验。
+        handle = self.kernel32.OpenProcess(0x1000, False, process_id)
+        if not handle:
+            raise ForegroundInputError(f'无法核验目标进程身份，系统错误码：{ctypes.get_last_error()}')
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not self.kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+                raise ForegroundInputError(f'无法读取目标进程创建时间，系统错误码：{ctypes.get_last_error()}')
+            created_at = times[0].dwLowDateTime | (times[0].dwHighDateTime << 32)
+            class_name = win32gui.GetClassName(hwnd)
+            if win32process.GetWindowThreadProcessId(hwnd) != (thread_id, process_id):
+                return None
+            return WindowIdentity(hwnd, process_id, created_at, thread_id, class_name)
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+    def post_message(self, hwnd, message, wparam, lparam):
+        ctypes.set_last_error(0)
+        result = bool(self.user32.PostMessageW(hwnd, message, wparam, lparam))
+        self.last_error = ctypes.get_last_error()
+        return result
+
+    @staticmethod
+    def is_visible(hwnd):
+        return bool(win32gui.IsWindowVisible(hwnd))
+
+    @staticmethod
+    def is_minimized(hwnd):
+        return bool(win32gui.IsIconic(hwnd))
+
+    @staticmethod
+    def is_enabled(hwnd):
+        return bool(win32gui.IsWindowEnabled(hwnd))
+
+    @staticmethod
+    def parent_window(hwnd):
+        return int(win32gui.GetParent(hwnd) or 0)
+
+    @staticmethod
+    def owner_window(hwnd):
+        return int(win32gui.GetWindow(hwnd, 4) or 0)
+
+    @staticmethod
+    def client_to_screen(hwnd, point):
+        return win32gui.ClientToScreen(hwnd, point)
+
+    @staticmethod
+    def screen_to_client(hwnd, point):
+        return win32gui.ScreenToClient(hwnd, point)
+
+    def client_bounds(self, hwnd):
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        left, top = self.client_to_screen(hwnd, (left, top))
+        right, bottom = self.client_to_screen(hwnd, (right, bottom))
+        return left, top, right, bottom
+
+    def scan_code(self, vk, thread_id):
+        return int(self.user32.MapVirtualKeyExW(vk, 4, self.user32.GetKeyboardLayout(thread_id)))
+
+    def vk_key_scan(self, char, thread_id):
+        return int(self.user32.VkKeyScanExW(char, self.user32.GetKeyboardLayout(thread_id)))
+
+
+@dataclass
+class _HeldInput:
+    identity: WindowIdentity
+    kind: str
+    code: int
+    scan: int = 0
+    point: tuple = (0, 0)
+    owners: set = field(default_factory=set)
+
+
+def _seconds(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError('输入时长必须是有限的非负秒数')
+    return value
+
+
+def _packed_point(point):
+    x, y = point
+    if not all(-32768 <= value <= 32767 for value in point):
+        raise ForegroundInputError('窗口消息坐标超出有符号16位范围')
+    return (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+
+
+class PostMessageTestInteraction(BaseInteraction):
+    """保持请求身份与按下台账；首帧、任务排队和暂停恢复由执行器控制。"""
+
+    def __init__(self, capture, hwnd_window, *, native=None, clock=time.monotonic, wait=time.sleep):
+        super().__init__(capture)
+        self.hwnd_window = hwnd_window
+        self.native = native if native is not None else Win32MessageBackend()
+        self.clock, self.wait = clock, wait
+        self._lock = threading.RLock()
+        self._bound_identity = None
+        self._active_request = None
+        self._prepared = False
+        self._expected_generation = None
+        self._interrupted = False
+        self._held = {}
+        self._logical_holds = {}
+        self._pointer = None
+        self._cleanup_failed = False
+
+    def _identity(self, hwnd):
+        try:
+            return self.native.identity(hwnd)
+        except ForegroundInputError:
+            raise
+        except Exception as error:
+            raise ForegroundInputError(f'无法核验后台窗口身份，HWND={hwnd}') from error
+
+    def _main_identity(self):
+        identity = self._identity(self.hwnd_window.hwnd)
+        if self._bound_identity is not None and identity != self._bound_identity:
+            self._prepared = False
+            if self._active_request is not None:
+                self._active_request.cancel()
+            raise ForegroundInputError('游戏主窗口或进程已变化，请重新开始任务')
+        return identity
+
+    def _available(self, identity):
+        if identity is None:
+            return False
+        try:
+            left, top, right, bottom = self.native.client_bounds(identity.hwnd)
+            return (self.native.is_visible(identity.hwnd) and not self.native.is_minimized(identity.hwnd)
+                    and right > left and bottom > top)
+        except Exception as error:
+            raise ForegroundInputError('无法检查后台窗口的可用状态') from error
+
+    def _cancel(self, cancel_check=None, *, preparing=False):
+        for name in ('app_exit_event', 'stop_event'):
+            event = getattr(self.hwnd_window, name, None)
+            if event is not None and event.is_set():
+                raise TaskDisabledException()
+        if cancel_check is not None and cancel_check():
+            raise TaskDisabledException()
+        if not preparing:
+            manager = getattr(self.hwnd_window, 'device_manager', None)
+            executor = getattr(manager, 'executor', None)
+            if executor is not None:
+                executor.check_input_cancelled()
+
+    def clickable(self):
+        with self._lock:
+            try:
+                available = self._available(self._main_identity())
+                if not available:
+                    self._interrupted = True
+                    self.release_all()
+                return available
+            except BaseException:
+                self.release_all()
+                raise
+
+    def should_capture(self):
+        # 可以只读预览未开始的游戏；普通输入另有成功请求门禁。
+        return self.clickable()
+
+    @property
+    def target_generation(self):
+        with self._lock:
+            main = self._main_identity()
+            # 既有捕获签名含几何和 PID／类名；补上子窗线程及进程创建身份，拒绝同号复用后的旧帧。
+            members = tuple(self._identity(info[0]) for info in self.hwnd_window.hwnds)
+            return id(self.capture), main, self.hwnd_window.capture_target_signature, members
+
+    @property
+    def needs_refresh(self):
+        return self._interrupted or self._expected_generation != self.target_generation
+
+    def refresh_target(self, force=False):
+        with self._lock:
+            self.hwnd_window.do_update_window_size()
+            if not self.clickable():
+                return False
+            if force or self.needs_refresh:
+                self.release_all()
+                self._expected_generation = self.target_generation
+                self._pointer = None
+                self._interrupted = False
+            return True
+
+    def prepare_start(self, request, cancel_check=None):
+        with self._lock:
+            self._cancel(cancel_check, preparing=True)
+            request.check_cancelled()
+            self.release_all()
+            self._prepared = False
+            self.hwnd_window.do_update_window_size()
+            identity = self._identity(self.hwnd_window.hwnd)
+            if identity is None:
+                raise ForegroundInputError('请先手动打开游戏')
+            if not self._available(identity):
+                raise ForegroundInputInterrupted('请先恢复并显示游戏窗口')
+
+            def send_activation():
+                self._cancel(cancel_check, preparing=True)
+                if self.hwnd_window.hwnd != identity.hwnd or self._identity(identity.hwnd) != identity:
+                    raise ForegroundInputError('激活前游戏目标已变化，请重新开始任务')
+                logger.info('后台激活尝试：请求=%s，来源=%s，目标=%s，消息=0x0006/1/0，尝试=1，接受=0，时间=%.6f',
+                            request.request_id, request.source, identity, self.clock())
+                self._raw_post(identity, WM_ACTIVATE, 1, 0)
+                logger.info('后台激活已入队：请求=%s，HWND=%s，尝试=1，接受=1', request.request_id, identity.hwnd)
+
+            try:
+                request.activate_once(identity, send_activation)
+            except RuntimeError as error:
+                raise ForegroundInputError(str(error)) from error
+            self._cancel(cancel_check, preparing=True)
+            request.check_cancelled()
+            if self.hwnd_window.hwnd != identity.hwnd or self._identity(identity.hwnd) != identity:
+                request.cancel()
+                raise ForegroundInputError('激活后游戏目标已变化，请重新开始任务')
+            self._bound_identity = identity
+            self._active_request = request
+            self._expected_generation = self.target_generation
+            self._pointer = None
+            self._interrupted = False
+            self._prepared = True
+            return True
+
+    def _guard(self):
+        self._cancel()
+        if not self._prepared:
+            raise ForegroundInputError('后台输入尚未准备，请通过开始或恢复操作启动任务')
+        self._active_request.check_cancelled()
+        if not self._available(self._main_identity()):
+            raise ForegroundInputInterrupted('游戏已隐藏或最小化，等待同一窗口恢复')
+        if self._interrupted or self._expected_generation != self.target_generation:
+            raise ForegroundInputInterrupted('后台窗口或坐标已变化，需要刷新画面')
+
+    @contextmanager
+    def _action(self):
+        with self._lock:
+            try:
+                if self._cleanup_failed:
+                    self.release_all()
+                self._guard()
+                yield
+            except BaseException as error:
+                if isinstance(error, ForegroundInputInterrupted):
+                    self._interrupted = True
+                self.release_all()
+                if isinstance(error, (OSError, pywintypes.error)):
+                    raise ForegroundInputError('后台窗口查询或坐标转换失败，已停止输入') from error
+                raise
+
+    def _related(self, candidate, main):
+        if candidate == main:
+            return True
+        patterns = getattr(self.hwnd_window, 'top_hwnd_class', ()) or ()
+        if not isinstance(patterns, (tuple, list)):
+            patterns = (patterns,)
+        same_process = (candidate.process_id, candidate.created_at) == (main.process_id, main.created_at)
+        if same_process and any(candidate.class_name == pattern if isinstance(pattern, str)
+                                else re.search(pattern, candidate.class_name) is not None for pattern in patterns):
+            return True
+        # 不能凭相同启动器根或同名 EXE 放行；直接父／拥有链必须到达选中主窗。
+        pending, seen = [candidate.hwnd], set()
+        while pending:
+            hwnd = pending.pop()
+            if hwnd == main.hwnd:
+                return True
+            if hwnd and hwnd not in seen:
+                seen.add(hwnd)
+                pending.extend((self.native.parent_window(hwnd), self.native.owner_window(hwnd)))
+        return False
+
+    def _targets(self):
+        main = self._main_identity()
+        targets = []
+        for info in self.hwnd_window.hwnds:
+            identity = self._identity(info[0])
+            if identity is None or identity.class_name != info[7] or not self._related(identity, main):
+                continue
+            if self._available(identity) and self.native.is_enabled(identity.hwnd):
+                targets.append(identity)
+        if not targets:
+            raise ForegroundInputInterrupted('没有可用的同实例后台输入窗口')
+        return targets
+
+    def _target(self):
+        targets = self._targets()
+        if self._pointer is not None and self._pointer[0] in targets:
+            return self._pointer[0]
+        return next((target for target in targets if target.hwnd == self.hwnd_window.top_hwnd), targets[0])
+
+    def _raw_post(self, identity, message, wparam, lparam):
+        if self._identity(identity.hwnd) != identity:
+            raise ForegroundInputError('消息发送目标身份已变化')
+        try:
+            accepted = self.native.post_message(identity.hwnd, message, wparam, lparam)
+        except Exception as error:
+            raise ForegroundInputError(f'后台消息发送失败，HWND={identity.hwnd}，消息=0x{message:04X}') from error
+        if not accepted:
+            error_code = getattr(self.native, 'last_error', 0)
+            raise ForegroundInputError(
+                f'系统拒绝后台消息，HWND={identity.hwnd}，消息=0x{message:04X}，系统错误码：{error_code}')
+
+    def _post(self, identity, message, wparam=0, lparam=0):
+        # 白名单不含激活／焦点消息。普通输入只能从这里进入原生投递边界。
+        if message not in _INPUT_MESSAGES:
+            raise ForegroundInputError('普通后台输入禁止发送激活或其它控制消息')
+        self._guard()
+        if identity not in self._targets():
+            raise ForegroundInputInterrupted('后台输入子窗口已变化，需要重新识别')
+        self._raw_post(identity, message, wparam, lparam)
+
+    def _sleep(self, seconds):
+        deadline = self.clock() + _seconds(seconds)
+        while True:
+            self._guard()
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return
+            self.wait(min(0.01, remaining))
+
+    @staticmethod
+    def _button(key):
+        code = _BUTTON_ENUMS.get(key) if isinstance(key, Button) else _BUTTON_NAMES.get(str(key).strip().lower())
+        if code is None:
+            raise ValueError('不支持该鼠标按钮')
+        return code
+
+    def get_mouse_button(self, key):
+        return {value: button for button, value in _BUTTON_ENUMS.items()}[self._button(key)]
+
+    @staticmethod
+    def _normalized_key(key):
+        if isinstance(key, Button) or isinstance(key, str) and key.lower() in MOUSE_BUTTON_MAP:
+            code = PostMessageTestInteraction._button(key)
+            return ('mouse', code), None
+        if isinstance(key, int):
+            key = str(key)
+        if isinstance(key, str):
+            name = KEY_ALIASES.get(key.lower(), key.lower())
+            if len(name) == 4 and name.startswith('num') and name[-1].isdigit():
+                key = KeyCode.from_vk(0x60 + int(name[-1]))
+            elif name in Key.__members__:
+                key = Key[name]
+            elif len(key) == 1:
+                key = KeyCode.from_char(key)
+            elif key.upper() in vk_key_dict:
+                key = KeyCode.from_vk(vk_key_dict[key.upper()])
+        if isinstance(key, Key):
+            key = key.value
+        if not isinstance(key, KeyCode):
+            raise ValueError('按键必须使用字符、Key 或 KeyCode')
+        if key.vk is not None:
+            vk = {0x10: 0xA0, 0x11: 0xA2, 0x12: 0xA4}.get(key.vk, key.vk)
+            return ('vk', vk), None
+        if not key.char or len(key.char) != 1 or len(key.char.encode('utf-16-le')) != 2:
+            raise ValueError('该字符不能作为后台按键，请使用文本输入接口')
+        return ('char', key.char), key.char
+
+    def _key(self, key, target):
+        token, char = self._normalized_key(key)
+        if token[0] == 'mouse':
+            return token, (('mouse', token[1], 0),)
+        if token[0] == 'vk':
+            codes = (token[1],)
+        else:
+            encoded = self.native.vk_key_scan(char, target.thread_id)
+            if encoded == -1 or (encoded >> 8) & ~7:
+                raise ValueError('目标键盘布局不支持该字符按键，请使用文本输入接口')
+            codes = tuple(code for bit, code in ((1, 0xA0), (2, 0xA2), (4, 0xA4)) if (encoded >> 8) & bit)
+            codes += (encoded & 0xFF,)
+        events = []
+        for vk in codes:
+            scan = self.native.scan_code(vk, target.thread_id)
+            if not 0 < vk <= 0xFF or not scan:
+                raise ValueError('目标键盘布局无法映射此虚拟键')
+            events.append(('key', vk, scan))
+        return token, tuple(events)
+
+    @staticmethod
+    def _key_lparam(scan, up=False):
+        value = 1 | ((scan & 0xFF) << 16)
+        if scan & 0xFF00 == 0xE000:
+            value |= 1 << 24
+        return value | (0xC0000000 if up else 0)
+
+    @staticmethod
+    def _message_vk(code):
+        # 窗口键盘消息使用通用 VK，左右差异由扫描码和 extended 位表达。
+        return {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11, 0xA4: 0x12, 0xA5: 0x12}.get(code, code)
+
+    def _mouse_flags(self, target, exclude=None):
+        flags = 0
+        for physical, held in self._held.items():
+            if physical == exclude or held.identity != target:
+                continue
+            if held.kind == 'mouse':
+                flags |= _BUTTON_MESSAGES[held.code][2]
+            elif held.code in (0x10, 0xA0, 0xA1):
+                flags |= 0x0004
+            elif held.code in (0x11, 0xA2, 0xA3):
+                flags |= 0x0008
+        return flags
+
+    def _press(self, token, events, target, point=(0, 0)):
+        if token in self._logical_holds:
+            return False
+        physicals = []
+        self._logical_holds[token] = physicals
+        for kind, code, scan in events:
+            physical = (target, kind, code)
+            physicals.append(physical)
+            if physical in self._held:
+                self._held[physical].owners.add(token)
+                continue
+            held = _HeldInput(target, kind, code, scan, point, {token})
+            # 先登记，未知发送异常也有机会做配对释放；失败不能遗留无法清理的长按。
+            self._held[physical] = held
+            if kind == 'key':
+                self._post(target, WM_KEYDOWN, self._message_vk(code), self._key_lparam(scan))
+            else:
+                wparam = self._mouse_flags(target) | ((code - 3) << 16 if code >= 4 else 0)
+                self._post(target, _BUTTON_MESSAGES[code][0], wparam, _packed_point(point))
+        return True
+
+    def _release_physical(self, physical):
+        held = self._held[physical]
+        if self._identity(held.identity.hwnd) != held.identity:
+            # 已销毁或复用的句柄不能接收旧 UP，旧目标已不存在时只注销本地持有。
+            logger.warning('原后台输入窗口已消失或被复用，丢弃旧持有：HWND=%s，类别=%s',
+                           held.identity.hwnd, held.kind)
+            del self._held[physical]
+            return
+        if held.kind == 'key':
+            self._raw_post(held.identity, WM_KEYUP, self._message_vk(held.code), self._key_lparam(held.scan, up=True))
+        else:
+            wparam = self._mouse_flags(held.identity, exclude=physical)
+            if held.code >= 4:
+                wparam |= (held.code - 3) << 16
+            self._raw_post(held.identity, _BUTTON_MESSAGES[held.code][1], wparam, _packed_point(held.point))
+        del self._held[physical]
+
+    def _release(self, token):
+        errors = []
+        for physical in reversed(self._logical_holds.get(token, ())):
+            held = self._held.get(physical)
+            if held is None:
+                continue
+            if held.owners != {token}:
+                held.owners.discard(token)
+                continue
+            try:
+                self._release_physical(physical)
+            except Exception as error:
+                errors.append(error)
+        if not any(token in held.owners for held in self._held.values()):
+            self._logical_holds.pop(token, None)
+        if errors:
+            self._cleanup_failed = True
+            raise ForegroundInputError('无法释放后台模式持有的输入，已阻止后续动作') from errors[0]
+
+    def release_all(self):
+        with self._lock:
+            errors = []
+            for physical in reversed(tuple(self._held)):
+                try:
+                    self._release_physical(physical)
+                except Exception as error:
+                    errors.append(error)
+            self._logical_holds = {token: physicals for token, physicals in self._logical_holds.items()
+                                   if any(token in held.owners for held in self._held.values())}
+            self._cleanup_failed = bool(errors)
+            if errors:
+                raise ForegroundInputError('无法释放后台模式持有的输入，已阻止后续动作') from errors[0]
+
+    def _pointer_position(self, x=-1, y=-1, target=None):
+        if (x == -1) != (y == -1):
+            raise ValueError('后台鼠标坐标必须同时提供 x 和 y')
+        if x == -1 and y == -1:
+            if self._pointer is not None:
+                chosen, screen, _ = self._pointer
+                target = target or chosen
+            else:
+                target = target or self._target()
+                screen = self.native.client_to_screen(target.hwnd, (0, 0))
+        else:
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError('后台鼠标坐标必须有限')
+            screen = tuple(round(value) for value in self.capture.get_abs_cords(x, y))
+        if target is None:
+            for candidate in self._targets():
+                left, top, right, bottom = self.native.client_bounds(candidate.hwnd)
+                if left <= screen[0] < right and top <= screen[1] < bottom:
+                    target = candidate
+                    break
+            if target is None:
+                raise ForegroundInputError('点击坐标不属于允许的游戏窗口')
+        try:
+            local = tuple(self.native.screen_to_client(target.hwnd, screen))
+        except Exception as error:
+            raise ForegroundInputError('无法转换后台鼠标坐标') from error
+        _packed_point(local)
+        self._pointer = target, screen, local
+        return target, screen, local
+
+    def _move_to(self, target, screen, local):
+        self._post(target, WM_MOUSEMOVE, self._mouse_flags(target), _packed_point(local))
+        self._pointer = target, screen, local
+        for held in self._held.values():
+            if held.identity == target and held.kind == 'mouse':
+                held.point = local
+
+    def send_key_down(self, key):
+        with self._action():
+            target = self._target()
+            token, events = self._key(key, target)
+            point = self._pointer_position(target=target)[2] if events[0][0] == 'mouse' else (0, 0)
+            self._press(token, events, target, point)
+
+    def send_key_up(self, key):
+        with self._lock:
+            # 释放只查本地逻辑键，不查询新目标／布局，也不经过暂停或最小化门禁。
+            self._release(self._normalized_key(key)[0])
+
+    def send_key(self, key, down_time=0.01):
+        duration = _seconds(down_time)
+        with self._action():
+            target = self._target()
+            token, events = self._key(key, target)
+            point = self._pointer_position(target=target)[2] if events[0][0] == 'mouse' else (0, 0)
+            created = self._press(token, events, target, point)
+            try:
+                self._sleep(duration)
+            finally:
+                if created:
+                    self._release(token)
+
+    def input_text(self, text):
+        encoded = text.encode('utf-16-le')
+        with self._action():
+            target = self._target()
+            for index in range(0, len(encoded), 2):
+                self._post(target, WM_CHAR, int.from_bytes(encoded[index:index + 2], 'little'), 0)
+                self._sleep(0.01)
+
+    def move(self, x, y):
+        with self._action():
+            mouse_targets = {held.identity for held in self._held.values() if held.kind == 'mouse'}
+            if len(mouse_targets) > 1:
+                raise ForegroundInputError('不能跨后台窗口续接同一鼠标手势')
+            target = next(iter(mouse_targets), None)
+            self._move_to(*self._pointer_position(x, y, target))
+
+    def mouse_down(self, x=-1, y=-1, name=None, key='left'):
+        with self._action():
+            target, _, local = self._pointer_position(x, y)
+            code = self._button(key)
+            self._press(('mouse', code), (('mouse', code, 0),), target, local)
+
+    def mouse_up(self, key='left'):
+        with self._lock:
+            self._release(('mouse', self._button(key)))
+
+    def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=True, key='left'):
+        duration = _seconds(down_time)
+        with self._action():
+            previous = self._pointer
+            code, token = self._button(key), ('mouse', self._button(key))
+            if token in self._logical_holds:
+                raise ForegroundInputError('后台鼠标已按住，不能开始新的点击')
+            target, screen, local = self._pointer_position(x, y)
+            if move:
+                self._move_to(target, screen, local)
+            created = self._press(token, (('mouse', code, 0),), target, local)
+            try:
+                self._sleep(duration)
+            finally:
+                if created:
+                    self._release(token)
+            if move_back and previous is not None:
+                self._move_to(*previous)
+
+    def right_click(self, x=-1, y=-1, move_back=False, name=None):
+        return self.click(x, y, move_back=move_back, name=name, key='right')
+
+    def scroll(self, x, y, scroll_amount):
+        delta = float(scroll_amount) * 120
+        if not math.isfinite(delta) or not delta.is_integer() or not -32768 <= delta <= 32767:
+            raise ValueError('后台滚轮量超出支持范围')
+        with self._action():
+            target, screen, _ = self._pointer_position(x, y)
+            wparam = self._mouse_flags(target) | ((int(delta) & 0xFFFF) << 16)
+            # WM_MOUSEWHEEL 的 lParam 是屏幕坐标，不能沿用按钮消息的客户区坐标。
+            self._post(target, WM_MOUSEWHEEL, wparam, _packed_point(screen))
+
+    def swipe(self, x1, y1, x2, y2, duration, settle_time=0):
+        # BaseTask 的既有接口传毫秒，仅在此处转换一次；settle_time 已是秒。
+        seconds, settle = _seconds(duration) / 1000, _seconds(settle_time)
+        with self._action():
+            target, start, local = self._pointer_position(x1, y1)
+            end = tuple(round(value) for value in self.capture.get_abs_cords(x2, y2))
+            self._move_to(target, start, local)
+            token = ('mouse', 1)
+            if token in self._logical_holds:
+                raise ForegroundInputError('后台鼠标已按住，不能开始新的拖拽')
+            self._press(token, (('mouse', 1, 0),), target, local)
+            try:
+                steps = max(1, math.ceil(seconds / 0.01))
+                started = self.clock()
+                for step in range(1, steps + 1):
+                    self._sleep(max(0, started + seconds * step / steps - self.clock()))
+                    screen = tuple(round(a + (b - a) * step / steps) for a, b in zip(start, end))
+                    local = tuple(self.native.screen_to_client(target.hwnd, screen))
+                    self._move_to(target, screen, local)
+            finally:
+                self._release(token)
+            self._sleep(settle)
+
+    def on_run(self):
+        # 内部任务切换也调用此钩子，不能在这里创造新的激活机会。
+        pass
+
+    def on_destroy(self):
+        self.release_all()

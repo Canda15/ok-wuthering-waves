@@ -27,6 +27,8 @@ foreach ($variable in @(
 
 $testFiles = @(
     'tests/TestForegroundInput.py',
+    'tests/TestBackgroundInput.py',
+    'tests/TestGameLauncher.py',
     'tests/TestForegroundNotification.py',
     'tests/TestMultiAccountConfig.py',
     'tests/TestMultiAccountDailyTask.py',
@@ -72,7 +74,7 @@ $testGroups = if ($Quick) {
         @{ Name = $testFile; Targets = @($testFile) }
     }
 }
-$checkName = if ($Quick) { '快速' } else { '前台核心' }
+$checkName = if ($Quick) { '快速' } else { '输入与任务核心' }
 
 # run_test.py 统一隔离配置、截图和日志；每个文件独立进程，避免 Qt 和执行器状态串用。
 Push-Location -LiteralPath $projectPath
@@ -94,5 +96,5 @@ try {
 if ($Quick) {
     Write-Host '快速检查通过。'
 } else {
-    Write-Host '前台核心检查通过。'
+    Write-Host '输入与任务核心检查通过。'
 }

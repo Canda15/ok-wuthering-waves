@@ -911,7 +911,7 @@ class TestMultiAccountConfigUI(unittest.TestCase):
                 self.assertLess(tab.vBoxLayout.indexOf(tab.status_card),
                                 tab.vBoxLayout.indexOf(tab.accounts_widget))
                 tab.start_clicked()
-                og.app.start_controller.start.assert_called_once_with(runner)
+                og.app.start_controller.start.assert_called_once_with(runner, source='多账号开始')
                 # Scheduling alone is not a running task yet.
                 self.assertTrue(tab.status_card.isHidden())
                 runner.start_time = time.time() - 65

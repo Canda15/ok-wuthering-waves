@@ -35,9 +35,11 @@ from ok.device.interaction_methods.foreground_input import (
 )
 from ok.device.interaction_methods.nono import NonoInteraction
 from ok.device.interaction_methods.pynput import PynputInteraction
+from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction, WM_ACTIVATE
 from ok.feature.Box import Box
 from ok.task.TaskExecutor import ExecutorJob, TaskExecutor
 from ok.core.start_controller import StartController
+from ok.core.start_request import StartRequest
 from ok.core.mcp_server import LocalMcpServer
 from ok.task.exceptions import TaskDisabledException, WaitFailedException
 from ok.task.task import BaseTask
@@ -1190,6 +1192,312 @@ class TestForegroundLifecycle(InputFixture):
         self.executor._prepare_task_for_run(is_trigger_task=False, request_focus=True)
         self.window.bring_to_front.assert_called_once()
 
+    def _use_background(self):
+        from tests.TestBackgroundInput import FakeMessages, FakeWindow as BackgroundWindow
+        self.messages = FakeMessages()
+        self.window = BackgroundWindow(self.messages)
+        self.window.bring_to_front = Mock()
+        self.window.get_abs_cords = lambda x, y: (
+            self.window.capture_origin[0] + x, self.window.capture_origin[1] + y)
+        self.capture = FakeCapture(self.window, self.clock)
+        self.adapter = PostMessageTestInteraction(self.capture, self.window, native=self.messages,
+                                                 clock=self.clock, wait=self.clock.wait)
+        manager = self.executor.device_manager
+        manager.hwnd_window = self.window
+        manager.interaction, manager.capture_method = self.adapter, self.capture
+        self.window.device_manager = manager
+
+    def _activation_count(self):
+        return sum(event[1] == WM_ACTIVATE for event in self.messages.attempts)
+
+    def test_暂停首帧准备绕过普通取帧门禁且业务输入仍封锁(self):
+        for background in (False, True):
+            with self.subTest(background=background):
+                if background:
+                    self._use_background()
+                self.executor.paused = self.task._paused = True
+                capture = self.capture.get_frame
+
+                def get_frame(**kwargs):
+                    with self.assertRaises(ForegroundInputInterrupted):
+                        self.adapter.send_key('w')
+                    return capture(**kwargs)
+
+                with patch.object(self.executor, 'next_frame', side_effect=AssertionError('不能调用暂停取帧')), \
+                        patch.object(self.capture, 'get_frame', side_effect=get_frame):
+                    self.assertTrue(self.executor.prepare_start(StartRequest('恢复')))
+                self.assertIsNotNone(self.executor._frame)
+                self.assertTrue(self.executor.paused)
+                self.assertTrue(self.task.paused)
+                self.assertFalse(self.executor._preparing_start)
+                self.assertFalse(self.native.inserted)
+        self.assertEqual(self._activation_count(), 1)
+
+    def test_后台人工开始暂停恢复与内部准备的激活计数(self):
+        self._use_background()
+        controller = self.make_start_controller()
+        self.executor.paused = True
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            self.assertTrue(controller._do_start())
+            self.assertEqual(self._activation_count(), 1)
+            self.executor.paused = False
+            self.adapter.send_key_down('w')
+            self.executor.pause()
+            self.assertFalse(self.adapter._held)
+            self.assertEqual(self._activation_count(), 1)
+            self.assertTrue(controller._do_start())
+            self.assertEqual(self._activation_count(), 2)
+        self.executor.paused = False
+        for trigger in (True, False):
+            self.executor._prepare_task_for_run(trigger, request_focus=True)
+        self.executor.prepare_foreground(request_focus=True)
+        self.adapter.on_run()
+        self.executor.next_frame()
+        self.adapter.send_key('esc')
+        self.assertEqual(self._activation_count(), 2)
+        self.window.bring_to_front.assert_not_called()
+
+    def test_后台鼠标首次任务开始不需要热键(self):
+        self._use_background()
+        controller = self.make_start_controller()
+        self.executor.paused, self.executor.current_task = True, None
+        self.task._enabled = self.task.running = False
+        globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
+        with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
+            self.assertTrue(controller.do_start(self.task, source='鼠标任务开始'))
+        self.assertEqual(self._activation_count(), 1)
+        self.assertEqual(self.executor.onetime_task_queue, [self.task])
+        self.assertIsNotNone(self.executor._frame)
+        self.assertTrue(self.task.enabled)
+        self.window.bring_to_front.assert_not_called()
+
+    def test_后台排队请求不打断持键且只在对应任务边界准备(self):
+        self._use_background()
+        self.executor.prepare_start(StartRequest())
+        self.adapter.send_key_down('w')
+        queued = BaseTask(self.executor, self.task._app)
+        queued._enabled = True
+        self.executor.onetime_tasks.append(queued)
+        request = StartRequest('排队任务')
+        self.assertTrue(self.executor.queue_start_request(queued, request))
+        self.assertFalse(self.executor.queue_start_request(queued, StartRequest('重复按钮')))
+        self.assertEqual(self._activation_count(), 1)
+        self.assertTrue(self.adapter._held)
+        self.executor.current_task = queued
+        self.executor._prepare_task_for_run(False)
+        self.assertFalse(self.adapter._held)
+        self.assertFalse(self.executor.has_start_request(queued))
+        self.assertEqual(self._activation_count(), 2)
+        self.executor._prepare_task_for_run(False)
+        self.assertEqual(self._activation_count(), 2)
+        self.executor.queue_start_request(queued, request)
+        self.executor._prepare_task_for_run(False)
+        self.assertEqual(self._activation_count(), 2)
+
+    def test_取消后台排队请求同时移除启用状态且不激活(self):
+        self._use_background()
+        request = StartRequest('等待任务')
+        self.executor.queue_start_request(self.task, request)
+        self.executor.onetime_task_queue.append(self.task)
+        self.assertTrue(self.executor.cancel_start_request(self.task))
+        self.assertTrue(request.cancelled)
+        self.assertFalse(self.task.enabled)
+        self.assertFalse(self.executor.onetime_task_queue)
+        self.assertEqual(self._activation_count(), 0)
+
+    def test_后台最小化恢复新帧暂停业务时钟且不补激活(self):
+        self._use_background()
+        self.executor.prepare_start(StartRequest())
+        self.task.on_foreground_resume.reset_mock()
+        self.adapter.send_key_down('w')
+        self.messages.minimized.add(10)
+        before = self.executor.business_time()
+        target_time = self.clock() + 1
+
+        def restore():
+            if self.clock() >= target_time:
+                self.messages.minimized.clear()
+                self.clock.after_wait = None
+
+        self.clock.after_wait = restore
+        self.executor.sleep(0.2)
+        self.assertFalse(self.adapter._held)
+        self.assertGreaterEqual(self.clock(), target_time + 0.19)
+        self.assertAlmostEqual(self.executor.business_time() - before, 0.2, delta=0.06)
+        self.task.on_foreground_resume.assert_called_once()
+        self.assertEqual(self._activation_count(), 1)
+        self.assertEqual(self.executor._frame_target_generation, self.executor._capture_generation())
+        self.window.bring_to_front.assert_not_called()
+
+    def test_后台首帧超时取消和目标更换均不补激活(self):
+        self._use_background()
+        request = StartRequest()
+        with patch.object(self.capture, 'get_frame', return_value=None):
+            with self.assertRaises(TimeoutError):
+                self.executor.prepare_start(request, time_out=0.1)
+            with self.assertRaises(TaskDisabledException):
+                self.executor.prepare_start(request, time_out=0.1)
+        self.assertEqual(self._activation_count(), 1)
+        self.assertIsNone(self.executor._frame)
+        with self.assertRaises(TaskDisabledException):
+            self.adapter.send_key('esc')
+        request = StartRequest('首帧失败后重新开始')
+        self.executor.prepare_start(request)
+        self.messages.identities[10] = replace(self.messages.identities[10], created_at=200)
+        with self.assertRaises(ForegroundInputError):
+            self.executor.next_frame()
+        self.assertEqual(self._activation_count(), 2)
+        self.assertTrue(request.cancelled)
+        self.executor.prepare_start(StartRequest('换代后重新开始'))
+        self.assertEqual(self._activation_count(), 3)
+
+    def test_后台排队开始时已最小化不进入内部自动恢复(self):
+        self._use_background()
+        self.messages.minimized.add(10)
+        request = StartRequest('最小化时开始')
+        self.executor.queue_start_request(self.task, request)
+        with self.assertRaises(ForegroundInputError):
+            self.executor._prepare_task_for_run(False)
+        self.assertTrue(request.cancelled)
+        self.assertFalse(self.executor.has_start_request(self.task))
+        self.assertEqual(self._activation_count(), 0)
+        self.messages.minimized.clear()
+        with self.assertRaises(ForegroundInputError):
+            self.adapter.send_key('esc')
+
+    def test_后台准备中窗口移动丢弃旧帧且取帧后取消不发布(self):
+        self._use_background()
+        self.clock.after_wait = lambda: (
+            setattr(self.window, 'capture_origin', (-250, 70)), setattr(self.clock, 'after_wait', None))
+        self.executor.prepare_start(StartRequest())
+        self.assertEqual(self.capture.count, 2)
+        self.assertEqual(self._activation_count(), 1)
+        request = StartRequest('抓帧期间取消')
+        self.clock.after_wait = request.cancel
+        with self.assertRaises(TaskDisabledException):
+            self.executor.prepare_start(request)
+        self.clock.after_wait = None
+        self.assertIsNone(self.executor._frame)
+        self.assertEqual(self._activation_count(), 2)
+
+    def test_暂停任务由启动线程恢复后在原执行线程清缓存且不重跑(self):
+        self._use_background()
+        self.executor.paused = self.task._paused = True
+        sleeping, resume = threading.Event(), threading.Event()
+        errors, callbacks = [], []
+
+        def wait(seconds):
+            if self.executor.paused:
+                sleeping.set()
+                resume.wait(1)
+            else:
+                self.clock.wait(seconds)
+
+        def run_once():
+            try:
+                self.task.run()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=run_once, daemon=True)
+        self.executor.thread = worker
+        self.executor._wait_for_activity = wait
+        self.task.run = Mock(side_effect=lambda: self.executor.sleep(0.1))
+        self.task.on_foreground_resume.side_effect = lambda: callbacks.append(threading.current_thread())
+        worker.start()
+        try:
+            self.assertTrue(sleeping.wait(1))
+            self.executor.prepare_start(StartRequest('恢复原执行栈'))
+            self.task.on_foreground_resume.assert_not_called()
+            self.executor.paused = self.task._paused = False
+        finally:
+            resume.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(callbacks, [worker])
+        self.task.run.assert_called_once()
+        self.assertEqual(self._activation_count(), 1)
+
+    def test_开始首帧使用有界捕获且准备后的尺寸检查不重复截图(self):
+        self._use_background()
+        self.capture.get_frame_for_probe = Mock(side_effect=lambda timeout: self.capture.get_frame(busy_wait=timeout))
+        self.executor.prepare_start(StartRequest(), time_out=0.25)
+        self.capture.get_frame_for_probe.assert_called_once_with(0.1)
+        frame = self.executor._frame
+        self.executor.device_manager.update_resolution_for_hwnd = Mock()
+        with patch.object(self.capture, 'get_frame', side_effect=AssertionError('不能重复截图')):
+            self.assertEqual(self.executor.check_frame_and_resolution('3:2', (30, 20), frame=frame), (True, '30x20'))
+        self.executor.device_manager.update_resolution_for_hwnd.assert_not_called()
+
+    def test_后台长按期间暂停和停止先发布状态再等待持锁释放(self):
+        for operation in ('总暂停', '任务暂停', '禁用任务', '停止当前', '关闭执行器', '直接清理'):
+            with self.subTest(operation=operation):
+                self._use_background()
+                self.executor.exit_event = self.window.app_exit_event
+                self.executor.paused = self.task._paused = False
+                self.task._enabled = True
+                self.executor.current_task = self.task
+                self.executor.start = Mock()
+                self.executor.prepare_start(StartRequest(operation))
+                held, stopping, stopped = threading.Event(), threading.Event(), threading.Event()
+                errors = []
+
+                def wait_held(seconds):
+                    held.set()
+                    stopping.wait(1)
+                    # 真实线程交接，让旧实现会等待10秒手势的死锁边界可被稳定观察。
+                    threading.Event().wait(0.005)
+                    self.clock.wait(seconds)
+
+                self.adapter.wait = wait_held
+
+                def press():
+                    try:
+                        self.adapter.send_key('w', down_time=10)
+                    except (ForegroundInputInterrupted, TaskDisabledException):
+                        pass
+                    except BaseException as error:
+                        errors.append(error)
+
+                actions = {'总暂停': self.executor.pause, '任务暂停': self.task.pause,
+                           '禁用任务': self.task.disable, '停止当前': self.executor.stop_current_task,
+                           '关闭执行器': self.executor.stop, '直接清理': self.executor.destroy}
+
+                def stop_input():
+                    stopping.set()
+                    try:
+                        actions[operation]()
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        stopped.set()
+
+                worker = threading.Thread(target=press, daemon=True)
+                self.executor.thread = worker
+                worker.start()
+                stopper = None
+                try:
+                    self.assertTrue(held.wait(1))
+                    before = self.clock()
+                    stopper = threading.Thread(target=stop_input, daemon=True)
+                    stopper.start()
+                    self.assertTrue(stopped.wait(1), '暂停／停止不应等待整段长按结束')
+                    self.assertLess(self.clock() - before, 1)
+                finally:
+                    self.executor.exit_event.set()
+                    stopping.set()
+                    worker.join(1)
+                    if stopper is not None:
+                        stopper.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(errors)
+                self.assertFalse(self.adapter._held)
+                self.assertEqual(self._activation_count(), 1)
+                self.assertEqual([message[1] for message in self.messages.messages], [WM_ACTIVATE, 0x100, 0x101])
+                self.assertTrue(all(message[0] == 10 for message in self.messages.messages))
+
     def make_start_controller(self):
         controller = StartController.__new__(StartController)
         controller.exit_event = self.executor.exit_event
@@ -1197,12 +1505,15 @@ class TestForegroundLifecycle(InputFixture):
         controller.start_exe = False
         controller.check_auto_hdr = Mock()
         controller.check_gpu_driver_post_processing = Mock()
+        controller.connect_existing_device = Mock(return_value=True)
+        controller.check_device_error = Mock(return_value=None)
         self.executor.device_manager.do_refresh = Mock()
         self.executor.start = Mock()
         return controller
 
     def test_GUI仅触发任务总启动也经过绑定与真实置前准备(self):
         controller = self.make_start_controller()
+        self.executor.paused = True
         self.task.enable_after_start = True
         globals_stub = SimpleNamespace(executor=self.executor, device_manager=self.executor.device_manager, app=None)
         with patch('ok.core.start_controller.og', globals_stub), patch('ok.core.start_controller.communicate'):
@@ -1225,6 +1536,7 @@ class TestForegroundLifecycle(InputFixture):
 
     def test_CLI索引启动在前台准备完成后只入队一次(self):
         controller = self.make_start_controller()
+        self.executor.paused = True
         posted = []
         controller.handler = SimpleNamespace(post=posted.append)
         self.task._enabled = self.task.running = False
@@ -1250,11 +1562,12 @@ class TestForegroundLifecycle(InputFixture):
         self.assertTrue(self.task.exit_after_task)
         self.assertFalse(self.task._foreground_resume_pending)
         self.assertFalse(controller.starting)
-        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertIsNone(controller.__dict__['_active_request'])
         self.assertFalse(self.native.inserted)
 
     def test_直接启动任务也保留前台准备和入队请求(self):
         controller = self.make_start_controller()
+        self.executor.paused = True
         self.task._enabled = self.task.running = False
         self.task._foreground_resume_pending = True
         self.executor.current_task = None
@@ -1272,7 +1585,7 @@ class TestForegroundLifecycle(InputFixture):
         self.assertTrue(self.task.exit_after_task)
         self.assertFalse(self.task._foreground_resume_pending)
         self.assertFalse(controller.starting)
-        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertIsNone(controller.__dict__['_active_request'])
         self.assertFalse(self.native.inserted)
 
     def test_CLI排队请求取消后不刷新设备或抢焦点(self):
@@ -1299,6 +1612,7 @@ class TestForegroundLifecycle(InputFixture):
 
     def test_CLI绑定期间取消不启用任务或发出输入(self):
         controller = self.make_start_controller()
+        self.executor.paused = True
         posted = []
         controller.handler = SimpleNamespace(post=posted.append)
         self.task._enabled = self.task.running = False
@@ -1318,7 +1632,7 @@ class TestForegroundLifecycle(InputFixture):
         self.assertFalse(self.executor.onetime_task_queue)
         self.assertFalse(self.task.enabled)
         self.assertFalse(controller.starting)
-        self.assertIsNone(controller.__dict__['_active_task'])
+        self.assertIsNone(controller.__dict__['_active_request'])
         self.assertFalse(self.native.inserted)
 
     def test_通知作业失焦延期但不阻塞只读作业(self):
@@ -1572,6 +1886,63 @@ class TestForegroundDeviceAndWindow(InputFixture):
         for value in ('未知方案', ' ', 0, False, {}, ('nono',), type('自定义后台', (), {}), ['Pynput', '未知方案']):
             with self.assertRaises(ValueError):
                 normalize_pc_interaction(value)
+        self.assertEqual(normalize_pc_interaction('post_message_test'), 'post_message_test')
+        self.assertEqual(normalize_pc_interaction(PostMessageTestInteraction), 'post_message_test')
+        self.assertEqual(normalize_pc_interaction(['nono', 'post_message_test']), 'nono')
+
+    def test_后台明确保存后重建与绑定保留选择且历史配置仍迁移前台(self):
+        from ok.util.config import Config
+        from tests.TestBackgroundInput import FakeMessages, FakeWindow as BackgroundWindow
+        for saved, expected in (('', 'nono'), ('PostMessage', 'nono'), ('post_message_test', 'post_message_test')):
+            with self.subTest(saved=saved), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'devices.json'
+                path.write_text(json.dumps({'interaction': saved, 'preferred': 'pc', 'capture': 'WGC'}), encoding='utf-8')
+                native = FakeMessages()
+                window = BackgroundWindow(native)
+                window.get_abs_cords = lambda x, y: (x, y)
+                capture = FakeCapture(window, self.clock)
+                windows = {'interaction': ['nono', 'post_message_test'], 'capture_method': ['WGC']}
+                with patch.object(Config, 'config_folder', directory), \
+                        patch('ok.device.DeviceManager.Handler', return_value=Mock()), \
+                        patch('ok.device.DeviceManager.HwndWindow', return_value=window), \
+                        patch('ok.device.DeviceManager.update_capture_method', return_value=capture), \
+                        patch('ok.device.interaction_methods.post_message_test.Win32MessageBackend', return_value=native), \
+                        patch('ok.device.interaction_methods.foreground_input._shared_input', self.core):
+                    manager = DeviceManager({'windows': windows}, threading.Event())
+                    manager.device_dict = {'pc': {'device': 'windows'}}
+                    manager.ensure_hwnd = Mock()
+                    manager.do_start(notify=False)
+                self.assertEqual(manager.config['interaction'], expected)
+                self.assertEqual(json.loads(path.read_text('utf-8'))['interaction'], expected)
+                self.assertEqual(manager.available_interaction_methods({'device': 'windows'}), ['nono', 'post_message_test'])
+                self.assertIsInstance(manager.interaction, PostMessageTestInteraction if expected == 'post_message_test' else NonoInteraction)
+                self.assertFalse(native.attempts)
+
+    def test_后台捕获限制整个回退链且切换不消费激活(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        manager.windows_capture_config = {
+            'interaction': ['nono', 'post_message_test'],
+            'capture_method': ['ForegroundBitBlt', 'WGC', 'DXGI', 'BitBlt_RenderFull']}
+        manager.config = {'interaction': 'nono', 'preferred': 'pc', 'capture': 'ForegroundBitBlt'}
+        manager.device_dict = {'pc': {'device': 'windows'}}
+        manager.win_interaction_class = NonoInteraction
+        manager.interaction = Mock(spec=BaseInteraction)
+        manager.capture_method = None
+        manager.hwnd_window, manager.exit_event = Mock(), threading.Event()
+        manager.start = Mock()
+        manager.set_interaction('post_message_test')
+        self.assertEqual(manager.available_capture_methods(), ['WGC', 'BitBlt_RenderFull'])
+        self.assertEqual(manager.windows_capture_config['interaction'], ['nono', 'post_message_test'])
+        with patch('ok.device.DeviceManager.update_capture_method', return_value=None) as update:
+            manager.use_windows_capture()
+        self.assertEqual(update.call_args.args[0]['capture_method'], ['WGC', 'BitBlt_RenderFull'])
+        self.assertEqual(update.call_args.kwargs['selected_method'], 'WGC')
+        with self.assertRaises(ValueError):
+            manager.set_capture('DXGI')
+        manager.executor = SimpleNamespace(paused=True, current_task=object())
+        with self.assertRaises(RuntimeError):
+            manager.set_interaction('nono')
+        self.assertEqual(manager.config['interaction'], 'post_message_test')
 
     def test_构造保存迁移不会实例化旧后端或读写用户配置(self):
         from ok.util.config import Config
@@ -1627,6 +1998,18 @@ class TestForegroundDeviceAndWindow(InputFixture):
         manager.capture_method = object()
         manager.interaction = Mock(spec=BaseInteraction)
         self.assertEqual(old.release_all.call_count, 2)
+
+    def test_设备替换清理失败保留旧后端与配置(self):
+        manager = DeviceManager.__new__(DeviceManager)
+        old = Mock(spec=BaseInteraction)
+        manager.interaction = old
+        previous_capture = manager.capture_method = object()
+        old.release_all.side_effect = ForegroundInputError('受控释放失败')
+        for name, value in (('interaction', Mock(spec=BaseInteraction)), ('capture_method', object())):
+            with self.subTest(name=name), self.assertRaises(ForegroundInputError):
+                setattr(manager, name, value)
+        self.assertIs(manager.interaction, old)
+        self.assertIs(manager.capture_method, previous_capture)
 
     def test_异步绑定屏障超时取消与完成(self):
         manager = DeviceManager.__new__(DeviceManager)
@@ -1774,11 +2157,11 @@ class TestMcpForegroundPreparation(InputFixture):
                 patch('ok.device.capture_methods.bitblt.render_full', False)):
             scoped_patch.start()
             self.addCleanup(scoped_patch.stop)
-        executor = SimpleNamespace(check_enabled=Mock(return_value=None), feature_set=None)
+        executor = SimpleNamespace(check_enabled=Mock(return_value=None), feature_set=None, current_task=None)
         controller = self.controller = StartController.__new__(StartController)
         controller.start_exe, controller.start_timeout = False, 1
         controller.start_device = Mock()
-        controller.try_capture_a_frame = Mock(side_effect=lambda: manager.capture_method.get_frame())
+        controller.try_capture_a_frame = Mock(side_effect=lambda **kwargs: manager.capture_method.get_frame())
         controller.check_resolution = Mock(return_value=None)
         controller.tr = lambda message: message
         controller.check_device_error = Mock(wraps=controller.check_device_error)

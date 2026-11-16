@@ -102,7 +102,9 @@ proof that the game behavior succeeded.
 
 ## 本项目的 Windows 输入契约
 
-本应用统一使用前台系统键鼠，游戏、原生登录器和已启用的 QQ／微信桌面通知共用输入核心。包内或历史资料中推荐 PostMessage、伪激活或局部前台兜底的指引不适用于本项目。
+本应用默认 nono 前台系统键鼠，游戏、原生登录器和已启用的 QQ／微信桌面通知共用输入核心。用户明确选择的 post_message_test 是独立后台测试模式：仅每个外部开始／恢复请求向主窗口伪激活一次，普通输入、子任务、窗口恢复和停止均不补发。旧资料中每次输入重复激活或局部前台兜底不适用。
+
+所有 Windows 开始入口只连接用户手动打开的游戏；快捷键和鼠标按钮使用相同规则。直接 start_device、MCP 或更新确认也不得自动启动／重启游戏。NoNo 自身启动器与更新不受此限制。后台模式仍检查身份、持有释放与新帧，最小化时等待恢复；nono 的下述真实前台契约保留，后台能力必须独立验证。
 
 - 任务使用 `self.click`、`self.send_key`、`self.swipe_relative`、`self.input_text` 等公共接口；拖拽时长以秒传递。角色通过 `self.task` 调用同一接口。
 - 不新建 `PynputInteraction` 或 Controller，不直接调用 SendInput／SetCursorPos，不用 `check_clickable=False` 绕过守卫。释放、失焦、取消和异常清理由共享后端负责。

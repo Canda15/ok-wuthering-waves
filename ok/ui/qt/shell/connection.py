@@ -66,7 +66,7 @@ def capture_options(device_manager, device: dict):
     """``(options, current_index, method_names)`` for the device's capture methods."""
 
     if device['device'] == "windows":
-        methods = device_manager.windows_capture_config.get('capture_method', [])
+        methods = device_manager.available_capture_methods(device)
         if not methods:
             return [(_t("SelectCaptureListView", "Game Window"), "", None)], 0, [None]
         names = [_method_name(method) for method in methods]
@@ -89,14 +89,22 @@ def capture_options(device_manager, device: dict):
 
 
 def interaction_options(device_manager, device: dict):
-    """返回输入选项；Windows 始终展示唯一的 nono 前台方案。"""
+    """界面、保存值与设备构造共用正式模式标识。"""
 
     if device['device'] == "windows":
         title = f"nono（{_t('SelectInteractionListView', '前台系统键鼠')}）"
         description = _t(
             "SelectInteractionListView",
             "使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续")
-        return [(title, description, None)], 0, ["nono"]
+        options = {'nono': (title, description, None),
+                   'post_message_test': (
+                       _t('SelectInteractionListView', '后台测试（启动时单次激活）'),
+                       _t('SelectInteractionListView', '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复'),
+                       None)}
+        names = device_manager.available_interaction_methods(device)
+        current = getattr(device_manager, 'config', {}).get('interaction')
+        index = names.index(current) if current in names else 0
+        return [options[name] for name in names], index, names
     if device['device'] == "adb":
         return [(_t("SelectInteractionListView", "ADBInteraction"), "", None)], 0, [None]
     if device['device'] == "browser":
@@ -220,7 +228,7 @@ class ConnectionPopover(Popover):
         from ok import og
         device_manager = og.device_manager
         device = device_manager.get_preferred_device()
-        editable = og.executor.paused
+        editable = og.executor.paused and og.executor.current_task is None
         for widget in (self.window_combo, self.capture_group, self.interaction_group):
             widget.setEnabled(editable)
         if device is None:
@@ -267,6 +275,7 @@ class ConnectionPopover(Popover):
         from ok import og
         if index < len(self._interaction_names) and self._interaction_names[index]:
             og.device_manager.set_interaction(self._interaction_names[index])
+            self._refresh_device_state()
         self.changed.emit()
 
     def _view_log(self) -> None:

@@ -45,7 +45,7 @@ Prefer visual geometry, color classification, and template matching for regular 
 
 ## Run, observe, modify
 
-1. 在真实目标上验证截图和每项必要输入。本应用 Windows 输入只使用统一前台系统键鼠，操作会占用真实键盘、鼠标和前台；每次新输入核对真实目标。失焦时释放并等待，用户回到游戏后刷新画面自动继续，不抢回前台，也不重放中断手势或部分文本。输入失败、权限拒绝或坐标异常时，先阅读[Windows 输入验证](references/windows-input.md)，不要切回窗口消息或私建控制器。
+1. 在真实目标上验证截图和每项必要输入。本应用默认 nono 前台系统键鼠，每次新输入核对真实目标，失焦释放并等待，返回后刷新新帧；不抢回前台、不重放中断手势。用户明确选择 post_message_test 时使用独立后台消息后端，仅外部开始／恢复请求激活一次，运行中零补发，最小化等待新帧。所有入口只连接已手动打开的游戏。输入失败、权限拒绝或坐标异常时，先阅读[Windows 输入验证](references/windows-input.md)，不得私建控制器或自动切换模式兜底。
 2. Put milestone logs, screenshots, bounded waits, and assertions in task code. MCP provides `self.artifact_directory` for per-attempt results; normal task screenshots use the configured screenshot folder. Save evidence around failures before resetting.
 3. Submit the task path with `run_task`. Poll `get_run_status` until `succeeded`, `failed`, or `cancelled`. Inspect local `run.log`, `status.json`, task output, and screenshots. Background-thread logs may be in the application's normal log files.
 4. Use `screenshot()` for additional observations. It captures fresh frames when idle; while a task runs it saves the latest cached frame. Inspect `captured_at` and `cached`. Before the first captured frame there may be no image. Capture again through task code when fresh evidence is needed; normal task screenshots can finish writing asynchronously.

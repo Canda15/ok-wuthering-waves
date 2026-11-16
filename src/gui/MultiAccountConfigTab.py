@@ -367,7 +367,7 @@ class MultiAccountConfigTab(CustomTab):
             self.show_error('请先新增并启用至少一个账号。')
             return
         if self.save_accounts(notify=False):
-            og.app.start_controller.start(self.runner)
+            og.app.start_controller.start(self.runner, source='多账号开始')
             self.refresh_status()
 
     def stop_clicked(self):

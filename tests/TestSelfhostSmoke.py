@@ -295,7 +295,7 @@ class TestSelfhostSmoke(unittest.TestCase):
         fixture.git('update-ref', 'refs/upstream-tags/v3.8.3', fixture.upstream_v383)
         fixture.git('checkout', 'master')
         ours = dict(base_files)
-        ours['config.py'] = base_config.replace("'PostMessage'", "'nono'")
+        ours['config.py'] = base_config.replace("'PostMessage'", "['nono', 'post_message_test']")
         ours['config.py'] = ours['config.py'].replace("        ['src.task.MouseResetTask', 'MouseResetTask'],\n", '')
         ours['config.py'] = ours['config.py'].replace("    'update_only_game_exit': True,\n", '')
         if variant == 'config_field':
@@ -323,7 +323,7 @@ class TestSelfhostSmoke(unittest.TestCase):
         self.assertEqual(result['resolved'], ['config.py', 'pyproject.toml', 'requirements.txt'])
         self.assertEqual(result['framework_version'], '3.0.5b9')
         config = ast.literal_eval(ast.parse((fixture.checkout / 'config.py').read_bytes()).body[0].value)
-        self.assertEqual(config['windows'], {'标题': '中文偏移', 'interaction': 'nono'})
+        self.assertEqual(config['windows'], {'标题': '中文偏移', 'interaction': ['nono', 'post_message_test']})
         self.assertEqual(config['gui_title'], '上游新标题')
         self.assertEqual(config['trigger_tasks'], [['src.task.KeepTask', 'KeepTask']])
         self.assertNotIn('update_only_game_exit', config)
@@ -678,38 +678,45 @@ function gh {
                          'ok/ 里的品牌补丁没生效,跑一次 python scripts/sync_ok.py')
 
     def test_default_input_policy_and_mouse_reset_removal(self):
-        """上游配置重新带回后台默认值或光标补救任务时必须在自维护门禁发现。"""
+        """前台默认与显式后台测试均可选，且同步不能恢复游戏自动启动。"""
         from config import config
         from ok.device.DeviceManager import DeviceManager
         from ok.ui.qt.shell.connection import interaction_options
         repo_root = Path(__file__).resolve().parents[1]
-        self.assertEqual(config['windows']['interaction'], 'nono')
+        self.assertEqual(config['windows']['interaction'], ['nono', 'post_message_test'])
+        self.assertFalse(config['windows']['start_exe'])
+        self.assertNotIn('launch_arguments', config['windows'])
         manager = DeviceManager.__new__(DeviceManager)
         manager.windows_capture_config = config['windows']
         options, index, names = interaction_options(manager, {'device': 'windows'})
         self.assertEqual(names, manager.available_interaction_methods({'device': 'windows'}))
-        self.assertEqual(names, ['nono'])
+        self.assertEqual(names, ['nono', 'post_message_test'])
         self.assertEqual(index, 0)
         self.assertEqual(options, [('nono（前台系统键鼠）',
-                                   '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续', None)])
+                                   '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续', None),
+                                   ('后台测试（启动时单次激活）',
+                                    '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复', None)])
         self.assertNotIn(('src.task.MouseResetTask', 'MouseResetTask'),
                          [tuple(task) for task in config['trigger_tasks']])
         self.assertFalse((repo_root / 'src' / 'task' / 'MouseResetTask.py').exists())
 
     def test_upstream_input_overwrite_preserves_foreground_policy_and_other_settings(self):
-        """覆盖入口同时守住前台默认值、旧注册和用户捕获参数，且可重复执行。"""
+        """上游覆盖保留可选模式和捕获参数，但绝不恢复自动启动入口。"""
         from selfhost.overrides import apply
         kept_task = ['src.task.AutoPickTask', 'AutoPickTask']
-        for old_name in ('PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect', 'Pynput', 'nono'):
+        for old_name in ('PostMessage', 'Genshin', 'ForegroundPostMessage', 'PyDirect', 'Pynput', 'nono',
+                         'post_message_test', ['nono', 'post_message_test']):
             with self.subTest(old_name=old_name):
                 config = {
-                    'windows': {'interaction': old_name, 'exe': 'fixture.exe', 'capture_method': ['WGC']},
+                    'windows': {'interaction': old_name, 'exe': 'fixture.exe', 'capture_method': ['WGC'],
+                                'start_exe': True, 'start_method': 'shell', 'launch_arguments': '-old'},
                     'trigger_tasks': [kept_task, ['src.task.MouseResetTask', 'MouseResetTask']],
                 }
                 apply(config)
                 apply(config)
                 self.assertEqual(config['windows'], {
-                    'interaction': 'nono', 'exe': 'fixture.exe', 'capture_method': ['WGC'],
+                    'interaction': ['nono', 'post_message_test'], 'exe': 'fixture.exe', 'capture_method': ['WGC'],
+                    'start_exe': False,
                 })
                 self.assertEqual(config['trigger_tasks'], [kept_task])
 
@@ -717,14 +724,16 @@ function gh {
         """部署白名单或导入来源漂移会让已通过的前台实现在用户包中消失。"""
         import ok
         from ok.device import interaction_methods
-        from ok.device.interaction_methods import foreground_input, nono
+        from ok.device.interaction_methods import foreground_input, nono, post_message_test
         from selfhost.portable import process_environment, hidden_process_options
         repo_root = Path(__file__).resolve().parents[1]
         self.assertTrue(Path(ok.__file__).resolve().is_relative_to(repo_root / 'ok'))
         self.assertTrue(Path(foreground_input.__file__).resolve().is_relative_to(repo_root / 'ok'))
         self.assertTrue(Path(nono.__file__).resolve().is_relative_to(repo_root / 'ok'))
+        self.assertTrue(Path(post_message_test.__file__).resolve().is_relative_to(repo_root / 'ok'))
         self.assertIs(ok.NonoInteraction, nono.NonoInteraction)
         self.assertIs(ok.PynputInteraction, nono.NonoInteraction)
+        self.assertIs(ok.PostMessageTestInteraction, post_message_test.PostMessageTestInteraction)
         deploy_entries = {
             line.strip() for line in (repo_root / 'deploy.txt').read_text(encoding='utf-8').splitlines()
             if line.strip() and not line.lstrip().startswith('#')
@@ -746,17 +755,19 @@ function gh {
         shutil.copytree(repo_root / 'ok', deployment / 'ok', ignore=ignored)
         shutil.copytree(repo_root / 'selfhost', deployment / 'selfhost', ignore=ignored)
         (deployment / 'ok/device/interaction_methods/nono.py').unlink()
+        (deployment / 'ok/device/interaction_methods/post_message_test.py').unlink()
         applied, _already = patches.apply_to(deployment / 'ok')
-        self.assertEqual(applied, ['device/interaction_methods/nono.py'])
+        self.assertEqual(applied, ['device/interaction_methods/nono.py', 'device/interaction_methods/post_message_test.py'])
         self.assertEqual(sync.hash_tree(deployment / 'ok'), sync.hash_tree(repo_root / 'ok'))
         self.assertEqual(sync.do_check(deployment), 0)
         code = (
             'import importlib; from pathlib import Path; '
-            'from ok import NonoInteraction, PynputInteraction; '
+            'from ok import NonoInteraction, PynputInteraction, PostMessageTestInteraction; '
             'from ok.device.DeviceManager import normalize_pc_interaction; '
             'assert NonoInteraction is PynputInteraction; '
             'assert normalize_pc_interaction("Pynput") == "nono"; '
             'assert normalize_pc_interaction(NonoInteraction) == "nono"; '
+            'assert normalize_pc_interaction(PostMessageTestInteraction) == "post_message_test"; '
             'module = importlib.import_module(NonoInteraction.__module__); '
             'assert Path(module.__file__).resolve().is_relative_to((Path.cwd() / "ok").resolve()); '
             'assert all(importlib.import_module(name).PynputInteraction is NonoInteraction '
@@ -1261,6 +1272,8 @@ function gh {
         current = {
             ('SelectInteractionListView', '前台系统键鼠'),
             ('SelectInteractionListView', '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续'),
+            ('SelectInteractionListView', '后台测试（启动时单次激活）'),
+            ('SelectInteractionListView', '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复'),
             ('app', '需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
             ('app', '需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
         }
@@ -1325,7 +1338,7 @@ function gh {
         # 资源约束跟随已登记的框架来源，升级补丁版本不应被旧版本常量误报阻断。
         self.assertEqual(manifest['framework_version'], pin['version'])
         paths = {entry['path'] for entry in manifest['entries']}
-        self.assertNotIn('ui/qt/MainWindow.py', paths)
+        self.assertIn('ui/qt/MainWindow.py', paths)
         self.assertNotIn('ui/qt/about/UpdateCard.py', paths)
 
     def test_update_card_passes_language_and_supports_legacy_notes(self):
@@ -1419,7 +1432,8 @@ function gh {
                 executor.paused = paused
                 about.check_for_updates.reset_mock()
                 MainWindow._startup_update_check(window)
-                if not auto_start and not requested and not starting and paused:
+                # 已废弃的游戏自动启动值不能影响 NoNo 自身的空闲更新检查。
+                if not requested and not starting and paused:
                     about.check_for_updates.assert_called_once_with(automatic=True)
                 else:
                     about.check_for_updates.assert_not_called()

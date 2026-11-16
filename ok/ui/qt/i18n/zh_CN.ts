@@ -3358,7 +3358,15 @@
             <source>前台系统键鼠</source>
             <translation>前台系统键鼠</translation>
         </message>
-        </context>
+        <message>
+            <source>后台测试（启动时单次激活）</source>
+            <translation>后台测试（启动时单次激活）</translation>
+        </message>
+        <message>
+            <source>每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复</source>
+            <translation>每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复</translation>
+        </message>
+    </context>
     <context>
         <name>ImportWarningDialog</name>
         <message>

@@ -81,13 +81,14 @@ def normalize_config(content):
 
     interaction = field(field(assignments[0].value, 'windows'), 'interaction')
     value = ast.literal_eval(interaction)
-    if value not in ('PostMessage', 'nono') and value != ['PostMessage', 'Pynput']:
-        raise RuntimeError('上游输入方式出现未知值，需人工核对 nono 适配')
+    if value not in ('PostMessage', 'nono') and value not in (
+            ['PostMessage', 'Pynput'], ['nono', 'post_message_test']):
+        raise RuntimeError('上游输入方式出现未知值，需人工核对输入模式适配')
     # AST 的列号是 UTF-8 字节偏移；同一行前面有中文时也只替换这个值。
     lines = content.splitlines(keepends=True)
     start = sum(map(len, lines[:interaction.lineno - 1])) + interaction.col_offset
     end = sum(map(len, lines[:interaction.end_lineno - 1])) + interaction.end_col_offset
-    return content[:start] + b"'nono'" + content[end:]
+    return content[:start] + b"['nono', 'post_message_test']" + content[end:]
 
 
 def normalize_pyproject(content):

@@ -53,11 +53,14 @@ def apply_user_data_paths(config):
 
 
 def apply_input_policy(config):
-    """上游配置同步后继续使用前台后端，并撤出后台光标补救任务。"""
+    """统一可选输入和手动开游戏策略，避免上游同步恢复隐式启动／激活。"""
     windows = config.get('windows')
     if windows is not None:
-        # 与 DeviceManager 的历史配置迁移共同守住输入边界，不保留后台备选。
-        windows['interaction'] = 'nono'
+        # 列表是可选能力；DeviceManager 单独保存用户选择，旧配置仍迁移到 nono。
+        windows['interaction'] = ['nono', 'post_message_test']
+        windows['start_exe'] = False
+        windows.pop('launch_arguments', None)
+        windows.pop('start_method', None)
     if 'trigger_tasks' in config:
         config['trigger_tasks'] = [
             task for task in config['trigger_tasks']

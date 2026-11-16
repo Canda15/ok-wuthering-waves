@@ -594,7 +594,7 @@ class EditTaskTab(QWidget):
     def _run_reloaded_task(self):
         if self.task is not None:
             self._switch_to_task_tab()
-            og.app.start_controller.start(self.task)
+            og.app.start_controller.start(self.task, source='编辑任务运行')
 
     def _switch_to_task_tab(self):
         """Switch to the tab that contains the current task."""

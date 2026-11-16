@@ -67,11 +67,9 @@ BASIC_GROUP_DEVELOPER = 'Developer'
 BASIC_GROUP_BLUR = 'Blur'
 
 _basic_options_default = {
-    'Auto Start Game When App Starts': False,
     'Exit App when Game Exits': False,
     'Auto Resize Game Window': True,
     'Mute Game while in Background': False,
-    'Launch with DX11': False,
     'Start/Stop': 'F9',
     'Trigger Interval': 1,
     'Minimize Window to System Tray when Closing': False,
@@ -81,11 +79,9 @@ _basic_options_default = {
     ENABLE_MCP_SERVER: False,
 }
 _basic_options_group = {
-    'Auto Start Game When App Starts': BASIC_GROUP_GAME,
     'Exit App when Game Exits': BASIC_GROUP_GAME,
     'Auto Resize Game Window': BASIC_GROUP_GAME,
     'Mute Game while in Background': BASIC_GROUP_GAME,
-    'Launch with DX11': BASIC_GROUP_GAME,
     'Start/Stop': BASIC_GROUP_TASKS,
     'Trigger Interval': BASIC_GROUP_TASKS,
     'Minimize Window to System Tray when Closing': BASIC_GROUP_APPLICATION,
@@ -341,6 +337,14 @@ def register_basic_options(global_config, enable_blur=False):
     registered.default_config[ENABLE_MCP_SERVER] = False
     if registered.config_type is None:
         registered.config_type = {}
+    # 老配置保留未知键，必须定向移除自动开游戏专属设置，不能只删除默认值。
+    for key in ('Auto Start Game When App Starts', 'Launch with DX11'):
+        config.default.pop(key, None)
+        registered.default_config.pop(key, None)
+        registered.config_description.pop(key, None)
+        registered.config_type[key] = {'hidden': True}
+        if key in config:
+            config.pop(key)
     registered.config_type[ENABLE_MCP_SERVER] = options.config_type[ENABLE_MCP_SERVER]
     registered.config_description.setdefault(ENABLE_MCP_SERVER, options.config_description[ENABLE_MCP_SERVER])
     # Shortcut options are hidden when pyappify cannot create shortcuts.

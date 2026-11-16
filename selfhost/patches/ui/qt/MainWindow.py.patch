@@ -1,0 +1,21 @@
+--- a/ui/qt/MainWindow.py
++++ b/ui/qt/MainWindow.py
+@@ -56,8 +56,8 @@
+ 
+ def game_starting_or_started(auto_start_enabled=False, start_task_requested=False, start_controller=None,
+                              executor=None):
+-    """Whether startup launched, is launching, or will launch the game and its tasks."""
+-    if auto_start_enabled or start_task_requested:
++    """仅显式任务请求或正在运行的助手阻止启动更新检查，旧自动开游戏选项已停用。"""
++    if start_task_requested:
+         return True
+     if start_controller is not None and getattr(start_controller, 'starting', False):
+         return True
+@@ -331,7 +331,6 @@
+         ok_instance = getattr(og, 'ok', None)
+         args = getattr(ok_instance, 'args', None) or {}
+         return game_starting_or_started(
+-            auto_start_enabled=bool(self.basic_global_config.get('Auto Start Game When App Starts')),
+             start_task_requested=bool(args.get('task')),
+             start_controller=getattr(getattr(og, 'app', None), 'start_controller', None),
+             executor=self.executor or getattr(og, 'executor', None),

@@ -16,6 +16,7 @@ from concurrent.futures import CancelledError
 from pathlib import Path
 
 from ok.core.code_runner import capture_output
+from ok.core.start_request import StartRequest
 from ok.task.exceptions import TaskDisabledException
 from ok.task.task import BaseTask, TriggerTask
 from ok.util.file import get_user_data_path
@@ -269,7 +270,18 @@ class McpTaskRunner:
                         if self.prepare is not None:
                             self.prepare()
                         task.ensure_capture()
-                        self.executor._prepare_task_for_run(is_trigger_task=False, request_focus=True)
+                        request = StartRequest('MCP运行任务')
+                        if not self.executor.prepare_start(
+                                request, cancel_check=lambda: self.executor.check_enabled(check_pause=False)):
+                            raise RuntimeError('游戏输入或画面尚未就绪，请检查游戏窗口后重试')
+                        controller = getattr(self.app, 'start_controller', None)
+                        if controller is not None:
+                            error = controller.check_device_error(
+                                frame=self.executor.nullable_frame(),
+                                cancel_check=lambda: self.executor.check_enabled(check_pause=False))
+                            if error:
+                                raise RuntimeError(error)
+                        self.executor._prepare_task_for_run(is_trigger_task=False)
                         self._phase(run_id, 'resetting')
                         if task.reset_to_start() is False:
                             raise RuntimeError('reset_to_start() returned False')

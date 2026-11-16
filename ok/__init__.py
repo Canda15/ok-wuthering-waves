@@ -38,6 +38,7 @@ if TYPE_CHECKING:
         NonoInteraction as NonoInteraction,
         PynputInteraction as PynputInteraction,
     )
+    from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction as PostMessageTestInteraction
     from ok.feature.Box import (
         Box,
         average_width,
@@ -116,6 +117,7 @@ _LAZY_IMPORTS = {
     'BrowserInteraction': ('ok.device.interaction', 'BrowserInteraction'),
     'NonoInteraction': ('ok.device.interaction', 'NonoInteraction'),
     'PynputInteraction': ('ok.device.interaction', 'PynputInteraction'),
+    'PostMessageTestInteraction': ('ok.device.interaction_methods.post_message_test', 'PostMessageTestInteraction'),
     'ForegroundInputInterrupted': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputInterrupted'),
     'ForegroundInputError': ('ok.device.interaction_methods.foreground_input', 'ForegroundInputError'),
     'ForegroundTarget': ('ok.device.interaction_methods.foreground_input', 'ForegroundTarget'),
@@ -698,7 +700,6 @@ class OK:
         register_basic = _resolve('register_basic_options')
         register_notifications = _resolve('register_notification_options')
         parse_arguments = _resolve('parse_arguments_to_map')
-        default_start_method = _resolve('WINDOWS_START_METHOD_START')
         wgc_available = _resolve('windows_graphics_available')
 
         self.args = parse_arguments()
@@ -739,8 +740,10 @@ class OK:
         self.global_config = global_config_class(config.get('global_configs'))
         windows_config = config.get('windows')
         if windows_config:
-            windows_config.setdefault('start_exe', True)
-            windows_config.setdefault('start_method', default_start_method)
+            # 旧配置也只能连接现有游戏，不能通过启动参数恢复自动开游戏。
+            windows_config['start_exe'] = False
+            windows_config.pop('start_method', None)
+            windows_config.pop('launch_arguments', None)
             capture_methods = windows_config.get('capture_method', [])
             available_methods = []
             for method in capture_methods:
@@ -903,7 +906,6 @@ class OK:
             self._runtime_started = True
 
         from ok.core.events import communicate
-        from ok.util.GlobalConfig import basic_options
 
         task_arg = self.args.get('task', 0)
         app = self.headless_app if self.should_init_task_manager_headless() else self.app
@@ -914,14 +916,11 @@ class OK:
                 # -t 传任务名/类名：解析为当前 onetime_tasks 中的任务实例再启动
                 start_task = self.get_onetime_task(task_arg)
                 logger.info(f'start runtime with task name {task_arg}')
-                app.start_controller.start(start_task, exit_after=self.args.get('exit', False))
+                app.start_controller.start(start_task, exit_after=self.args.get('exit', False), source='命令行任务')
                 return True
             task_number = task_arg
             logger.info(f'start runtime with task param {task_number - 1} {self.args.get("exit", False)}')
-            app.start_controller.start(task_number - 1, exit_after=self.args.get('exit', False))
-        elif self.global_config.get_config(basic_options).get('Auto Start Game When App Starts'):
-            logger.info('start runtime with Auto Start Game When App Starts')
-            app.start_controller.start()
+            app.start_controller.start(task_number - 1, exit_after=self.args.get('exit', False), source='命令行任务')
         else:
             self.device_manager.refresh()
         return True

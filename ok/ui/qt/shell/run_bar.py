@@ -1,10 +1,4 @@
-"""The run bar under the main window's title bar.
-
-Left: the game connection pill, which opens :class:`ConnectionPopover`.
-Right: what the executor is doing and the one executor button, bound to the
-Start/Stop hotkey (F11 by default). Running a single task happens from the
-task pages; this bar never starts a specific task.
-"""
+"""运行栏显示连接状态，并统一处理总开始／暂停按钮及可配置热键（默认 F9）。"""
 
 import time
 from ctypes import byref, windll, wintypes
@@ -26,6 +20,7 @@ from ok.util.logger import Logger
 logger = Logger.get_logger(__name__)
 
 HOTKEY_ID = 999
+MOD_NOREPEAT = 0x4000
 HOTKEY_KEYS = {'F9': 0x78, 'F10': 0x79, 'F11': 0x7A, 'F12': 0x7B}
 
 
@@ -66,11 +61,7 @@ class RunState:
 
 def compute_run_state(executor, device_manager, starting: bool = False, game_name: str = "Game",
                       app_name: str = "") -> RunState:
-    """The run bar state; the button text names what it acts on.
-
-    Stopped with the game closed, Start launches the game, so it reads
-    "Start <game>". Otherwise the button starts or pauses the app.
-    """
+    """总开始仅运行助手；游戏未打开时提示手动打开，不再显示启动游戏。"""
 
     start_app = _t("RunBar", "Start {name}").format(name=app_name).strip()
     pause_app = _t("RunBar", "Pause {name}").format(name=app_name).strip()
@@ -80,24 +71,26 @@ def compute_run_state(executor, device_manager, starting: bool = False, game_nam
                         _t("MainWindow", "{owner} is controlling the app. Other tasks are stopped.")
                         .format(owner=owner), "warning")
     if starting:
-        return RunState("cancel", _t("RunBar", "Cancel"), _t("RunBar", "Launching {name}").format(name=game_name),
+        return RunState("cancel", _t("RunBar", "Cancel"), "正在连接游戏并准备任务",
                         starting=True)
     if executor.paused:
         device = device_manager.get_preferred_device() if device_manager else None
-        if device is not None and not device.get('connected'):
-            return RunState("start", _t("RunBar", "Start {name}").format(name=game_name))
+        if device is None or not device.get('connected'):
+            return RunState("start", start_app, "请先手动打开游戏，并选择正确的游戏窗口", "warning")
         return RunState("start", start_app)
     if not executor.connected():
         return RunState("pause", pause_app, _t("StartCard", "Game Window Disconnected"), "danger")
+    capture_wait_message = ("游戏窗口暂不可用，请恢复游戏窗口" if executor.is_background_input
+                            else _t("StartCard", "Paused: PC Game Window Must Be in Front!"))
     task = executor.current_task
     if task is not None and task in executor.onetime_tasks and task.enabled:
         if not executor.can_capture():
-            return RunState("pause", pause_app, _t("StartCard", "Paused: PC Game Window Must Be in Front!"), "danger")
+            return RunState("pause", pause_app, capture_wait_message, "danger")
         queued = len([t for t in executor.onetime_task_queue if t is not task and t.enabled])
         return RunState("pause", pause_app, task=task, queued=queued)
     if executor.active_trigger_task_count():
         if not executor.can_capture():
-            return RunState("pause", pause_app, _t("StartCard", "Paused: PC Game Window Must Be in Front!"), "danger")
+            return RunState("pause", pause_app, capture_wait_message, "danger")
         return RunState("pause", pause_app)
     return RunState("pause", pause_app, _t("StartCard", "Waiting for task to be enabled"))
 
@@ -177,7 +170,6 @@ class RunBar(QFrame):
         from ok import og
         self.setFixedHeight(self.HEIGHT)
         self._starting = False
-        self._launch_deadline = 0.0
         self._state = None
 
         self.connection_pill = ConnectionPill(self)
@@ -195,8 +187,8 @@ class RunBar(QFrame):
         self.queue_pill = Pill("", "neutral")
         self.message_label = Label("", "secondary")
         self.executor_button = Button("", "power", "tonal")
-        self.executor_button.clicked.connect(self.toggle_executor)
-        self.toggle_requested.connect(self.toggle_executor)
+        self.executor_button.clicked.connect(lambda: self.toggle_executor('总开始按钮'))
+        self.toggle_requested.connect(lambda: self.toggle_executor('开始热键'))
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 12, 0)
@@ -248,7 +240,7 @@ class RunBar(QFrame):
         running_task = state.task is not None
         self.ring.setVisible(state.starting)
         self.task_label.setVisible(running_task)
-        self.elapsed_label.setVisible(running_task or state.starting)
+        self.elapsed_label.setVisible(running_task)
         self.cancel_task_button.setVisible(running_task)
         self.queue_pill.setVisible(running_task and state.queued > 0)
         self.message_label.setVisible(bool(state.message))
@@ -260,9 +252,6 @@ class RunBar(QFrame):
             started = getattr(state.task, 'start_time', 0) or 0
             self.elapsed_label.setText(format_elapsed(time.time() - started) if started else "")
             self.queue_pill.setText(_t("RunBar", "+{count} queued").format(count=state.queued))
-        elif state.starting:
-            left = max(0, self._launch_deadline - time.time())
-            self.elapsed_label.setText(format_elapsed(left))
 
         button = self.executor_button
         button.setEnabled(state.button != "disabled")
@@ -293,8 +282,6 @@ class RunBar(QFrame):
 
     def _on_starting(self, done, error, seconds_left) -> None:
         self._starting = not done
-        if not done:
-            self._launch_deadline = time.time() + (seconds_left or 0)
         self.refresh()
 
     # --- actions --------------------------------------------------------------
@@ -309,9 +296,9 @@ class RunBar(QFrame):
         if not self.popover.isVisible():
             self.toggle_popover()
 
-    def toggle_executor(self) -> None:
+    def toggle_executor(self, source='总开始按钮') -> None:
         from ok import og
-        state = self._state or self._compute_state()
+        state = self._compute_state()
         if state.button == "disabled":
             return
         if state.button == "cancel":
@@ -319,7 +306,7 @@ class RunBar(QFrame):
         elif state.button == "pause":
             og.executor.pause()
         else:
-            og.app.start_controller.start()
+            og.app.start_controller.start(source=source)
 
     def _cancel_task(self) -> None:
         from ok import og
@@ -355,7 +342,8 @@ class RunBar(QFrame):
     def _rebind_hotkey(hotkey) -> None:
         windll.user32.UnregisterHotKey(None, HOTKEY_ID)
         if hotkey and hotkey != 'None' and hotkey in HOTKEY_KEYS:
-            if not windll.user32.RegisterHotKey(None, HOTKEY_ID, 0, HOTKEY_KEYS[hotkey]):
+            # 长按只产生一次请求，避免系统键盘重复触发开始／暂停和额外激活。
+            if not windll.user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, HOTKEY_KEYS[hotkey]):
                 logger.error(f"Failed to register hotkey {hotkey}")
         else:
             logger.debug(f"Hotkey disabled or invalid: {hotkey}")

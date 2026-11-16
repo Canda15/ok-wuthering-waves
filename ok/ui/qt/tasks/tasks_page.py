@@ -75,8 +75,7 @@ def start_task(task, parent: QWidget) -> None:
     """Run (or resume) a one-time task, confirming its first-run alert once."""
 
     if task.enabled and task.paused:
-        logger.info(f"resume paused task {task}")
-        task.unpause()
+        og.app.start_controller.start(task, source='任务卡恢复')
         return
     if task.first_run_alert and not task.config.get('_first_run_alert'):
         dialog = Dialog(parent, _app_tr('Alert'), _app_tr(task.first_run_alert), ok_text=_app_tr('Confirm'),
@@ -87,7 +86,7 @@ def start_task(task, parent: QWidget) -> None:
         if not accepted:
             return
         task.config['_first_run_alert'] = task.first_run_alert
-    og.app.start_controller.start(task)
+    og.app.start_controller.start(task, source='任务卡开始')
 
 
 def _start_controller():
@@ -96,7 +95,7 @@ def _start_controller():
 
 
 def start_pending(task) -> bool:
-    """Whether ``task`` was started and waits for the game to launch."""
+    """任务是否等待连接或等待消费外部开始请求。"""
 
     is_pending = getattr(_start_controller(), 'is_task_pending', None)
     return callable(is_pending) and is_pending(task) is True
