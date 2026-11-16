@@ -2369,6 +2369,30 @@
       "file_name": "weekly_garden_zero.webp",
       "width": 2560,
       "height": 1440
+    },
+    {
+      "id": 310,
+      "file_name": "weekly_garden_claimed.png",
+      "width": 2560,
+      "height": 1440
+    },
+    {
+      "id": 311,
+      "file_name": "weekly_garden_unclaimed.png",
+      "width": 2560,
+      "height": 1440
+    },
+    {
+      "id": 312,
+      "file_name": "weekly_garden_obtained.png",
+      "width": 2560,
+      "height": 1440
+    },
+    {
+      "id": 313,
+      "file_name": "weekly_garden_claimed_hover.png",
+      "width": 2560,
+      "height": 1440
     }
   ],
   "annotations": [
@@ -6653,6 +6677,19 @@
       ],
       "area": 783.0,
       "iscrowd": 0
+    },
+    {
+      "id": 464,
+      "image_id": 310,
+      "category_id": 303,
+      "bbox": [
+        2332.0,
+        1244.0,
+        76.0,
+        68.0
+      ],
+      "area": 5168.0,
+      "iscrowd": 0
     }
   ],
   "categories": [
@@ -8164,6 +8201,11 @@
     {
       "id": 302,
       "name": "weekly_garden_reward_hint",
+      "supercategory": ""
+    },
+    {
+      "id": 303,
+      "name": "weekly_garden_reward_claimed",
       "supercategory": ""
     }
   ]
