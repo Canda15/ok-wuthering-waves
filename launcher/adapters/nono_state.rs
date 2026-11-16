@@ -114,7 +114,8 @@ pub(crate) fn path_under(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 pub(crate) struct DirectoryPins {
-    _handles: Vec<File>,
+    root: PathBuf,
+    handles: BTreeMap<PathBuf, File>,
 }
 
 fn open_directory(path: &Path) -> Result<File> {
@@ -130,59 +131,117 @@ fn open_directory(path: &Path) -> Result<File> {
             .custom_flags(0x02000000 | 0x00200000);
     }
     let file = options.open(path).context("无法锁定父目录（E_PATH_PIN）")?;
-    ensure!(file.metadata()?.is_dir(), "父目录身份无效（E_PATH_PIN）");
+    validate_directory_handle(&file)?;
+    Ok(file)
+}
+
+fn validate_directory_handle(file: &File) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .context("无法读取已持目录身份（E_PATH_PIN）")?;
+    ensure!(metadata.is_dir(), "父目录身份无效（E_PATH_PIN）");
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         ensure!(
-            file.metadata()?.file_attributes() & 0x400 == 0,
+            metadata.file_attributes() & 0x400 == 0,
             "父目录句柄包含重解析点（E_PATH_PIN）"
         );
     }
-    Ok(file)
+    Ok(())
+}
+
+impl DirectoryPins {
+    fn new(root: &Path) -> Result<Self> {
+        let mut handles = BTreeMap::new();
+        handles.insert(root.to_path_buf(), open_directory(root)?);
+        Ok(Self {
+            root: root.to_path_buf(),
+            handles,
+        })
+    }
+
+    fn pin_parents(&mut self, paths: &[&Path]) -> Result<()> {
+        for path in paths {
+            ensure!(
+                path.starts_with(&self.root) && *path != self.root,
+                "路径超出便携目录（E_PATH_BOUNDARY）"
+            );
+            let mut missing = Vec::new();
+            for parent in path.parent().into_iter().flat_map(Path::ancestors) {
+                // 句柄阻止更名，却不能阻止原地设置 junction；缓存命中仍核对整条祖先链。
+                if let Some(handle) = self.handles.get(parent) {
+                    validate_directory_handle(handle)?;
+                } else if parent.exists() {
+                    missing.push(parent.to_path_buf());
+                }
+                if parent == self.root {
+                    break;
+                }
+            }
+            // 从已持祖先向下逐层获取，不能先打开子目录再补上祖先的保护。
+            for parent in missing.into_iter().rev() {
+                let handle = open_directory(&parent)?;
+                self.handles.insert(parent, handle);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_directory(&self, path: &Path) -> Result<()> {
+        ensure!(
+            path.starts_with(&self.root),
+            "路径超出便携目录（E_PATH_BOUNDARY）"
+        );
+        for ancestor in path.ancestors() {
+            let handle = self
+                .handles
+                .get(ancestor)
+                .ok_or_else(|| anyhow!("目录尚未受保护（E_PATH_PIN）"))?;
+            validate_directory_handle(handle)?;
+            if ancestor == self.root {
+                return Ok(());
+            }
+        }
+        bail!("路径超出便携目录（E_PATH_BOUNDARY）")
+    }
+
+    fn ensure_directory(&mut self, relative: &str) -> Result<PathBuf> {
+        let relative = relative_path(relative)?;
+        self.validate_directory(&self.root)?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let child = current.join(component);
+            if self.handles.contains_key(&child) {
+                self.validate_directory(&child)?;
+            } else {
+                self.pin_parents(&[&child])?;
+                if child.exists() {
+                    ensure!(
+                        ordinary_metadata(&child)?.is_dir(),
+                        "目录身份无效（E_PATH_DIRECTORY）"
+                    );
+                } else {
+                    fs::create_dir(&child).context("无法创建事务目录（E_DIRECTORY_CREATE）")?;
+                }
+                let handle = open_directory(&child)?;
+                self.handles.insert(child.clone(), handle);
+            }
+            current = child;
+        }
+        self.validate_directory(&current)?;
+        Ok(current)
+    }
 }
 
 pub(crate) fn pin_parents(root: &Path, paths: &[&Path]) -> Result<DirectoryPins> {
-    let mut directories = BTreeSet::new();
-    directories.insert(root.to_path_buf());
-    for path in paths {
-        ensure!(
-            path.starts_with(root) && *path != root,
-            "路径超出便携目录（E_PATH_BOUNDARY）"
-        );
-        for parent in path.parent().into_iter().flat_map(Path::ancestors) {
-            if parent.exists() {
-                directories.insert(parent.to_path_buf());
-            }
-            if parent == root {
-                break;
-            }
-        }
-    }
-    let mut handles = Vec::new();
-    for path in directories {
-        handles.push(open_directory(&path)?);
-    }
-    Ok(DirectoryPins { _handles: handles })
+    let mut pins = DirectoryPins::new(root)?;
+    pins.pin_parents(paths)?;
+    Ok(pins)
 }
 
 pub(crate) fn ensure_directory(root: &Path, relative: &str) -> Result<PathBuf> {
-    let relative = relative_path(relative)?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let child = current.join(component);
-        let _pins = pin_parents(root, &[&child])?;
-        if child.exists() {
-            ensure!(
-                ordinary_metadata(&child)?.is_dir(),
-                "目录身份无效（E_PATH_DIRECTORY）"
-            );
-        } else {
-            fs::create_dir(&child).context("无法创建事务目录（E_DIRECTORY_CREATE）")?;
-        }
-        current = child;
-    }
-    Ok(current)
+    DirectoryPins::new(root)?.ensure_directory(relative)
 }
 
 fn open_readonly_file(path: &Path) -> Result<File> {
@@ -242,8 +301,11 @@ pub(crate) fn collect_tree(root: &Path) -> Result<TreeStamp> {
         "目录身份无效（E_TREE_ROOT）"
     );
     let mut result = TreeStamp::default();
+    // 同次扫描持有已核验目录，每个目录只打开一次；退出后不向交换阶段遗留句柄。
+    let mut pins = DirectoryPins::new(root)?;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        pins.validate_directory(&directory)?;
         for entry in fs::read_dir(&directory).context("无法枚举原件（E_TREE_READ）")? {
             let path = entry?.path();
             let relative = path
@@ -252,8 +314,10 @@ pub(crate) fn collect_tree(root: &Path) -> Result<TreeStamp> {
                 .ok_or_else(|| anyhow!("文件名编码无效（E_PATH_ENCODING）"))?
                 .replace('\\', "/");
             relative_path(&relative)?;
-            let _pins = pin_parents(root, &[&path])?;
+            pins.pin_parents(&[&path])?;
             if ordinary_metadata(&path)?.is_dir() {
+                let handle = open_directory(&path)?;
+                pins.handles.insert(path.clone(), handle);
                 result.directories.insert(relative);
                 pending.push(path);
             } else {
@@ -270,16 +334,30 @@ pub(crate) fn copy_verified(
     target: &Path,
     expected: &FileStamp,
 ) -> Result<()> {
-    let relative_parent = target
+    let mut pins = DirectoryPins::new(root)?;
+    copy_verified_with_pins(&mut pins, source, target, expected)
+}
+
+fn copy_verified_with_pins(
+    pins: &mut DirectoryPins,
+    source: &Path,
+    target: &Path,
+    expected: &FileStamp,
+) -> Result<()> {
+    let parent = target
         .parent()
-        .and_then(|p| p.strip_prefix(root).ok())
+        .ok_or_else(|| anyhow!("副本路径无效（E_COPY_PATH）"))?;
+    let relative_parent = parent
+        .strip_prefix(&pins.root)
+        .ok()
         .and_then(Path::to_str)
         .ok_or_else(|| anyhow!("副本路径无效（E_COPY_PATH）"))?
         .replace('\\', "/");
-    if !relative_parent.is_empty() {
-        ensure_directory(root, &relative_parent)?;
+    // 已预建的目标目录仍在下一步核对完整祖先；此处只避免逐文件重复创建流程。
+    if !relative_parent.is_empty() && !pins.handles.contains_key(parent) {
+        pins.ensure_directory(&relative_parent)?;
     }
-    let _pins = pin_parents(root, &[source, target])?;
+    pins.pin_parents(&[source, target])?;
     if target.exists() {
         ensure!(
             file_stamp(target)? == *expected,
@@ -300,7 +378,7 @@ pub(crate) fn copy_verified(
     ));
     if temporary.exists() {
         if file_stamp(&temporary)? == *expected {
-            rename_no_replace(root, &temporary, target)?;
+            rename_no_replace_with_pins(pins, &temporary, target)?;
             return Ok(());
         }
         ordinary_metadata(&temporary)?;
@@ -334,7 +412,7 @@ pub(crate) fn copy_verified(
         } == *expected,
         "复制期间原件发生变化（E_COPY_SOURCE_CHANGED）"
     );
-    rename_no_replace(root, &temporary, target)?;
+    rename_no_replace_with_pins(pins, &temporary, target)?;
     Ok(())
 }
 
@@ -344,18 +422,20 @@ pub(crate) fn copy_tree(
     target: &Path,
     expected: &TreeStamp,
 ) -> Result<()> {
+    // 目录守卫只属于本次复制，既保护路径身份，也避免逐文件重开整条祖先链。
+    let mut pins = DirectoryPins::new(root)?;
     let relative = target
         .strip_prefix(root)?
         .to_str()
         .ok_or_else(|| anyhow!("副本路径无效（E_COPY_PATH）"))?
         .replace('\\', "/");
-    ensure_directory(root, &relative)?;
+    pins.ensure_directory(&relative)?;
     for directory in &expected.directories {
-        ensure_directory(root, &format!("{relative}/{directory}"))?;
+        pins.ensure_directory(&format!("{relative}/{directory}"))?;
     }
     for (relative, stamp) in &expected.files {
-        copy_verified(
-            root,
+        copy_verified_with_pins(
+            &mut pins,
             &source.join(relative_path(relative)?),
             &target.join(relative_path(relative)?),
             stamp,
@@ -369,7 +449,16 @@ pub(crate) fn copy_tree(
 }
 
 pub(crate) fn rename_no_replace(root: &Path, source: &Path, target: &Path) -> Result<()> {
-    let _pins = pin_parents(root, &[source, target])?;
+    let mut pins = DirectoryPins::new(root)?;
+    rename_no_replace_with_pins(&mut pins, source, target)
+}
+
+fn rename_no_replace_with_pins(
+    pins: &mut DirectoryPins,
+    source: &Path,
+    target: &Path,
+) -> Result<()> {
+    pins.pin_parents(&[source, target])?;
     ordinary_metadata(source)?;
     ensure!(!target.exists(), "交换目标已存在（E_SWAP_OCCUPIED）");
     // exists 只用于诊断；真正的“不覆盖”由系统同一更名操作保证。
@@ -553,6 +642,94 @@ pub(crate) fn exclusive_lease(root: &Path, name: &str) -> Result<ExclusiveLease>
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn test_reparse_ioctl(
+        directory: &Path,
+        control: u32,
+        payload: &mut [u8],
+    ) -> std::io::Result<()> {
+        use std::ffi::c_void;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn DeviceIoControl(
+                handle: *mut c_void,
+                control: u32,
+                input: *mut c_void,
+                input_size: u32,
+                output: *mut c_void,
+                output_size: u32,
+                returned: *mut u32,
+                overlapped: *mut c_void,
+            ) -> i32;
+        }
+
+        // 真实 WRITE_ATTRIBUTES 句柄可在目录 pin 仍持有时原地改变重解析属性。
+        let handle = OpenOptions::new()
+            .access_mode(0x100)
+            .share_mode(0x1 | 0x2)
+            .custom_flags(0x02000000 | 0x00200000)
+            .open(directory)?;
+        let mut returned = 0;
+        let input_size = u32::try_from(payload.len()).unwrap();
+        // SAFETY：File 保持有效目录句柄，输入和返回缓冲区在同步调用期间有效，无异步重叠。
+        let result = unsafe {
+            DeviceIoControl(
+                handle.as_raw_handle(),
+                control,
+                payload.as_mut_ptr().cast(),
+                input_size,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_set_directory_junction(directory: &Path, target: &Path) -> std::io::Result<()> {
+        let raw = target.to_string_lossy();
+        let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+        let substitute = format!(r"\??\{raw}");
+        let encode =
+            |value: &str| -> Vec<u8> { value.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let substitute = encode(&substitute);
+        let printed = encode(raw);
+        let path_size = substitute.len() + printed.len() + 4;
+        let mut data = Vec::new();
+        data.extend(0xA0000003u32.to_le_bytes());
+        for value in [
+            path_size + 8,
+            0,
+            0,
+            substitute.len(),
+            substitute.len() + 2,
+            printed.len(),
+        ] {
+            data.extend(u16::try_from(value).unwrap().to_le_bytes());
+        }
+        data.extend(substitute);
+        data.extend([0, 0]);
+        data.extend(printed);
+        data.extend([0, 0]);
+        test_reparse_ioctl(directory, 0x000900A4, &mut data)
+    }
+
+    #[cfg(windows)]
+    fn test_delete_directory_reparse(directory: &Path, tag: u32) -> std::io::Result<()> {
+        let mut data = Vec::from(tag.to_le_bytes());
+        data.extend([0, 0, 0, 0]);
+        test_reparse_ioctl(directory, 0x000900AC, &mut data)
+    }
+
     fn root() -> PathBuf {
         let root = std::env::current_dir()
             .unwrap()
@@ -590,6 +767,165 @@ mod tests {
         assert!(move_file(&source, &target, false).is_err());
         assert_eq!(fs::read(&source).unwrap(), b"new bytes");
         assert_eq!(fs::read(&target).unwrap(), b"old bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_directory_pins_reuse_ancestors_and_release_before_directory_swap() {
+        let root = root();
+        let source = root.join("source/nested");
+        fs::create_dir_all(&source).unwrap();
+        let mut pins = DirectoryPins::new(&root).unwrap();
+        for index in 0..64 {
+            pins.pin_parents(&[&source.join(format!("file-{index}.bin"))])
+                .unwrap();
+        }
+        // 文件数增加不会重开或累积重复祖先句柄，三个实际目录均持续受保护。
+        assert_eq!(pins.handles.len(), 3);
+        assert!(move_file(&root.join("source"), &root.join("renamed"), false).is_err());
+        drop(pins);
+        move_file(&root.join("source"), &root.join("renamed"), false).unwrap();
+        assert!(root.join("renamed/nested").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_directory_guard_rejects_in_place_junction_before_descendant_access() {
+        for populated in [false, true] {
+            let root = root();
+            let managed = root.join("managed");
+            let ancestor = managed.join("ancestor");
+            let outside = root.join("outside");
+            fs::create_dir_all(&ancestor).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            if populated {
+                fs::write(outside.join("existing.bin"), b"outside original").unwrap();
+            }
+            let source = managed.join("source.bin");
+            fs::write(&source, b"source bytes").unwrap();
+            let expected = file_stamp(&source).unwrap();
+            let outside_before = collect_tree(&outside).unwrap();
+            let target = ancestor.join("nested/data.bin");
+            let mut pins = DirectoryPins::new(&managed).unwrap();
+            pins.pin_parents(&[&target]).unwrap();
+            test_set_directory_junction(&ancestor, &outside).unwrap();
+
+            // 即使外部目标为空，read_dir 前的当前目录检查也不能被零项枚举绕过。
+            let directory_rejected = pins.validate_directory(&ancestor).is_err();
+            let descendant_rejected = pins.pin_parents(&[&target]).is_err();
+            let creation_rejected = pins.ensure_directory("ancestor/nested").is_err();
+            let copy_rejected =
+                copy_verified_with_pins(&mut pins, &source, &target, &expected).is_err();
+            let outside_unchanged = collect_tree(&outside)
+                .map(|stamp| stamp == outside_before)
+                .unwrap_or(false);
+
+            // 必须先清除真实 junction 再释放 guard 和清理自有目录，不能跟随外部路径。
+            test_delete_directory_reparse(&ancestor, 0xA0000003).unwrap();
+            drop(pins);
+            fs::remove_dir_all(root).unwrap();
+            assert!(directory_rejected);
+            assert!(descendant_rejected);
+            assert!(creation_rejected);
+            assert!(copy_rejected);
+            assert!(outside_unchanged);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_directory_guard_checks_ancestors_above_the_nearest_parent() {
+        use std::os::windows::fs::MetadataExt;
+
+        let root = root();
+        let ancestor = root.join("ancestor");
+        let nested = ancestor.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("original.bin"), b"original bytes").unwrap();
+        let target = nested.join("new.bin");
+        let mut pins = DirectoryPins::new(&root).unwrap();
+        pins.pin_parents(&[&target]).unwrap();
+        // Cloud RP 可原地附加到非空祖先，最近的 nested 句柄仍是普通目录。
+        let tag = 0x9000001Au32;
+        let mut data = Vec::from(tag.to_le_bytes());
+        data.extend([0, 0, 0, 0]);
+        test_reparse_ioctl(&ancestor, 0x000900A4, &mut data).unwrap();
+        let nearest_still_ordinary = pins.handles[&nested]
+            .metadata()
+            .map(|metadata| metadata.is_dir() && metadata.file_attributes() & 0x400 == 0)
+            .unwrap_or(false);
+        let ancestor_changed = pins.handles[&ancestor]
+            .metadata()
+            .map(|metadata| metadata.file_attributes() & 0x400 != 0)
+            .unwrap_or(false);
+        let descendant_rejected = pins.pin_parents(&[&target]).is_err();
+        let directory_rejected = pins.validate_directory(&nested).is_err();
+        let creation_rejected = pins.ensure_directory("ancestor/nested").is_err();
+
+        test_delete_directory_reparse(&ancestor, tag).unwrap();
+        drop(pins);
+        let original_preserved =
+            fs::read(nested.join("original.bin")).unwrap() == b"original bytes";
+        let no_new_file = !target.exists();
+        fs::remove_dir_all(root).unwrap();
+        assert!(nearest_still_ordinary);
+        assert!(ancestor_changed);
+        assert!(descendant_rejected);
+        assert!(directory_rejected);
+        assert!(creation_rejected);
+        assert!(original_preserved);
+        assert!(no_new_file);
+    }
+
+    #[test]
+    fn batch_copy_keeps_empty_directories_and_rejects_existing_copy_drift() {
+        let root = root();
+        let source = root.join("source");
+        fs::create_dir_all(source.join("nested/empty")).unwrap();
+        fs::write(source.join("nested/data.bin"), b"original bytes").unwrap();
+        let expected = collect_tree(&source).unwrap();
+        let target = root.join("target");
+        copy_tree(&root, &source, &target, &expected).unwrap();
+        assert_eq!(collect_tree(&target).unwrap(), expected);
+        // 同一副本可恢复重试，但已有冲突字节不能被新一轮复制覆盖。
+        copy_tree(&root, &source, &target, &expected).unwrap();
+        fs::write(target.join("nested/data.bin"), b"changed copy").unwrap();
+        assert!(copy_tree(&root, &source, &target, &expected).is_err());
+        assert_eq!(
+            fs::read(target.join("nested/data.bin")).unwrap(),
+            b"changed copy"
+        );
+        assert_eq!(
+            fs::read(source.join("nested/data.bin")).unwrap(),
+            b"original bytes"
+        );
+        // 错误返回也释放复制 guard，下一事务仍能进行整目录交换。
+        move_file(&target, &root.join("retired"), false).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_copy_rejects_hard_linked_source_and_recovers_its_partial_temporary() {
+        let root = root();
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let file = source.join("data.bin");
+        fs::write(&file, b"complete original bytes").unwrap();
+        let expected = collect_tree(&source).unwrap();
+        let link = root.join("linked.bin");
+        fs::hard_link(&file, &link).unwrap();
+        let target = root.join("target");
+        assert!(copy_tree(&root, &source, &target, &expected).is_err());
+        assert!(!target.join("data.bin").exists());
+        assert_eq!(fs::read(&file).unwrap(), b"complete original bytes");
+        fs::remove_file(link).unwrap();
+        let temporary = target.join(format!(".nono-copy-{}", digest_bytes(b"data.bin")));
+        fs::write(&temporary, b"interrupted copy").unwrap();
+        copy_tree(&root, &source, &target, &expected).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(collect_tree(&target).unwrap(), expected);
+        move_file(&target, &root.join("completed"), false).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

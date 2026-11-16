@@ -4,11 +4,11 @@
   "files": {
     "adapters/nono_install.rs": "8dc8f0e7a0d83603d5d8dd31b2a7010f5044ada9b4116ba3f23aa13b50b464b6",
     "adapters/nono_portable.rs": "7187f4dde7f14caf296c1456b688bcdf9141624a4189fa1d6e89e1bee4bd2e16",
-    "adapters/nono_state.rs": "325fb8ebeb52b71d4be44266362291523d189ac121ca5351fce0b25e5da22cf8",
+    "adapters/nono_state.rs": "722207e4f12ca0029325da76cf080413c5a499044cc5b4e6983d9eae2eafa181",
     "Cargo.lock": "0663c7354159b6cc4fa5bd6ccfcf7059055454995c8da5c54e56eadf288d9c85",
     "patches/action.patch": "fe7fa897902e2fb108bd093c61b13ce2abf5730f3542f26a63616004baf6d283",
     "patches/v1.2.7.patch": "2a48b8af80df1d8368373ce71dce44cd7bd52e2aaba12834345c0c0930bb3611",
     "../selfhost/user_data.py": "d3d273bab2add2268cf2a64ea3f0e8d9300e4ac189416a6a0f12249d1b597c7c"
   },
-  "adaptation_sha256": "66c9953bcc249b117feb4bebc352c12a1db332699f587f44fb7099e56dc607dd"
+  "adaptation_sha256": "cdc1e26504e601a65969cee43994710ebceab3d26abd125073e58beaa5cb84d2"
 }
