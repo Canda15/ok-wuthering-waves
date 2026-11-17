@@ -45,6 +45,65 @@ def load_sync_script(filename='sync_ok.py'):
     return sync_ok
 
 
+class TestInferenceMemoryDefaults(unittest.TestCase):
+    def test_cache_default_precedes_configuration_and_preserves_environment(self):
+        from selfhost.portable import diagnostic_tail, process_environment, hidden_process_options
+
+        repo = Path(__file__).resolve().parents[1]
+        names = ('ONEDNN_PRIMITIVE_CACHE_CAPACITY', 'DNNL_PRIMITIVE_CACHE_CAPACITY')
+        # 在真实入口的首个配置导入处停止，验证默认值不会等到加载模型后才设置。
+        observer = (
+            'import importlib,json,os,sys\nfrom pathlib import Path\n'
+            'selfhost=sys.modules["selfhost"]\n'
+            f'names={names!r}\n'
+            'before=[os.environ.get(name) for name in names]\n'
+            'importlib.reload(selfhost)\n'
+            'print(json.dumps({"before":before,"after":[os.environ.get(name) for name in names],'
+            '"source":str(Path(selfhost.__file__).resolve()),'
+            '"heavy_imports":any(name in sys.modules for name in ("ok","cv2","openvino","onnxocr"))}))\n'
+            'raise SystemExit(0)\n'
+        )
+        scenarios = (
+            (None, None, '64', None),
+            ('128', None, '128', None),
+            ('0', None, '0', None),
+            (None, '128', None, '128'),
+            (None, '0', None, '0'),
+            ('16', '128', '16', '128'),
+            ('', '0', '', '0'),
+            ('', '', '64', ''),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            working = Path(directory).resolve()
+            package = working / 'selfhost'
+            package.mkdir()
+            shutil.copy2(repo / 'selfhost/__init__.py', package / '__init__.py')
+            (package / 'user_data.py').write_text('def bootstrap_user_data():\n    pass\n', encoding='utf-8')
+            (working / 'config.py').write_text(observer, encoding='utf-8')
+            for entrypoint in ('main.py', 'main_debug.py', 'main_web.py', 'main_web_debug.py'):
+                shutil.copy2(repo / entrypoint, working / entrypoint)
+                for supplied_new, supplied_old, expected_new, expected_old in scenarios:
+                    with self.subTest(entrypoint=entrypoint, supplied=(supplied_new, supplied_old)):
+                        environment = process_environment(working)
+                        for name, value in zip(names, (supplied_new, supplied_old)):
+                            environment.pop(name, None)
+                            if value is not None:
+                                environment[name] = value
+                        result = subprocess.run(
+                            [sys.executable, '-X', 'utf8', '-B', str(working / entrypoint)],
+                            cwd=working, env=environment, capture_output=True, text=True,
+                            encoding='utf-8', timeout=10, **hidden_process_options(),
+                        )
+                        self.assertEqual(result.returncode, 0,
+                                         f'标准输出尾部：\n{diagnostic_tail(result.stdout)}\n'
+                                         f'标准错误尾部：\n{diagnostic_tail(result.stderr)}')
+                        observed = json.loads(result.stdout)
+                        self.assertEqual(observed['before'], [expected_new, expected_old])
+                        self.assertEqual(observed['after'], observed['before'])
+                        self.assertEqual(observed['source'], str((package / '__init__.py').resolve()))
+                        self.assertFalse(observed['heavy_imports'])
+
+
 class TestSelfhostSmoke(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

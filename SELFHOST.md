@@ -92,6 +92,7 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 文件 | 作用 | 何时生效 |
 | --- | --- | --- |
+| `__init__.py` | 设置 oneDNN 算子缓存的默认容量，保留外部环境变量覆盖 | 各应用入口首次导入 `selfhost` 时，早于配置和推理库 |
 | `overrides.py` | 运行时改 config dict：把上游取消注册的两个页面加回 `custom_tabs`，并改品牌项 | `main.py` 里 `OK(config)` 之前 |
 | `framework_patches.py` | vendored `ok/` 源码的文字补丁清单（品牌标识） | `scripts/sync_ok.py` 每次内联时 |
 | `logic_patches.py`、`logic_patches.json`、`patches/` | 严格逻辑重放器、支持版本及基线清单、文本差异和二进制载荷 | 品牌补丁之后、覆盖 `ok/` 之前 |
@@ -113,6 +114,20 @@ dict，`MainWindow` 读的是同一个对象。
 逻辑差异用例只操作隔离树，覆盖文本与二进制、新增／修改／删除、重复施加、覆盖前漂移失败、
 原始 wheel 摘要和部署一致性；它们不操作真实游戏或联系人。
 上游每次发版后由 CI 执行，红了就不许合并——上游的测试测的是"没有我们补丁"的树，覆盖不到这些。
+
+## 推理缓存的默认容量
+
+应用入口先导入 `selfhost.user_data`，因此 `selfhost/__init__.py` 可以在 oneDNN 首次加载前将
+`ONEDNN_PRIMITIVE_CACHE_CAPACITY` 默认设为 `64`。不同 OCR 区域、文本行宽和批量会产生不同
+算子，限制底层缓存可减少长期运行的专用提交。模型、识别输入和推理线程保持原有设置。
+
+新变量或兼容别名 `DNNL_PRIMITIVE_CACHE_CAPACITY` 的非空外部值均保留，包括禁用缓存的 `0`；
+只有两者都未设置或为空时才使用默认值。修改需要在新进程启动时生效，不能在模型加载后补设。
+oneDNN 缓存容量按算子条目计数，并非内存字节上限；缩小缓存可能增加未命中时的计算准备耗时。
+依据：[oneDNN 缓存机制](https://uxlfoundation.github.io/oneDNN/dev_guide_primitive_cache.html)。
+
+启动顺序和环境覆盖回归复用 `tests/TestSelfhostSmoke.py`；性能与识别结果使用隔离进程回放真实
+截图比较，专用提交和物理工作集分别记录。完整约束见 `.trellis/spec/backend/inference-memory.md`。
 
 ## 业务进程为什么显示 NoNo.exe
 
