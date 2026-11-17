@@ -1,16 +1,23 @@
-"""后台消息的请求额度、目标身份和持有清理；所有原生调用均使用替身。"""
+"""后台消息的请求额度、目标身份和持有清理；原生验证仅操作本进程自建窗口。"""
 
+import ctypes
+import os
 import threading
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import win32api
+import win32con
+import win32gui
+import win32process
 from pynput.keyboard import Key
 
 from ok.core.start_request import StartRequest
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
 from ok.device.interaction_methods.post_message_test import (
-    PostMessageTestInteraction, WindowIdentity, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    PostMessageTestInteraction, Win32MessageBackend, WindowIdentity, WM_ACTIVATE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL,
 )
 from ok.task.exceptions import TaskDisabledException
@@ -118,6 +125,174 @@ class FakeWindow:
 
 def unpack_point(value):
     return tuple(part if part < 0x8000 else part - 0x10000 for part in (value & 0xFFFF, value >> 16 & 0xFFFF))
+
+
+class TestWin32MessageBackend(unittest.TestCase):
+    def setUp(self):
+        self.native = Win32MessageBackend()
+        self.messages = []
+        self.hwnd = 0
+        self.instance = win32api.GetModuleHandle(None)
+        self.class_name = f'后台输入原生回归_{os.getpid()}_{id(self)}'
+        window_class = win32gui.WNDCLASS()
+        window_class.hInstance = self.instance
+        window_class.lpszClassName = self.class_name
+        window_class.lpfnWndProc = self.window_proc
+        win32gui.RegisterClass(window_class)
+        self.addCleanup(win32gui.UnregisterClass, self.class_name, self.instance)
+        self.addCleanup(self.destroy_window)
+        # 屏幕外的无激活窗口可走真实可见性检查，不抢焦点，也不需要截图用户桌面。
+        self.hwnd = win32gui.CreateWindowEx(
+            win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOOLWINDOW,
+            self.class_name, '后台输入原生回归', win32con.WS_POPUP,
+            -30000, -30000, 160, 120, 0, 0, self.instance, None)
+        win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
+        bounds = self.native.client_bounds(self.hwnd)
+        self.window = SimpleNamespace(
+            hwnd=self.hwnd, top_hwnd=self.hwnd, top_hwnd_class=(),
+            hwnds=[(self.hwnd, '受控测试进程', 160, 120, bounds[0], bounds[1], '', self.class_name, os.getpid())],
+            capture_target_signature=(self.hwnd, bounds), do_update_window_size=lambda: None,
+            app_exit_event=threading.Event(), stop_event=threading.Event(), device_manager=None)
+        capture = SimpleNamespace(get_abs_cords=lambda x, y: self.native.client_to_screen(self.hwnd, (x, y)))
+        clock = FakeClock()
+        self.backend = PostMessageTestInteraction(capture, self.window, native=self.native,
+                                                   clock=clock, wait=clock.wait)
+        self.addCleanup(self.backend.release_all)
+        self.drain_messages()
+        self.messages.clear()
+
+    def window_proc(self, hwnd, message, wparam, lparam):
+        if message == WM_ACTIVATE or WM_KEYDOWN <= message <= WM_CHAR or WM_MOUSEMOVE <= message <= 0x020C:
+            self.messages.append((hwnd, message, wparam, lparam))
+            # DefWindowProc 收到 WA_ACTIVE 会设置键盘焦点；测试只接收消息，不执行默认激活。
+            return 0
+        if message == win32con.WM_MOUSEACTIVATE:
+            return win32con.MA_NOACTIVATE
+        return win32gui.DefWindowProc(hwnd, message, wparam, lparam)
+
+    def drain_messages(self):
+        # 仅分发自有 HWND 的队列；不用 TranslateMessage，避免它额外合成 WM_CHAR。
+        for _ in range(256):
+            available, message = win32gui.PeekMessage(self.hwnd, 0, 0, win32con.PM_REMOVE)
+            if not available:
+                return
+            win32gui.DispatchMessage(message)
+        self.fail('受控窗口消息未在限定数量内清空')
+
+    def destroy_window(self):
+        if self.hwnd:
+            win32gui.DestroyWindow(self.hwnd)
+            self.hwnd = 0
+
+    def test_real_window_identity_is_stable_and_accepts_list_or_tuple_api_results(self):
+        expected = self.native.identity(self.hwnd)
+        self.assertIsNotNone(expected)
+        self.assertEqual((expected.hwnd, expected.process_id, expected.thread_id, expected.class_name),
+                         (self.hwnd, os.getpid(), threading.get_native_id(), self.class_name))
+        self.assertGreater(expected.created_at, 0)
+        for _ in range(3):
+            self.assertEqual(self.native.identity(self.hwnd), expected)
+        query = win32process.GetWindowThreadProcessId
+        for first_type, second_type in ((list, list), (tuple, tuple), (list, tuple), (tuple, list)):
+            with self.subTest(first=first_type.__name__, second=second_type.__name__):
+                values = first_type(query(self.hwnd)), second_type(query(self.hwnd))
+                with patch.object(win32process, 'GetWindowThreadProcessId', side_effect=values) as get_ids:
+                    self.assertEqual(self.native.identity(self.hwnd), expected)
+                self.assertEqual(get_ids.call_count, 2)
+
+    def test_identity_rejects_changed_thread_process_and_disappeared_window_and_closes_process(self):
+        thread_id, process_id = win32process.GetWindowThreadProcessId(self.hwnd)
+        for second in ([thread_id + 1, process_id], [thread_id, process_id + 1], [0, 0]):
+            with self.subTest(second=second), \
+                    patch.object(win32process, 'GetWindowThreadProcessId',
+                                 side_effect=([thread_id, process_id], second)), \
+                    patch.object(self.native.kernel32, 'CloseHandle', wraps=self.native.kernel32.CloseHandle) as close:
+                self.assertIsNone(self.native.identity(self.hwnd))
+                close.assert_called_once()
+
+    def test_missing_window_and_native_query_failures_never_activate(self):
+        with patch.object(self.native, 'post_message', wraps=self.native.post_message) as post:
+            with patch.object(self.native.kernel32, 'OpenProcess', return_value=0):
+                ctypes.set_last_error(5)
+                with self.assertRaisesRegex(ForegroundInputError, '无法核验目标进程身份.*5'):
+                    self.backend.prepare_start(StartRequest('权限失败'))
+            with patch.object(self.native.kernel32, 'GetProcessTimes', return_value=0), \
+                    patch.object(self.native.kernel32, 'CloseHandle', wraps=self.native.kernel32.CloseHandle) as close:
+                ctypes.set_last_error(5)
+                with self.assertRaisesRegex(ForegroundInputError, '无法读取目标进程创建时间'):
+                    self.backend.prepare_start(StartRequest('创建时间读取失败'))
+                close.assert_called_once()
+            hwnd = self.hwnd
+            self.destroy_window()
+            self.assertIsNone(self.native.identity(hwnd))
+            self.assertIsNone(self.native.identity(0))
+            with self.assertRaisesRegex(ForegroundInputError, '请先手动打开游戏'):
+                self.backend.prepare_start(StartRequest('窗口已销毁'))
+            post.assert_not_called()
+
+    def test_changed_creation_time_rejects_old_request_before_native_post(self):
+        request = StartRequest('创建身份核验')
+        self.backend.prepare_start(request)
+        self.backend.send_key_down(Key.esc)
+        get_times = self.native.kernel32.GetProcessTimes
+
+        def changed_time(handle, created, exited, kernel, user):
+            result = get_times(handle, created, exited, kernel, user)
+            value = ctypes.cast(created, ctypes.POINTER(ctypes.wintypes.FILETIME)).contents
+            value.dwLowDateTime ^= 1
+            return result
+
+        with patch.object(self.native.kernel32, 'GetProcessTimes', side_effect=changed_time), \
+                patch.object(self.native, 'post_message', wraps=self.native.post_message) as post:
+            with self.assertRaisesRegex(ForegroundInputError, '游戏主窗口或进程已变化'):
+                self.backend.send_key(Key.esc)
+            post.assert_not_called()
+        self.assertTrue(request.cancelled)
+        self.assertFalse(self.backend._held)
+
+    def test_real_messages_reach_owned_window_with_one_activation_per_start_or_resume(self):
+        request = StartRequest('受控窗口开始')
+        self.backend.prepare_start(request)
+        self.backend.prepare_start(request)
+        self.drain_messages()
+        self.assertEqual(self.messages, [(self.hwnd, WM_ACTIVATE, 1, 0)])
+
+        self.backend.send_key(Key.esc)
+        self.backend.click(20, 25)
+        self.backend.right_click(20, 25)
+        self.backend.send_key('mouse4')
+        self.backend.scroll(30, 35, -1)
+        self.backend.input_text('中😀')
+        self.backend.swipe(10, 10, 80, 40, 15)
+        self.backend.on_run()
+        self.backend.refresh_target(force=True)
+        self.backend.send_key_down(Key.esc)
+        self.backend.release_all()
+        self.backend.on_destroy()
+        self.drain_messages()
+        self.assertEqual([event for event in self.messages if event[1] == WM_ACTIVATE],
+                         [(self.hwnd, WM_ACTIVATE, 1, 0)])
+        self.assertEqual([(event[1], event[2], event[3] & 0xFFFFFFFF)
+                          for event in self.messages if event[1] in (WM_KEYDOWN, WM_KEYUP)],
+                         [(WM_KEYDOWN, 0x1B, 0x00010001), (WM_KEYUP, 0x1B, 0xC0010001)] * 2)
+        self.assertEqual([event[2] for event in self.messages if event[1] == WM_CHAR],
+                         [0x4E2D, 0xD83D, 0xDE00])
+        wheel, = [event for event in self.messages if event[1] == WM_MOUSEWHEEL]
+        self.assertEqual(wheel[2], 0xFF880000)
+        self.assertEqual(unpack_point(wheel[3]), self.native.client_to_screen(self.hwnd, (30, 35)))
+        self.assertEqual([(event[1], event[2], unpack_point(event[3]))
+                          for event in self.messages if event[1] in (0x0201, 0x0202, 0x0204, 0x0205, 0x020B, 0x020C)],
+                         [(0x0201, 1, (20, 25)), (0x0202, 0, (20, 25)),
+                          (0x0204, 2, (20, 25)), (0x0205, 0, (20, 25)),
+                          (0x020B, 0x00010020, (20, 25)), (0x020C, 0x00010000, (20, 25)),
+                          (0x0201, 1, (10, 10)), (0x0202, 0, (80, 40))])
+        self.assertEqual({event[0] for event in self.messages}, {self.hwnd})
+        self.assertFalse(self.backend._held)
+
+        self.backend.prepare_start(StartRequest('受控窗口恢复'))
+        self.drain_messages()
+        self.assertEqual([event for event in self.messages if event[1] == WM_ACTIVATE],
+                         [(self.hwnd, WM_ACTIVATE, 1, 0)] * 2)
 
 
 class TestBackgroundInput(unittest.TestCase):

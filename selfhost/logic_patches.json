@@ -193,7 +193,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/post_message_test.py.patch",
       "before_sha256": null,
-      "after_sha256": "9e735c09803a671a370e202b9a3c9359ee84bd0815b9c48c0baf6c02de379762"
+      "after_sha256": "cf7744f9fadfdf898d621bbb495dd4d9958d14a4219361732bd3e64cca8d060e"
     },
     {
       "path": "device/interaction_methods/pydirect.py",

@@ -87,7 +87,9 @@ class Win32MessageBackend:
                 raise ForegroundInputError(f'无法读取目标进程创建时间，系统错误码：{ctypes.get_last_error()}')
             created_at = times[0].dwLowDateTime | (times[0].dwHighDateTime << 32)
             class_name = win32gui.GetClassName(hwnd)
-            if win32process.GetWindowThreadProcessId(hwnd) != (thread_id, process_id):
+            # pywin32 的多输出值可能是列表；按标识值核对，避免容器类型差异误拒稳定窗口。
+            current_thread_id, current_process_id = win32process.GetWindowThreadProcessId(hwnd)
+            if current_thread_id != thread_id or current_process_id != process_id:
                 return None
             return WindowIdentity(hwnd, process_id, created_at, thread_id, class_name)
         finally:
