@@ -34,6 +34,9 @@ class FakeFarmEchoTask:
     def handle_claim_button(self):
         return True
 
+    def handle_cloud_disconnect(self):
+        return False
+
     def handle_monthly_card(self):
         return False
 
@@ -82,15 +85,17 @@ class TestFarmEchoTaskEchoRate(unittest.TestCase):
             raise TaskDisabledException()
 
         task.do_run = Mock(side_effect=cancel_after_pickup)
+        task.handle_cloud_disconnect = Mock()
         task.handle_claim_button = Mock()
         task.handle_monthly_card = Mock()
 
         with self.assertRaises(TaskDisabledException):
             task.run()
 
-        # 已确认的拾取计数保留，取消不能成为正常完成或重新进入领奖／月卡恢复。
+        # 已确认的拾取计数保留，取消不能成为正常完成或进入任何弹窗恢复。
         self.assertEqual(1, task.info['Echo Count'])
         task.do_run.assert_called_once()
+        task.handle_cloud_disconnect.assert_not_called()
         task.handle_claim_button.assert_not_called()
         task.handle_monthly_card.assert_not_called()
 

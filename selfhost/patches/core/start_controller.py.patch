@@ -562,16 +562,7 @@
  
      def check_auto_hdr(self):
          if not (self.config.get('windows') or {}).get('check_auto_hdr', False):
-@@ -411,7 +348,7 @@
-                 None,
-             )
- 
--    def check_resolution(self):
-+    def check_resolution(self, frame=None):
-         error = None
-         supported_resolution = self.config.get(
-             'supported_resolution', {})
-@@ -423,9 +360,10 @@
+@@ -423,7 +360,8 @@
          is_windows_capture = isinstance(capture_method, BaseWindowsCaptureMethod)
          auto_resize_enabled = (
              not is_windows_capture
@@ -579,11 +570,8 @@
 +            or (not isinstance(og.device_manager.interaction, PostMessageTestInteraction)
 +                and og.global_config.get_config('Basic Options').get('Auto Resize Game Window', True))
          )
--        supported, resolution = og.executor.check_frame_and_resolution(supported_ratio, min_size)
-+        supported, resolution = og.executor.check_frame_and_resolution(supported_ratio, min_size, frame=frame)
+         supported, resolution = og.executor.check_frame_and_resolution(supported_ratio, min_size, frame=frame)
          if not supported:
-             resize_success = False
-             if resize_to and is_windows_capture and auto_resize_enabled:
 @@ -449,14 +387,16 @@
          elif error:
              alert_error(error, tray=True)
@@ -629,7 +617,7 @@
                          from ok.util.window import resize_window
                          logger.info(
                              f"Window pos invalid, trying to center window with size {hwnd_window.window_width}x{hwnd_window.window_height}")
-@@ -482,22 +426,23 @@
+@@ -482,23 +426,22 @@
                      if not og.device_manager.capture_method.hwnd_window.pos_valid:
                          return self.tr(
                              'Window is minimized or out of screen, and don\'t use full-screen exclusive mode!')
@@ -653,15 +641,15 @@
 -                logger.info(f'check_device_error: feature_set is None')
 -
 -            logger.info(f'check_device_error: checking resolution')
--            resolution_error = self.check_resolution()
+-            # A static WGC target may not produce another frame. Validate the
+-            # successful capture above instead of timing out and reporting 0x0.
 +                logger.info('check_device_error: feature_set is None')
 +
 +            logger.info('check_device_error: checking resolution')
-+            resolution_error = self.check_resolution(frame=frame)
+             resolution_error = self.check_resolution(frame=frame)
              if resolution_error:
                  logger.error(f'check_device_error: resolution_error: {resolution_error}')
-                 return resolution_error
-@@ -506,23 +451,28 @@
+@@ -508,23 +451,28 @@
                  started = og.device_manager.adb_ensure_in_front()
                  if not started:
                      return self.tr("Can't start game, make sure the game is installed")

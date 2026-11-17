@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "framework_version": "3.0.5b9",
-  "baseline_tree_sha256": "d9166ed15ee5cec922afa125c2036328a88324036070f32217b7aa6abda27a69",
+  "framework_version": "3.0.6",
+  "baseline_tree_sha256": "321ff09edc26ba4599d22f1558cfd80fb96fd5075895875542869f3b0486d4fa",
   "entries": [
     {
       "path": "__init__.py",
@@ -80,7 +80,7 @@
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/core/start_controller.py.patch",
-      "before_sha256": "97c58ae890e8591246958f7d268734ba119056f0fe6ad4fe723c653fe6bd59c2",
+      "before_sha256": "53fea02042ddec4231a8df6f1de302f236aed9e25e8447c74f08cdd72bb014a6",
       "after_sha256": "ed157397d760c4ef7d0bed9b02c4eb9b0fb29aec5e5f2822091375132534d636"
     },
     {
@@ -112,16 +112,16 @@
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/device/DeviceManager.py.patch",
-      "before_sha256": "b3ca3599a9570ea1aef62db8b4d97f1d8d2e6e119a721b1a40545ee90f62e5f1",
-      "after_sha256": "d66972e65babc54cbd97666f3ea13ea040bda6bc58e4d637651f58764de6063e"
+      "before_sha256": "47b58cec2b085fdde122884f3e5658020d35791e236d71d66a37c3fb534bdfad",
+      "after_sha256": "d51f8388dfa6f5b6afa354f1e4bb7fea958af93339514342a7185dd252efab92"
     },
     {
       "path": "device/capture_methods/hwnd_window.py",
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/device/capture_methods/hwnd_window.py.patch",
-      "before_sha256": "70cffdfe5a07e3d99e565dda9044036763a2ae443ff4048aabc2b18329ee228e",
-      "after_sha256": "bd4a8d52e4f75c81252a432533260359c3b7a36c0ff9544f8c8d1f3c3dc90cc4"
+      "before_sha256": "6d41758aa8f1abcf1483b6cf20d76ccaf7e32ecb1c3d1ae3904ec82abc313233",
+      "after_sha256": "688620d72ae24dd4a56d0a2422c3400c03f167b4eb87a1a11d480668a594da9b"
     },
     {
       "path": "device/interaction_methods/__init__.py",
@@ -256,8 +256,8 @@
       "operation": "modify",
       "format": "unified_diff",
       "payload": "patches/task/TaskExecutor.py.patch",
-      "before_sha256": "85862d681d2faaf40a9df4c419c765a6a8cdcc70b8e76efb53989ead8ab88814",
-      "after_sha256": "f0639e67ff05c110f46446aee7eca630fb28ded76d1b41534cd9efa54a5b4206"
+      "before_sha256": "5bb14156aedfeb1a0f5f012196eb3273ee5af736c644a46d9687c021bf632143",
+      "after_sha256": "33b6ba07cae84d394266899c52d27fdfb7bef67c7439e65d29a13a1b4f9bf6e1"
     },
     {
       "path": "task/task.py",

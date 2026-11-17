@@ -155,9 +155,10 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
             except ForegroundInputInterrupted:
                 self.wait_foreground_frame()
             except Exception as e:
-                logger.error('刷取异常，检查领奖或月卡弹窗', e)
-                # 原有普通弹窗恢复仍有上限，焦点中断不进入该预算。
-                if retries > 0 and (self.handle_claim_button() or self.handle_monthly_card()):
+                logger.error('刷取异常，检查断线、领奖或月卡弹窗', e)
+                # 断线优先于通用弹窗，避免误关错误提示；恢复沿用当前轮次与有限预算。
+                if retries > 0 and (self.handle_cloud_disconnect() or self.handle_claim_button()
+                                    or self.handle_monthly_card()):
                     retries -= 1
                 else:
                     raise

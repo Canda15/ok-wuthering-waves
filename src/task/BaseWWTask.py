@@ -18,6 +18,11 @@ number_re = re.compile(r'(\d+)')
 stamina_re = re.compile(r'(\d+)/(\d+)')
 LOGIN_TEXTS = ["登录", re.compile('Log|点击连接|Click to Connect', re.IGNORECASE), '登入']
 LOGIN_CLICK_SETTLE_TIME = 4  # seconds; keep below AutoLoginTask trigger_interval (5) so triggers don't overlap
+# 云游戏网页弹窗, 如 【云服务错误：1020】检测到您已长时间未进行操作，已和服务器断开连接。
+# 1020 弹窗按钮是"退出游戏", 4012 只有"确定"; 两者都会回到云游戏首页。
+CLOUD_DISCONNECT_TEXTS = re.compile(r'云服务错误|服务器断开|断开连接')
+CLOUD_EXIT_GAME_TEXTS = re.compile(r'^(退出游戏|确定)$')
+CLOUD_RELOGIN_TIMEOUT = 600
 f_white_color = {
     'r': (235, 255),  # Red range
     'g': (235, 255),  # Green range
@@ -948,6 +953,8 @@ class BaseWWTask(BaseTask):
             return False
         if self.handle_monthly_card():
             return False
+        if self.handle_cloud_disconnect():
+            return self.in_team_and_world()
         if esc:
             self.log_debug('main esc')
             self.back(after_sleep=2)
@@ -958,6 +965,36 @@ class BaseWWTask(BaseTask):
         confirm = getattr(self, '_login_account_guard', None)
         if confirm is not None:
             confirm(require_visible=require_visible)
+
+    def find_cloud_disconnect(self):
+        """识别云游戏断线弹窗，返回用于退出或确认的按钮。"""
+        if not self.is_browser():
+            return None
+        texts = self.ocr(box=self.box_of_screen(0.2, 0.25, 0.8, 0.75, hcenter=True, vcenter=True),
+                         name='cloud_disconnect', log=self.debug)
+        if not self.find_boxes(texts, match=CLOUD_DISCONNECT_TEXTS):
+            return None
+        return self.find_boxes(texts, match=CLOUD_EXIT_GAME_TEXTS) or None
+
+    def handle_cloud_disconnect(self):
+        """确认云游戏断线后，经已打开的云游戏页面重新登录。"""
+        epoch = getattr(self, '_foreground_epoch', 0)
+        exit_game = self.find_cloud_disconnect()
+        if not exit_game:
+            return False
+        self.log_info(self.tr('Cloud game disconnected, re-entering the game'), notify=True)
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('云游戏断线弹窗需要在新画面重新识别')
+        self.logged_in = False
+        self.click(exit_game[0], after_sleep=3)
+
+        def in_world_after_login():
+            # 登录完成后 wait_login 不再返回真；稳定等待必须持续检查最新画面的队伍状态。
+            return self.in_team_and_world() if self.logged_in else self.wait_login()
+
+        self.wait_until(in_world_after_login, time_out=CLOUD_RELOGIN_TIMEOUT,
+                        raise_if_not_found=True, settle_time=1)
+        return True
 
     def wait_login(self):
         if not self.logged_in:

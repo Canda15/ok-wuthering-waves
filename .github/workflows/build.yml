@@ -289,6 +289,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           body: |
+            **使用本工具存在封号风险。如果你不清楚自己在做什么，请不要使用。**
+
             ### 更新日志 -> ${{ needs.synchronize.outputs.end_tag }}
               自上次同步以来部署树的改动(mirror 仓库视角,不含上游提交正文):
               ${{ needs.synchronize.outputs.changes }}

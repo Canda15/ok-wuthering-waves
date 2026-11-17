@@ -186,7 +186,7 @@ config = {
             'use_npu': True,
         }
     },
-    'plugin':True,
+    'plugin': True,  # 保留 NoNo 的插件及自定义任务支持。
     'my_app': ['src.globals', 'Globals'],
     'start_timeout': 120,  # default 60
     'wait_until_settle_time': 0,
@@ -222,6 +222,15 @@ config = {
         'check_auto_hdr': True,
         'check_night_light': True,
         'force_no_night_light': False,
+    },
+    'browser': {
+        'url': 'https://mc.kurogames.com/cloud/#/',
+        'resolution': (1920, 1080),
+        'channels': ['msedge', 'chrome', 'chromium'],
+        # 避免 HDR 显示器上的直接视频叠加层导致 WGC 截图颜色失真。
+        'args': ['--webrtc-ip-handling-policy=default', '--force-color-profile=srgb',
+                 '--disable-direct-composition'],
+        'nick': '云游戏(需要Win11并安装Chrome或Edge)',
     },
     'window_size': {
         'width': 1200,

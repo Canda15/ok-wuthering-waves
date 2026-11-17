@@ -65,18 +65,13 @@
          self.config_folder = config_folder or "config"
          self.trigger_task_index = -1
          self.basic_options = global_config.get_config(basic_options)
-@@ -276,21 +296,21 @@
-         # copying without blocking queue operations on a potentially large image.
-         return (snapshot[0].copy(), snapshot[1]) if snapshot is not None else None
- 
--    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0):
-+    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0, *, frame=None):
+@@ -279,15 +299,17 @@
+     def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0, frame=None):
          if supported_ratio is None or min_size is None:
              return True, '0x0'
 -        logger.info(f'start check_frame_and_resolution')
 -        self.device_manager.update_resolution_for_hwnd()
 -        start = time.time()
--        frame = None
 -        while frame is None and (time.time() - start) < time_out:
 -            frame = self.method.get_frame()
 -            time.sleep(0.1)
@@ -84,8 +79,6 @@
          if frame is None:
 -            logger.error(f'check_frame_and_resolution failed can not get frame after {time_out} {time.time() - start}')
 -            return False, '0x0'
--        width = self.method.width
--        height = self.method.height
 +            self.device_manager.update_resolution_for_hwnd()
 +            start = time.time()
 +            while frame is None and (time.time() - start) < time_out:
@@ -95,11 +88,10 @@
 +                logger.error(f'check_frame_and_resolution failed can not get frame after {time_out} {time.time() - start}')
 +                return False, '0x0'
 +        # 显式开始已完成有界首帧，直接验证该帧，避免诊断重新等待截图或挪动窗口。
-+        height, width = frame.shape[:2]
+         height, width = frame.shape[:2]
          actual_ratio = 0
          if height == 0:
-             actual_ratio = 0
-@@ -316,40 +336,330 @@
+@@ -314,40 +336,330 @@
          return (self.method is not None and self.method.connected()
                  and self.interaction is not None and self.interaction.should_capture())
  
@@ -460,7 +452,7 @@
          raise FinishedException()
  
      def is_executor_thread(self):
-@@ -360,14 +670,13 @@
+@@ -358,14 +670,13 @@
  
      @property
      def frame(self):
@@ -481,7 +473,7 @@
  
      def blocked_by_pause(self):
          """Whether the calling code should wait because the executor is paused.
-@@ -375,6 +684,8 @@
+@@ -373,6 +684,8 @@
          debug_mode ignores pause everywhere; a job ignores it only for its own
          code on the executor thread.
          """
@@ -490,7 +482,7 @@
          if not self.paused or self.debug_mode:
              return False
          job = self.current_job
-@@ -405,54 +716,45 @@
+@@ -403,54 +716,45 @@
              raise TaskDisabledException()
  
      def sleep(self, timeout: float):
@@ -578,7 +570,7 @@
  
      def _wake_executor(self):
          condition = getattr(self, '_wake_condition', None)
-@@ -485,9 +787,14 @@
+@@ -483,9 +787,14 @@
          if task is not None:
              if self.current_task != task:
                  raise Exception(f"Can only pause current task {self.current_task}")
@@ -593,7 +585,7 @@
              communicate.executor_paused.emit(self.paused)
              self.reset_scene(check_enabled=False)
              self.pause_start = time.time()
-@@ -495,8 +802,13 @@
+@@ -493,8 +802,13 @@
  
      def stop_current_task(self):
          if task := self.current_task:
@@ -607,7 +599,7 @@
  
      def _start_thread_locked(self):
          if self.thread is None:
-@@ -519,7 +831,8 @@
+@@ -517,7 +831,8 @@
      def exclusive_owner(self):
          return self._exclusive_owner
  
@@ -617,7 +609,7 @@
          """Run ``fn`` once on the executor thread and return its ExecutorJob.
  
          Jobs run before queued tasks, as soon as the running task finishes, and
-@@ -529,7 +842,7 @@
+@@ -527,7 +842,7 @@
          holder's jobs are accepted.
          """
          job = ExecutorJob(self, fn, name=name, owner=owner, capture=capture, interaction=interaction,
@@ -626,7 +618,7 @@
          with self.lock:
              if self._exclusive_owner is not None and owner != self._exclusive_owner:
                  raise ExecutorBusyException(self._exclusive_owner)
-@@ -554,6 +867,8 @@
+@@ -552,6 +867,8 @@
          if job.future.done():
              return False
          job._cancel_requested.set()
@@ -635,7 +627,7 @@
          self._wake_executor()
          return True
  
-@@ -608,8 +923,10 @@
+@@ -606,8 +923,10 @@
  
      def _pop_job(self):
          with self.lock:
@@ -648,7 +640,7 @@
          return None
  
      def _run_job(self, job):
-@@ -622,57 +939,75 @@
+@@ -620,57 +939,75 @@
          logger.info(f'start {job}')
          self.current_job = job
          start = time.time()
@@ -756,7 +748,7 @@
          if raise_if_not_found:
              raise WaitFailedException()
          return None
-@@ -695,7 +1030,45 @@
+@@ -693,7 +1030,45 @@
          self._wake_executor()
          return True
  
@@ -802,7 +794,7 @@
          if task not in self.onetime_tasks:
              return False
          removed = False
-@@ -724,7 +1097,7 @@
+@@ -722,7 +1097,7 @@
  
      def next_task(self) -> tuple:
          if self.exit_event.is_set():
@@ -811,7 +803,7 @@
              return None, False, False
          with self.lock:
              while self.onetime_task_queue:
-@@ -732,6 +1105,9 @@
+@@ -730,6 +1105,9 @@
                  if onetime_task.enabled:
                      logger.info(f'get queued onetime_task {onetime_task.name}')
                      return onetime_task, True, False
@@ -821,7 +813,7 @@
          for onetime_task in self.onetime_tasks:
              if onetime_task.enabled:
                  logger.info(f'get one enabled onetime_task {onetime_task.name}')
-@@ -764,20 +1140,28 @@
+@@ -762,20 +1140,28 @@
          ]
          return min(delays, default=default)
  
@@ -862,7 +854,7 @@
          while not self.exit_event.is_set():
              wake_version = self._get_wake_version()
              job = self._pop_job()
-@@ -804,10 +1188,12 @@
+@@ -802,10 +1188,12 @@
                      communicate.task.emit(task)
                  self._prepare_task_for_run(is_trigger_task)
                  if cycled or self._frame is None:
@@ -879,7 +871,7 @@
                  if is_trigger_task:
                      if task.run():
                          self.trigger_task_index = -1
-@@ -817,10 +1203,16 @@
+@@ -815,10 +1203,16 @@
                      prevent_sleeping(True)
                      try:
                          logger.debug(f'start running onetime_task {task.name}')
@@ -897,7 +889,7 @@
                      task.disable()
                      communicate.task_done.emit(task)
                      if task.exit_after_task or task.config.get('Exit After Task'):
-@@ -830,13 +1222,20 @@
+@@ -828,13 +1222,20 @@
                          self.device_manager.stop_hwnd()
                          time.sleep(5)
                          communicate.quit.emit()
@@ -919,7 +911,7 @@
                  break
              except Exception as e:
                  if isinstance(e, CaptureException):
-@@ -862,6 +1261,7 @@
+@@ -860,6 +1261,7 @@
          self.destroy()
  
      def _finish_task(self, task, is_trigger_task):
@@ -927,7 +919,7 @@
          if self.current_task is None and not task.running:
              return
          task.running = False
-@@ -873,6 +1273,8 @@
+@@ -871,6 +1273,8 @@
          logger.info('stop')
          self.exit_event.set()
          self._wake_executor()
@@ -936,7 +928,7 @@
  
      def destroy(self):
          lock = getattr(self, '_destroy_lock', None)
-@@ -882,7 +1284,10 @@
+@@ -880,7 +1284,10 @@
              if getattr(self, '_destroyed', False):
                  return
              self._destroyed = True

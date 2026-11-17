@@ -740,7 +740,9 @@ class TestMultiAccountDailyTask(unittest.TestCase):
         """真实公共调用链，仅替换画面、前台等待和系统输入，不初始化应用。"""
         state = SimpleNamespace(screen='login', account='账号A', logged_in=False, settle_count=0)
         task = task_class.__new__(task_class)
-        task._executor = SimpleNamespace(debug=False, business_time=time.monotonic)
+        task._executor = SimpleNamespace(
+            debug=False, business_time=time.monotonic,
+            device_manager=SimpleNamespace(get_preferred_device=lambda: {'device': 'windows'}))
         task._app = None
         task.tr = str
         task.info_set = Mock()

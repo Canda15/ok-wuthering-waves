@@ -40,6 +40,8 @@ $testFiles = @(
     'tests/TestSkipDialogConfirm.py',
     'tests/TestBaseCombatTask.py',
     'tests/TestCombatCheck.py',
+    'tests/TestCloudCombatTarget.py',
+    'tests/TestCloudDisconnect.py',
     'tests/TestAbyssRestart.py',
     'tests/TestChar.py',
     'tests/TestLily.py',

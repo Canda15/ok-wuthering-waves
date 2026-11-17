@@ -15,10 +15,10 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | `ok-script` 3.0.5b9（适配上游应用 v3.8.3） |
+| 版本 | `ok-script` 3.0.6（适配上游应用 v3.8.4） |
 | 权威来源 | `selfhost/ok_pin.json`（版本、原始 wheel、完整补丁后树与逻辑差异集合的 SHA-256，由 `scripts/sync_ok.py` 维护） |
-| 来源 | PyPI wheel `ok_script-3.0.5b9-py3-none-any.whl` |
-| 原始 wheel SHA-256 | `f121e95962aba973998ac5edeaf459aac1aca83edf228c205c3965903b7c24a1` |
+| 来源 | PyPI wheel `ok_script-3.0.6-py3-none-any.whl` |
+| 原始 wheel SHA-256 | `01256cc399ffd3cfb76b090bf203068dc7915302e4d18e89f57ab8f7e9562dd2` |
 | 内联范围 | 固定 wheel 的 `ok/`；逻辑差异后的实际数量由 `--check` 给出 |
 | 未内联 | wheel 的 `diagnostics/`、`examples/` 与 dist-info 不作为框架源码入库；生成依赖和内联版本依据原始 wheel、pin 及严格来源清单，不能回退到另一份已安装的 ok-script |
 
@@ -80,6 +80,9 @@ site-packages 里的 `ok` 复制进部署树，再由 `pyappify.yml` 的 `git_ur
 后台测试只在每个外部开始／恢复请求发送一条激活，普通动作和内部接续不补发；旧 PostMessage
 配置仍迁移到 nono，只有明确选择 `post_message_test` 才启用实验方式。所有 Windows 开始入口
 只连接用户手动打开的游戏，旧自动启动和任务内重启不能绕过；NoNo 自身启动器与更新继续保留。
+
+同步 v3.8.4 时保留 NoNo 的角色工坊、自定义角色加载及「无音消除」任务，继续随 NoNo 维护。
+上游 1080p 网页云游戏作为独立设备使用，优先使用 Edge；本地客户端仍走原有前台或后台测试输入。
 同步器仅对已知的 `windows.interaction` 字面量和框架依赖声明应用本项目规则，再交给 Git 三方合并；
 其它配置与依赖继续参与正常合并，未知冲突停止并人工审查。不能为了解决一个输入字段的冲突而覆盖整份配置。
 
@@ -189,7 +192,7 @@ v1.2.7 根启动器与原生业务宿主；快捷方式默认关闭，已有明�
 
 ```powershell
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py'            # 优先取上游 pyproject 版本，没有声明才用 pin
-& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.5b9   # 明确固定已经审查的版本
+& '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --version 3.0.6     # 明确固定已经审查的版本
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --dry-run  # 下载并验证重放，只报告差异
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check    # 离线校验框架、基线及差异来源
 & '.\.venv\Scripts\python.exe' 'scripts/sync_ok.py' --check --root 'E:\deploy\NoNo'  # 示例：校验另一棵部署树

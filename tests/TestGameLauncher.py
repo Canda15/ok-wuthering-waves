@@ -14,6 +14,8 @@ from ok.core.mcp_runner import McpTaskRunner
 from ok.core.mcp_server import LocalMcpServer
 from ok.core.start_controller import StartController
 from ok.core.start_request import StartRequest
+from ok.device.DeviceManager import DeviceManager
+from ok.device.interaction_methods.post_message_test import PostMessageTestInteraction
 from ok.task.TaskExecutor import TaskExecutor
 from ok.task.exceptions import TaskDisabledException
 from ok.task.task import BaseTask
@@ -369,6 +371,52 @@ class Task(BaseTask):
         task.click.assert_not_called()
         task.start_device.assert_not_called()
         self.executor.release_inputs.assert_called_once()
+
+
+class TestGameDeviceSelection(unittest.TestCase):
+    def setUp(self):
+        self.manager = DeviceManager.__new__(DeviceManager)
+        self.manager.windows_capture_config = {}
+        self.manager.adb_capture_config = None
+        self.manager.win_interaction_class = PostMessageTestInteraction
+        self.manager.config = {'preferred': 'pc_10', 'capture': 'WGC', 'interaction': 'post_message_test'}
+        self.manager.device_dict = {'browser': {'imei': 'browser', 'device': 'browser', 'connected': False}}
+        self.manager.start = Mock()
+        self.manager.release_input = Mock()
+
+    def test_旧本地窗口失效时优先等待本地游戏(self):
+        self.manager.device_dict['pc'] = {'imei': 'pc', 'device': 'windows', 'connected': False}
+        self.manager.do_start(notify=False)
+        self.assertEqual(self.manager.get_preferred_device()['imei'], 'pc')
+        self.manager.start.assert_called_once()
+
+    def test_无本地窗口时不自动切到云端但可手动选择(self):
+        self.manager.do_start(notify=False)
+        self.assertIsNone(self.manager.get_preferred_device())
+        self.manager.start.assert_not_called()
+
+        self.manager.set_preferred_device(index=0)
+        self.assertEqual(self.manager.get_preferred_device()['imei'], 'browser')
+        self.manager.start.assert_called_once()
+
+    def test_仅配置浏览器时默认选择云端(self):
+        self.manager.windows_capture_config = None
+        self.manager.config['preferred'] = ''
+        self.manager.do_start(notify=False)
+        self.assertEqual(self.manager.get_preferred_device()['imei'], 'browser')
+        self.manager.start.assert_called_once()
+
+    def test_切换到云端或ADB不受Windows后台配置限制(self):
+        for kind, input_method in (('browser', 'BrowserInteraction'), ('adb', 'ADBInteraction')):
+            with self.subTest(kind=kind):
+                self.manager.device_dict[kind] = {'imei': kind, 'device': kind, 'connected': True}
+                self.manager.set_preferred_device(kind)
+                self.manager.set_capture(kind)
+                self.manager.set_interaction(input_method)
+                self.assertEqual(self.manager.get_preferred_capture(), kind)
+                self.assertEqual(self.manager.config['interaction'], 'post_message_test')
+                with self.assertRaises(ValueError):
+                    self.manager.set_interaction('post_message_test')
 
 
 class TestStartRequest(unittest.TestCase):

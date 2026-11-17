@@ -229,19 +229,38 @@
          return width, height
  
      def set_preferred_device(self, imei=None, index=-1):
-@@ -451,9 +499,10 @@
-                 preferred = connected_device
-                 imei = preferred['imei']
-             else:
+@@ -442,18 +490,20 @@
+             imei = self.config.get("preferred")
+         preferred = self.device_dict.get(imei)
+         if preferred is None:
+-            if len(self.device_dict) > 0:
+-                connected_device = None
+-                for device in self.device_dict.values():
+-                    if device.get('connected') or connected_device is None:
+-                        connected_device = device
+-                logger.info(f'first start use first or connected device {connected_device}')
+-                preferred = connected_device
+-                imei = preferred['imei']
+-            else:
 -                logger.warning(f'no devices')
-+                logger.warning('no devices')
++            local_configured = self.windows_capture_config is not None or self.adb_capture_config is not None
++            for device in self.device_dict.values():
++                # 绑定浏览器会启动云游戏；同时支持本地设备时必须由用户选择云端。
++                if local_configured and device.get('device') == 'browser':
++                    continue
++                if preferred is None or device.get('connected'):
++                    preferred = device
++            if preferred is None:
++                logger.warning('没有可自动选择的设备')
                  return
++            imei = preferred['imei']
++            logger.info(f'自动选择设备：{preferred}')
          if self.config.get("preferred") != imei:
 +            self.release_input()
              logger.info(f'preferred device did change {imei}')
              self.config["preferred"] = imei
              if preferred.get('device') == 'windows' and preferred.get('real_hwnd'):
-@@ -497,7 +546,7 @@
+@@ -497,7 +547,7 @@
                  if image is not None:
                      return image
                  else:
@@ -250,7 +269,7 @@
          except Exception as e:
              logger.error('screencap', e)
  
-@@ -546,7 +595,10 @@
+@@ -546,7 +596,10 @@
          if kind == 'windows':
              configured = (self.windows_capture_config or {}).get('capture_method', [])
              methods = configured if isinstance(configured, list) else [configured]
@@ -262,7 +281,7 @@
          if kind == 'browser':
              return ['browser']
          methods = ['adb']
-@@ -568,9 +620,9 @@
+@@ -568,9 +621,9 @@
              return []
          kind = device.get('device')
          if kind == 'windows':
@@ -275,11 +294,13 @@
          if kind == 'browser':
              return ['BrowserInteraction']
          if kind == 'adb':
-@@ -586,37 +638,37 @@
+@@ -586,37 +639,39 @@
              self.config.save_file()
  
      def set_capture(self, capture):
-+        if (getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction
++        preferred = self.get_preferred_device()
++        if (preferred and preferred.get('device') == 'windows'
++                and getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction
 +                and capture not in BACKGROUND_CAPTURE_METHODS):
 +            raise ValueError('后台测试只支持 WGC、WGC_HDR 或 BitBlt_RenderFull 捕获')
          if self.config.get("capture") != capture:
@@ -320,7 +341,7 @@
 +            expected = BrowserInteraction if kind == 'browser' else ADBInteraction
 +            if interaction not in (expected, expected.__name__):
 +                raise ValueError('该设备不支持请求的输入方案')
-+            self.config['interaction'] = expected.__name__
++            # 云端和 ADB 由绑定流程创建固定输入方式，保留 Windows 的已保存选择。
 +            return
 +        interaction = normalize_pc_interaction(interaction)
 +        interaction_class = PC_INTERACTIONS[interaction]
@@ -339,7 +360,7 @@
              self.start()
  
      def get_hwnd_name(self):
-@@ -628,28 +680,82 @@
+@@ -628,28 +683,82 @@
              self.hwnd_window = HwndWindow(self.exit_event, title, exe, frame_width, frame_height, player_id,
                                            hwnd_class, global_config=self.global_config, device_manager=self, top_hwnd_class=top_hwnd_class)
          else:
@@ -427,7 +448,7 @@
          preferred = self.get_preferred_device()
          if preferred is None:
              if self.device_dict:
-@@ -659,6 +765,10 @@
+@@ -659,6 +768,10 @@
              return
  
          if preferred['device'] == 'windows':
@@ -438,7 +459,7 @@
              title = self.windows_capture_config.get('title')
              exe = self.windows_capture_config.get('exe')
              if not exe and not title and preferred.get('real_hwnd'):
-@@ -701,7 +811,7 @@
+@@ -702,7 +815,7 @@
                      logger.info(f'use ipc capture {preferred}')
                  else:
                      if not isinstance(self.capture_method, ADBCaptureMethod):
@@ -447,7 +468,7 @@
                          if self.capture_method is not None:
                              self.capture_method.close()
                          self.capture_method = ADBCaptureMethod(self, self.exit_event, width=width,
-@@ -744,7 +854,7 @@
+@@ -745,7 +858,7 @@
                  logger.info(f'get device adb device addr changed {preferred}')
                  self._device = self.adb_connect(preferred.get('address'))
          else:
@@ -456,7 +477,7 @@
          return self._device
  
      def adb_kill_server(self):
-@@ -768,6 +878,7 @@
+@@ -769,6 +882,7 @@
          pass
  
      def clear_devices(self):
@@ -464,7 +485,7 @@
          logger.info('clear_devices')
          self.device_dict.clear()
          self.config['preferred'] = ''
-@@ -867,6 +978,7 @@
+@@ -868,6 +982,7 @@
          logger.info(f'update_capture {config}')
          if 'windows' in config:
              win_config = config['windows']
@@ -472,7 +493,7 @@
              reset_selected_hwnd = any(
                  key in win_config for key in ('title', 'exe', 'hwnd_class', 'top_hwnd_class', 'selected_hwnd')
              )
-@@ -987,6 +1099,8 @@
+@@ -988,6 +1103,8 @@
      def ensure_capture(self, config: dict):
          import time
          logger.info(f'ensure_capture {config}')
@@ -481,7 +502,7 @@
          self.clear_devices()
          if 'windows' in config:
              win_config = config['windows']
-@@ -1018,7 +1132,8 @@
+@@ -1019,7 +1136,8 @@
              if 'capture_method' in win_config:
                  self.set_capture(win_config['capture_method'])
              else:

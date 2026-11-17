@@ -11,6 +11,7 @@ def make_task(config, is_team):
     task = FarmEchoTask.__new__(FarmEchoTask)
     task.config = config
     task.info = {}
+    task.is_browser = lambda: False
     task.total_weekly_number = 9
     task.total_boss_number = 20
     task.nightmare_structure = [5, 10]
@@ -99,6 +100,30 @@ class TestFarmEchoTeleport(unittest.TestCase):
             task.run()
 
         self.assertEqual(2, task.do_run.call_count)
+
+    def test_cloud_reconnect_retries_current_phase_without_resetting_completed_rounds(self):
+        task = make_task({}, is_team=True)
+        task.is_browser = lambda: True
+        task.handle_cloud_disconnect = Mock(return_value=True)
+        task.handle_claim_button = Mock()
+        task.handle_monthly_card = Mock()
+        phase = {'count': 2, 'phase': 'prepare'}
+
+        def run_round():
+            if task._farm_state is None:
+                task._farm_state = phase
+                raise RuntimeError('云游戏断线')
+            self.assertIs(task._farm_state, phase)
+
+        task.do_run = Mock(side_effect=run_round)
+        with patch.object(WWOneTimeTask, 'run') as start:
+            task.run()
+
+        start.assert_called_once_with(task)
+        task.handle_cloud_disconnect.assert_called_once_with()
+        self.assertEqual(2, task.do_run.call_count)
+        task.handle_claim_button.assert_not_called()
+        task.handle_monthly_card.assert_not_called()
 
 
 class TestNavigationForegroundRecovery(unittest.TestCase):

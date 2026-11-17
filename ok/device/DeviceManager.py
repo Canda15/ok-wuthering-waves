@@ -490,17 +490,18 @@ class DeviceManager:
             imei = self.config.get("preferred")
         preferred = self.device_dict.get(imei)
         if preferred is None:
-            if len(self.device_dict) > 0:
-                connected_device = None
-                for device in self.device_dict.values():
-                    if device.get('connected') or connected_device is None:
-                        connected_device = device
-                logger.info(f'first start use first or connected device {connected_device}')
-                preferred = connected_device
-                imei = preferred['imei']
-            else:
-                logger.warning('no devices')
+            local_configured = self.windows_capture_config is not None or self.adb_capture_config is not None
+            for device in self.device_dict.values():
+                # 绑定浏览器会启动云游戏；同时支持本地设备时必须由用户选择云端。
+                if local_configured and device.get('device') == 'browser':
+                    continue
+                if preferred is None or device.get('connected'):
+                    preferred = device
+            if preferred is None:
+                logger.warning('没有可自动选择的设备')
                 return
+            imei = preferred['imei']
+            logger.info(f'自动选择设备：{preferred}')
         if self.config.get("preferred") != imei:
             self.release_input()
             logger.info(f'preferred device did change {imei}')
@@ -638,7 +639,9 @@ class DeviceManager:
             self.config.save_file()
 
     def set_capture(self, capture):
-        if (getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction
+        preferred = self.get_preferred_device()
+        if (preferred and preferred.get('device') == 'windows'
+                and getattr(self, 'win_interaction_class', None) is PostMessageTestInteraction
                 and capture not in BACKGROUND_CAPTURE_METHODS):
             raise ValueError('后台测试只支持 WGC、WGC_HDR 或 BitBlt_RenderFull 捕获')
         if self.config.get("capture") != capture:
@@ -653,7 +656,7 @@ class DeviceManager:
             expected = BrowserInteraction if kind == 'browser' else ADBInteraction
             if interaction not in (expected, expected.__name__):
                 raise ValueError('该设备不支持请求的输入方案')
-            self.config['interaction'] = expected.__name__
+            # 云端和 ADB 由绑定流程创建固定输入方式，保留 Windows 的已保存选择。
             return
         interaction = normalize_pc_interaction(interaction)
         interaction_class = PC_INTERACTIONS[interaction]
@@ -787,7 +790,8 @@ class DeviceManager:
             if not isinstance(self.capture_method, BrowserCaptureMethod):
                 if self.capture_method is not None:
                     self.capture_method.close()
-                self.capture_method = BrowserCaptureMethod(self.browser_config, self.exit_event)
+                self.capture_method = BrowserCaptureMethod(
+                    self.browser_config, self.exit_event, global_config=self.global_config)
             if not isinstance(self.interaction, BrowserInteraction):
                 self.interaction = BrowserInteraction(self.capture_method)
 

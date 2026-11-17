@@ -296,7 +296,7 @@ class TaskExecutor:
         # copying without blocking queue operations on a potentially large image.
         return (snapshot[0].copy(), snapshot[1]) if snapshot is not None else None
 
-    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0, *, frame=None):
+    def check_frame_and_resolution(self, supported_ratio, min_size, time_out=8.0, frame=None):
         if supported_ratio is None or min_size is None:
             return True, '0x0'
         logger.info('start check_frame_and_resolution')
