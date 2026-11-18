@@ -65,16 +65,16 @@ $testGroups = if ($Quick) {
             Targets = @(
                 'tests.TestBackgroundInput.TestBackgroundInput',
                 'tests.TestBackgroundInput.TestBackgroundMouseResetTask',
-                'tests.TestBackgroundInput.TestWin32MessageBackend.test_manual_inactive_notification_posts_once_without_changing_running_input',
-                'tests.TestBackgroundInput.TestWin32MessageBackend.test_manual_inactive_notification_rejects_invalid_identity_and_never_retries'
+                'tests.TestBackgroundInput.TestWin32MessageBackend.test_manual_activation_notification_posts_once_without_changing_running_input',
+                'tests.TestBackgroundInput.TestWin32MessageBackend.test_manual_activation_notification_rejects_invalid_identity_and_never_retries'
             )
         },
         @{
             Name = 'tests/TestSelfhostSmoke.py'
             Targets = @(
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_default_input_policy_and_background_mouse_reset_registration',
-                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_connection_inactive_notification_button_is_available_while_running',
-                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_connection_inactive_notification_button_rejects_unavailable_targets_and_reports_failure',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_connection_activation_notification_button_is_available_while_running',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_connection_activation_notification_button_rejects_unavailable_targets_and_reports_failure',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_xmod_versions_sort_as_branded_releases_in_both_python_consumers',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_main_window_still_consumes_custom_tabs',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_registered_tabs_instantiate_against_current_framework',

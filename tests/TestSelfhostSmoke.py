@@ -782,7 +782,7 @@ function gh {
                     kept_task, ['src.task.MouseResetTask', 'MouseResetTask'],
                 ])
 
-    def test_connection_inactive_notification_button_is_available_while_running(self):
+    def test_connection_activation_notification_button_is_available_while_running(self):
         from PySide6.QtWidgets import QWidget
         from ok import og
         from ok.core.start_request import StartRequest
@@ -806,9 +806,9 @@ function gh {
             for mode in ('nono', 'post_message_test'):
                 manager.config['interaction'] = mode
                 popover._refresh_device_state()
-                self.assertTrue(popover.inactive_notification_button.isEnabled())
-                popover.inactive_notification_button.click()
-            self.assertEqual(backend.return_value.send_inactive_notification.call_args_list,
+                self.assertTrue(popover.activation_notification_button.isEnabled())
+                popover.activation_notification_button.click()
+            self.assertEqual(backend.return_value.send_activation_notification.call_args_list,
                              [unittest.mock.call(10)] * 2)
         self.assertIs(executor.current_task, task)
         self.assertFalse(executor.paused)
@@ -816,7 +816,7 @@ function gh {
         for action in (executor.pause, executor.stop, executor.release_inputs):
             action.assert_not_called()
 
-    def test_connection_inactive_notification_button_rejects_unavailable_targets_and_reports_failure(self):
+    def test_connection_activation_notification_button_rejects_unavailable_targets_and_reports_failure(self):
         from PySide6.QtWidgets import QWidget
         from ok import og
         from ok.device.interaction_methods.foreground_input import ForegroundInputError
@@ -840,22 +840,22 @@ function gh {
                 manager.get_preferred_device.return_value = selected
                 manager.hwnd_window.foreground_target.hwnd = hwnd
                 popover._refresh_device_state()
-                self.assertFalse(popover.inactive_notification_button.isEnabled())
-                popover.inactive_notification_button.click()
+                self.assertFalse(popover.activation_notification_button.isEnabled())
+                popover.activation_notification_button.click()
             backend.assert_not_called()
             manager.get_preferred_device.return_value = device
             manager.hwnd_window.foreground_target.hwnd = 10
             popover._refresh_device_state()
             device['connected'] = False
-            popover.inactive_notification_button.click()
+            popover.activation_notification_button.click()
             backend.assert_not_called()
             alert.assert_called_once()
             device['connected'] = True
             popover._refresh_device_state()
             alert.reset_mock()
-            backend.return_value.send_inactive_notification.side_effect = ForegroundInputError('受控投递失败')
-            popover.inactive_notification_button.click()
-            backend.return_value.send_inactive_notification.assert_called_once_with(10)
+            backend.return_value.send_activation_notification.side_effect = ForegroundInputError('受控投递失败')
+            popover.activation_notification_button.click()
+            backend.return_value.send_activation_notification.assert_called_once_with(10)
             alert.assert_called_once()
 
     def test_foreground_sources_remain_inline_and_are_deployed(self):
