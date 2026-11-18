@@ -61,7 +61,11 @@ class DomainTask(WWOneTimeTask, BaseCombatTask):
         while True:
             try:
                 if phase == 'prepare':
+                    epoch = getattr(self, '_foreground_epoch', 0)
                     current, _, total = self.open_F2_book_and_get_stamina()
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        # 后续分类点击复用本页，不能沿用恢复前打开的图鉴或波片额度。
+                        continue
                     if total < self.stamina_once or total < must_use or (must_use == 0 and current < self.stamina_once):
                         self.log_info(self.tr('not enough stamina'), notify=True)
                         self.make_sure_in_world()

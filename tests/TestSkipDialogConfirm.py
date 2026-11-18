@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
@@ -15,6 +16,9 @@ class TestSkipDialogConfirm(unittest.TestCase):
         self.task.click = Mock()
         self.task.sleep = Mock()
         self.task.wait_foreground_frame = Mock()
+        self.before = object()
+        self.task._executor = SimpleNamespace(nullable_frame=lambda: SimpleNamespace(copy=lambda: self.before))
+        self.task.ocr = Mock(return_value=[SimpleNamespace(name='是否开始挑战？')])
 
     def test_focus_after_checkbox_does_not_click_checkbox_again(self):
         confirm, checkbox, fresh_confirm = object(), object(), object()
@@ -40,6 +44,26 @@ class TestSkipDialogConfirm(unittest.TestCase):
         self.task.wait_foreground_frame.assert_not_called()
         self.task.click.assert_called_once()
 
+    def test_新画面题干更换时不确认即使仍有不再提醒(self):
+        original, check, other = object(), object(), object()
+        self.task.find_one.side_effect = [original, check, other]
+        self.task.click.side_effect = ForegroundInputInterrupted()
+        self.task.ocr.side_effect = lambda *args, frame=None: [
+            SimpleNamespace(name='是否开始挑战？' if frame is self.before else '是否消耗波片？'),
+            SimpleNamespace(name='不再提示'),
+        ]
+        self.task.wait_until = lambda condition, **kwargs: condition()
+        with self.assertRaises(ForegroundInputError):
+            self.task.wait_click_skip_dialog_confirm()
+        self.task.click.assert_called_once_with(check)
+
+    def test_确认已发出后中断且同一弹窗仍在不得再次提交(self):
+        confirm, check, fresh = object(), object(), object()
+        self.task.find_one.side_effect = [confirm, check, fresh]
+        self.task.click.side_effect = [None, ForegroundInputInterrupted()]
+        with self.assertRaises(ForegroundInputError):
+            self.task.click_skip_dialog_confirm()
+        self.assertEqual(self.task.click.call_args_list, [call(check), call(confirm)])
     def test_clicks_checkbox_then_confirm(self):
         confirm = object()
         checkbox = object()
@@ -95,6 +119,25 @@ class TestSkipDialogConfirm(unittest.TestCase):
         self.assertTrue(clicked)
         self.task.click.assert_called_once_with(teleport, after_sleep=1)
         self.task.wait_click_skip_dialog_confirm.assert_called_once_with()
+
+    def test_传送点击中断后只确认传送题干(self):
+        for question, allowed in (('是否传送？', True), ('是否退出副本？', False)):
+            with self.subTest(question=question):
+                self.setUp()
+                travel, confirm = SimpleNamespace(name='gray_teleport'), object()
+                self.task.in_team_and_world = lambda: False
+                self.task.find_one.side_effect = lambda feature, **kwargs: (
+                    confirm if isinstance(feature, list) else travel if feature == 'gray_teleport' else None)
+                self.task.ocr.return_value = [SimpleNamespace(name=question)]
+                self.task.click.side_effect = [ForegroundInputInterrupted(), None]
+                if allowed:
+                    self.assertTrue(self.task.click_traval_button())
+                    self.assertEqual(self.task.click.call_args_list, [call(travel, after_sleep=1),
+                                                                    call(confirm, after_sleep=.2)])
+                else:
+                    with self.assertRaises(ForegroundInputError):
+                        self.task.click_traval_button()
+                    self.task.click.assert_called_once_with(travel, after_sleep=1)
 
 
 class TestSkipConfirmForegroundRecovery(unittest.TestCase):

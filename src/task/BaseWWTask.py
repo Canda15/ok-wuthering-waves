@@ -34,6 +34,31 @@ WIDE_MODE_UI_SCALE = 0.75
 # team_start_challenge 在同一帧不随悬停变化, 且下一步本来就要点它。
 TEAM_SCREEN_FEATURES = ('team_start_challenge', 'team_close')
 
+# 恢复时只认完整的动作名或题干；“不离开”“退出游戏”“继续消耗”等不能因含有关键词而被点击。
+_REPEAT_LABEL = re.compile(r'^\s*(?:(?:再次|重新|继续|繼續)(?:挑战|挑戰)|Rechallenge|Challenge Again|'
+                           r'(?:Restart|Repeat|Continue) Challenge)\s*$', re.IGNORECASE)
+_EXIT_LABEL = re.compile(r'^\s*(?:退出|离开|離開|返回)(?:(?:当前|當前)?(?:挑战|挑戰|副本|大世界))?\s*$|'
+                         r'^\s*(?:Exit|Leave|Return)(?: (?:Challenge|Domain|to (?:the )?Overworld))?\s*$',
+                         re.IGNORECASE)
+
+
+def _confirmation_prompt(chinese_action, english_action):
+    return re.compile(rf'(?:(?:是否(?:确认|確認|确定|確定)?|确认|確認|确定|確定)(?:要)?(?:{chinese_action})|'
+                      rf'(?:Are you sure you want to |Do you want to |Would you like to )(?:{english_action}))'
+                      r'[？?。.！!]*', re.IGNORECASE)
+
+
+_REPEAT_PROMPT = _confirmation_prompt(r'(?:再次|重新|继续|繼續)(?:挑战|挑戰)', r'(?:restart|repeat|continue) (?:the |this )?challenge')
+_EXIT_PROMPT = _confirmation_prompt(r'(?:退出|离开|離開)(?:(?:当前|當前|本次)?(?:挑战|挑戰|副本))?',
+                                    r'(?:leave|exit) (?:the |this )?(?:challenge|domain)')
+DOMAIN_ENTRY_PROMPT = _confirmation_prompt(r'(?:进入|進入|开始|開始)(?:(?:本次|当前|當前)?(?:挑战|挑戰|副本))',
+                                           r'(?:start|enter) (?:the |this )?(?:challenge|domain)')
+_TRAVEL_PROMPT = _confirmation_prompt(r'(?:快速)?(?:传送|傳送)', r'(?:fast travel|teleport)(?: (?:here|to this location))?')
+_DIALOG_LABEL = re.compile(r'(?:提示|提醒|警告|(?:本次|今日|今天)?不再(?:提示|提醒|显示|顯示)(?:此提示)?|Notice|Warning|'
+                           r"(?:Don['’]?t|Do not) (?:show|ask)(?: (?:this|me))? again)[。.！!]*", re.IGNORECASE)
+_GENERIC_QUESTION = re.compile(r'(?:(?:是否|要|确定|確認|确认|確定|取消|继续|繼續|Are you sure|Do you want to|'
+                               r'Confirm|Continue|Proceed|Yes|No|OK|Cancel)[？?。.！!\s]*)+', re.IGNORECASE)
+
 
 class BaseWWTask(BaseTask):
     map_zoomed = False
@@ -574,8 +599,7 @@ class BaseWWTask(BaseTask):
         if rewards:
             return 'completed'
         claiming = bool(self.has_claim_stamina())
-        if not claiming and self.ocr(.25, .7, .85, 1, match=re.compile(
-                r'再次挑战|再次挑戰|继续挑战|繼續挑戰|重新挑战|Rechallenge|Challenge Again|Repeat Challenge', re.I)):
+        if not claiming and self.ocr(.25, .7, .85, 1, match=_REPEAT_LABEL):
             return 'completed'
         if self.find_one('gem_add_stamina'):
             return 'backup'
@@ -591,32 +615,32 @@ class BaseWWTask(BaseTask):
                                 team_timeout=120, hcenter=False):
         """领取已确认后继续或离场；恢复仅操作新画面中的目标按钮，不重复领取。"""
         point = repeat_point if repeat else exit_point
-        pattern = re.compile(r'再次|重新|继续|再次|繼續|Rechallenge|Again|Repeat|Continue' if repeat
-                             else r'退出|返回|離開|Exit|Leave|Return', re.I)
+        pattern = _REPEAT_LABEL if repeat else _EXIT_LABEL
+        prompt = _REPEAT_PROMPT if repeat else _EXIT_PROMPT
         recovering = False
         while True:
             try:
                 if self.in_team_and_world() and (repeat or not self.in_realm()):
                     return
                 if recovering:
+                    epoch = getattr(self, '_foreground_epoch', 0)
                     area = self.box_of_screen(max(0, point[0] - .2), max(0, point[1] - .15),
                                               min(1, point[0] + .2), min(1, point[1] + .15), hcenter=hcenter)
                     targets = self.wait_ocr(box=area, match=pattern, time_out=2, raise_if_not_found=False)
-                    if targets:
-                        expected = self.box_of_screen(*point, *point, hcenter=hcenter)
-                        target = min(targets, key=lambda box: (box.x + box.width / 2 - expected.x) ** 2
-                                     + (box.y + box.height / 2 - expected.y) ** 2)
-                        self.click(target, after_sleep=1)
-                    elif self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
-                        self.click_confirm()
-                    else:
+                    if targets and len(targets) == 1 and self._stamina_result_state() == 'completed':
+                        if epoch != getattr(self, '_foreground_epoch', 0):
+                            raise ForegroundInputInterrupted('结算页发生变化，需要重新识别')
+                        self.click(targets[0], after_sleep=1)
+                        self.wait_until(lambda: self._confirm_resumed_skip_dialog(expected_prompt=prompt),
+                                        time_out=3, raise_if_not_found=False)
+                    elif not self._confirm_resumed_skip_dialog(expected_prompt=prompt):
                         if self.wait_in_team_and_world(time_out=team_timeout, raise_if_not_found=False):
                             return
                         self.screenshot('challenge_result_unknown')
                         raise ForegroundInputError('无法确认挑战结果页的继续或离场状态，已停止操作')
                 else:
                     self.click_relative(*point, hcenter=hcenter, after_sleep=1)
-                self.wait_click_skip_dialog_confirm()
+                    self.wait_click_skip_dialog_confirm()
                 self.wait_in_team_and_world(time_out=team_timeout)
                 return
             except ForegroundInputInterrupted:
@@ -1298,7 +1322,6 @@ class BaseWWTask(BaseTask):
     def open_boss_book(self, name, after_sleep=2):
         self.log_info(self.tr('open_boss_book {name}').format(name=name))
         x = 0.24
-        self.sleep(0.4)
         if name == 'ningsu':
             y = 0.4
         elif name == 'moni':
@@ -1318,9 +1341,17 @@ class BaseWWTask(BaseTask):
         self._book_category_name = name
         while True:
             try:
+                epoch = getattr(self, '_foreground_epoch', 0)
+                self.sleep(0.4)
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('分类点击前图鉴已变化，需要重新定位')
                 if name == 'mengyan':
                     self.click_relative(0.356, 0.882, after_sleep=after_sleep)
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('梦魇列表已变化，需要重新定位')
                 self.click_relative(x, y, after_sleep=after_sleep, name=name)
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('选择分类后图鉴已变化，需要重新定位')
                 return
             except ForegroundInputInterrupted:
                 self._recover_foreground_input()
@@ -1378,14 +1409,11 @@ class BaseWWTask(BaseTask):
                 if requested and self.in_team_and_world():
                     return True
                 if recovering and requested:
-                    confirm = self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
-                                            threshold=.6)
-                    if confirm:
-                        # 只重查并确认仍在前台的弹窗；失焦前的勾选步骤不再盲目切换。
-                        self.click(confirm, after_sleep=.5)
-                        self.click_confirm()
-                        self.wait_click_skip_dialog_confirm()
+                    if self._confirm_resumed_skip_dialog(expected_prompt=_TRAVEL_PROMPT):
                         return True
+                    if self.wait_in_team_and_world(time_out=120, raise_if_not_found=False):
+                        return True
+                    raise ForegroundInputError('无法确认传送结果，已停止操作')
                 for feature_name in ['fast_travel_custom', 'gray_teleport', 'remove_custom']:
                     if self.find_one(feature_name, threshold=0.7):
                         self.sleep(0.5)
@@ -1404,11 +1432,6 @@ class BaseWWTask(BaseTask):
                         if feature.name != 'remove_custom':
                             self.wait_click_skip_dialog_confirm()
                         return True
-                if requested:
-                    # 传送点击可能已进入加载，先确认新主界面；没有结果时不能再点旧地图坐标。
-                    if self.wait_in_team_and_world(time_out=120, raise_if_not_found=False):
-                        return True
-                    raise ForegroundInputError('无法确认传送结果，已停止操作')
                 return False
             except ForegroundInputInterrupted:
                 self._recover_foreground_input()
@@ -1453,6 +1476,12 @@ class BaseWWTask(BaseTask):
         if not skip_dialog_check:
             return False
 
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('勾选框与题干没有在同一代画面识别')
+        # 正常勾选不做额外 OCR。只有实际中断时，才从这张已识别的帧与恢复帧核对同一题干。
+        frame = self.executor.nullable_frame()
+        original_frame = frame.copy() if frame is not None else None
+        submitted = False
         logger.info('confirm dialog exists, click confirm')
         try:
             self.sleep(.5)
@@ -1462,38 +1491,56 @@ class BaseWWTask(BaseTask):
             self.sleep(.5)
             if epoch != getattr(self, '_foreground_epoch', 0):
                 raise ForegroundInputInterrupted('勾选后画面已刷新，需要重新识别确认')
+            submitted = True
             self.click(skip_dialog_confirm)
             self.sleep(.2)
             return True
         except ForegroundInputInterrupted:
             self._recover_foreground_input()
-            return self._confirm_resumed_skip_dialog()
+            return self._confirm_resumed_skip_dialog(previous_frame=original_frame, submitted=submitted)
 
-    def _confirm_resumed_skip_dialog(self):
+    def _dialog_question(self, frame=None):
+        # 只读弹窗中央题干，排除标题、按钮和“不再提醒”；单有这些外观不能识别业务对象。
+        words = self.ocr(.24, .34, .76, .535, frame=frame)
+        words = (box.name.strip() for box in words)
+        question = ' '.join(word for word in words if word and not _DIALOG_LABEL.fullmatch(word))
+        # OCR 可把中文题干拆成几个文字框；英文词间的空格仍然保留。
+        question = re.sub(r'(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])', '', question)
+        return '' if _GENERIC_QUESTION.fullmatch(question) else question
+
+    def _confirm_resumed_skip_dialog(self, *, expected_prompt=None, previous_frame=None, submitted=False):
+        previous_question = self._dialog_question(previous_frame) if previous_frame is not None else None
         while True:
             try:
+                epoch = getattr(self, '_foreground_epoch', 0)
                 confirm = self.find_one(
                     ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter'],
                     horizontal_variance=.1, vertical_variance=.1)
                 if not confirm:
-                    return False
-                # 不恢复旧勾选动作；新弹窗仍在时只点其确认，避免取消已经生效的勾选。
+                    return submitted
+                question = self._dialog_question()
+                if epoch != getattr(self, '_foreground_epoch', 0):
+                    raise ForegroundInputInterrupted('识别题干期间画面已变化')
+                if not question or not (expected_prompt.fullmatch(question) if expected_prompt is not None
+                                        else question == previous_question):
+                    raise ForegroundInputError('恢复后无法确认这是原操作的弹窗，已停止点击')
+                # 恢复后只提交同一问题的确认，不再切换勾选状态。
+                if submitted:
+                    raise ForegroundInputError('确认点击已尝试而弹窗仍在，已停止以免重复提交')
+                submitted = True
                 self.click(confirm, after_sleep=.2)
                 return True
             except ForegroundInputInterrupted:
                 self._recover_foreground_input()
 
     def wait_click_skip_dialog_confirm(self, time_out=3):
-        recovering = False
-        while True:
-            try:
-                if recovering:
-                    return self._confirm_resumed_skip_dialog()
-                return self.wait_until(self.click_skip_dialog_confirm, time_out=time_out,
-                                       raise_if_not_found=False)
-            except ForegroundInputInterrupted:
-                self._recover_foreground_input()
-                recovering = True
+        try:
+            return self.wait_until(self.click_skip_dialog_confirm, time_out=time_out,
+                                   raise_if_not_found=False)
+        except ForegroundInputInterrupted:
+            # 尚未识别原题干就中断，让调用方根据新的业务页面决定下一步。
+            self._recover_foreground_input()
+            return False
 
     def click_team_challenge(self):
         recovering = False
@@ -1502,8 +1549,8 @@ class BaseWWTask(BaseTask):
                 if recovering and self.in_team_and_world():
                     return
                 if recovering and not self.find_one('team_start_challenge'):
-                    if self.find_one(['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']):
-                        self.click_confirm()
+                    if self._confirm_resumed_skip_dialog(expected_prompt=DOMAIN_ENTRY_PROMPT):
+                        return
                     elif self.wait_in_team_and_world(time_out=120, raise_if_not_found=False):
                         return
                     else:

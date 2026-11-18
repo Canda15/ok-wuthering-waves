@@ -1,6 +1,6 @@
 from ok import Logger
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
-from src.task.BaseWWTask import TEAM_SCREEN_FEATURES
+from src.task.BaseWWTask import DOMAIN_ENTRY_PROMPT, TEAM_SCREEN_FEATURES
 from src.task.DomainTask import DomainTask
 from src.task.task_icons import task_icon
 
@@ -61,17 +61,24 @@ class SimulationTask(DomainTask):
                 if recovering and phase != 'select' and self.in_team_and_world():
                     return
                 if phase == 'select':
-                    self.openF2Book('gray_book_boss')
+                    # 正常入口已在图鉴读过波片，只有被中断的选择需要重新定位图鉴。
+                    if recovering:
+                        self.openF2Book('gray_book_boss')
                     self.open_boss_book('moni')
+                    epoch = getattr(self, '_foreground_epoch', 0)
                     self.click(.9730, .8806, after_sleep=1)
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('模拟挑战选择页已变化')
                     self.click(.898, .533 + index * .14, after_sleep=1)
                     phase = 'proceed'
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('模拟挑战入口已变化')
                 if phase == 'proceed':
                     if not recovering:
                         self.click_relative(.93, .90, after_sleep=1)
                     elif self.find_one(TEAM_SCREEN_FEATURES):
                         pass
-                    elif self._confirm_resumed_skip_dialog():
+                    elif self._confirm_resumed_skip_dialog(expected_prompt=DOMAIN_ENTRY_PROMPT):
                         pass
                     elif proceed := self.find_one('boss_proceed', box=self.box_of_screen(.7, .75, 1, 1)):
                         self.click(proceed, after_sleep=1)

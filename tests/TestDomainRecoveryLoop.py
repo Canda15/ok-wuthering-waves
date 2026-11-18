@@ -285,6 +285,18 @@ class TestDomainEntryForegroundRecovery(unittest.TestCase):
         self.assertEqual(task.click.call_count, 2)
         task.click_team_challenge.assert_called_once()
 
+    def test_首次直接选分类而选择中断后重新定位图鉴(self):
+        for cls, selection, category in ((ForgeryTask, 1, 'ningsu'), (SimulationTask, 'Shell Credit', 'moni')):
+            for interrupted in (False, True):
+                with self.subTest(cls=cls, interrupted=interrupted):
+                    task = self.make_entry(cls)
+                    if interrupted:
+                        task.open_boss_book.side_effect = [ForegroundInputInterrupted(), None]
+                    task.teleport_into_domain(selection)
+                    self.assertEqual(task.openF2Book.call_count, int(interrupted))
+                    self.assertTrue(all(args.args == (category,) for args in task.open_boss_book.call_args_list))
+                    task.click_team_challenge.assert_called_once()
+
     def test_unconfirmed_entry_stops_without_clicking_old_coordinate_again(self):
         task = self.make_entry(ForgeryTask, 'unknown')
         task.click.side_effect = ForegroundInputInterrupted()
@@ -327,6 +339,8 @@ class TestDomainEntryForegroundRecovery(unittest.TestCase):
         fresh = SimpleNamespace(x=630, y=830, width=20, height=20)
         task.box_of_screen = Mock(return_value=SimpleNamespace(x=640, y=840))
         task.wait_ocr = Mock(return_value=[fresh])
+        task._stamina_result_state = Mock(return_value='completed')
+        task.wait_until = Mock()
         task.click = Mock()
         task.wait_click_skip_dialog_confirm = Mock()
         task.wait_in_team_and_world = Mock(return_value=True)
@@ -335,6 +349,57 @@ class TestDomainEntryForegroundRecovery(unittest.TestCase):
         task.click.assert_called_once_with(fresh, after_sleep=1)
         self.assertTrue(all(call.kwargs.get('hcenter') for call in task.box_of_screen.call_args_list))
         task.wait_foreground_frame.assert_called_once()
+
+    def test_退出恢复只认本次挑战题干与按钮不认同外观其它业务(self):
+        for question, accepted in (
+                ('确认离开', True), ('是否要退出当前副本？', True), ('確認離開', True),
+                ('Are you sure you want to leave this challenge?', True),
+                ('是否不离开？', False), ('确认离开游戏？', False), ('不再提示', False),
+                ('是否消耗资源继续挑战？', False), ('是否确认退出账号？', False)):
+            with self.subTest(question=question):
+                task = BaseWWTask.__new__(BaseWWTask)
+                task.in_team_and_world = lambda: False
+                task.click_relative = Mock(side_effect=ForegroundInputInterrupted())
+                task.wait_foreground_frame = Mock()
+                task.wait_ocr = Mock(return_value=[])
+                task.box_of_screen = Mock()
+                confirm = object()
+                task.find_one = Mock(return_value=confirm)
+                task.ocr = Mock(return_value=[SimpleNamespace(name=question)])
+                task.click = Mock()
+                task.wait_in_team_and_world = Mock(return_value=True)
+                if accepted:
+                    task.finish_challenge_result(False)
+                    task.click.assert_called_once_with(confirm, after_sleep=.2)
+                else:
+                    with self.assertRaises(ForegroundInputError):
+                        task.finish_challenge_result(False)
+                    task.click.assert_not_called()
+
+    def test_简体离开仅在已证实的结果页用作恢复目标(self):
+        for label, outcome, accepted in (('离开', 'completed', True), ('离开', None, False),
+                                        ('不要离开', 'completed', False), ('离开账号', 'completed', False)):
+            with self.subTest(label=label, outcome=outcome):
+                task = BaseWWTask.__new__(BaseWWTask)
+                task.in_team_and_world = Mock(return_value=False)
+                task.click_relative = Mock(side_effect=ForegroundInputInterrupted())
+                task.wait_foreground_frame = Mock()
+                target = SimpleNamespace(name=label)
+                task.wait_ocr = lambda *, match, **kwargs: [target] if match.search(label) else []
+                task._stamina_result_state = Mock(return_value=outcome)
+                task.find_one = Mock(return_value=None)
+                task.box_of_screen = Mock()
+                task.screenshot = Mock()
+                task.click = Mock()
+                task.wait_until = Mock()
+                task.wait_in_team_and_world = Mock(return_value=False)
+                if accepted:
+                    task.finish_challenge_result(False)
+                    task.click.assert_called_once_with(target, after_sleep=1)
+                else:
+                    with self.assertRaises(ForegroundInputError):
+                        task.finish_challenge_result(False)
+                    task.click.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ number_pattern = re.compile(r"^[\d.%％ ]+$")
 property_pattern = re.compile(r"[\u4e00-\u9fff]{2,}")
 TUNING_RESULT_PATTERN = re.compile(r'调谐成功|調諧成功|点击任意|點擊任意')
 TUNING_DIALOG_PATTERN = re.compile(r'不再提示|' + TUNING_RESULT_PATTERN.pattern)
+TUNING_CONFIRM_PROMPT = re.compile(r'(?:是否(?:确认|確認|确定|確定)?|确认|確認|确定|確定)'
+                                   r'(?:要)?(?:进行|進行)?(?:声骸|聲骸)?(?:强化并调谐|強化並調諧|调谐|調諧)[？?。]*')
 
 
 class EnhanceEchoTask(BaseWWTask, FindFeature):
@@ -136,6 +138,7 @@ class EnhanceEchoTask(BaseWWTask, FindFeature):
                         self._enhance_baseline_count = len(properties)
                         self._enhance_result_seen = False
                         self._enhance_resolving_after_resume = False
+                        self._enhance_confirm_attempted = False
                         self._put_staged_materials()
                         self._enhance_phase = 'submit'
                     if self._enhance_phase == 'submit':
@@ -209,11 +212,17 @@ class EnhanceEchoTask(BaseWWTask, FindFeature):
                 self.click(result, after_sleep=1)
                 continue
             if handle:
-                if getattr(self, '_enhance_resolving_after_resume', False):
-                    # 勾选可能已经生效；只重新定位仍在前台的确认，避免把“不再提示”反向切换。
-                    self._confirm_resumed_skip_dialog()
-                else:
-                    self.click_skip_dialog_confirm()
+                if not getattr(self, '_enhance_confirm_attempted', False):
+                    # 点击途中断开也可能已经扣料；本次只观察结果，不因旧弹窗仍在而反复提交。
+                    self._enhance_confirm_attempted = True
+                    if getattr(self, '_enhance_resolving_after_resume', False):
+                        if self._stat_signature(*self._read_echo_stats()) != self._enhance_baseline_signature:
+                            self._enhance_unknown('恢复后无法确认待调谐的原声骸，已停止操作')
+                        confirmed = self._confirm_resumed_skip_dialog(expected_prompt=TUNING_CONFIRM_PROMPT)
+                    else:
+                        confirmed = self.click_skip_dialog_confirm()
+                    if not confirmed:
+                        self._enhance_confirm_attempted = False
                 self.sleep(.2)
                 continue
             properties, _ = self._read_echo_stats()

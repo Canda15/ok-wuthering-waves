@@ -190,6 +190,33 @@ class TestEchoForegroundRecovery(unittest.TestCase):
         self.assertEqual(2, counters['成功声骸数量'])
         self.assertEqual('completed', task._enhance_phase)
 
+    def test_调谐恢复不能仅凭不再提示提交材料(self):
+        for question, current in (('是否购买材料？', True), ('是否确认调谐？', False)):
+            with self.subTest(question=question, original_echo=current):
+                task, _ = self.make_enhance_task('resolve')
+                task._enhance_resolving_after_resume = True
+                task.find_one = Mock(return_value=object())
+                if current:
+                    task._read_echo_stats.return_value = ([Box(0, 0, 1, 1, name='攻击')],
+                                                          [Box(0, 0, 1, 1, name='10%')])
+                task.ocr.side_effect = lambda *args, **kwargs: [
+                    Box(0, 0, 1, 1, name='不再提示' if 'match' in kwargs else question)]
+                with self.assertRaises(ForegroundInputError):
+                    task._resolve_enhance_result()
+                task.click.assert_not_called()
+
+    def test_确认同一调谐后弹窗滞留只观察不再次扣料(self):
+        task, _ = self.make_enhance_task('resolve')
+        task._enhance_resolving_after_resume = True
+        task._read_echo_stats.return_value = ([Box(0, 0, 1, 1, name='攻击')], [Box(0, 0, 1, 1, name='10%')])
+        confirm = object()
+        task.find_one = Mock(return_value=confirm)
+        task.ocr.side_effect = lambda *args, **kwargs: [
+            Box(0, 0, 1, 1, name='不再提示' if 'match' in kwargs else '是否确认调谐？')]
+        with self.assertRaisesRegex(ForegroundInputError, '无法确认强化与调谐结果'):
+            task._resolve_enhance_result()
+        task.click.assert_called_once_with(confirm, after_sleep=.2)
+
     def test_native_failure_after_submission_propagates_without_focus_retry(self):
         task, counters = self.make_enhance_task('submit')
         task.click.side_effect = ForegroundInputError('SendInput 部分成功')

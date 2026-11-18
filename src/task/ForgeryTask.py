@@ -2,7 +2,7 @@ import cv2
 
 from ok import Logger, find_color_rectangles
 from ok.device.interaction_methods.foreground_input import ForegroundInputError, ForegroundInputInterrupted
-from src.task.BaseWWTask import TEAM_SCREEN_FEATURES
+from src.task.BaseWWTask import DOMAIN_ENTRY_PROMPT, TEAM_SCREEN_FEATURES
 from src.task.DomainTask import DomainTask
 from src.task.task_icons import task_icon
 
@@ -74,16 +74,20 @@ class ForgeryTask(DomainTask):
                 if recovering and phase != 'select' and self.in_team_and_world():
                     return
                 if phase == 'select':
-                    self.openF2Book('gray_book_boss')
+                    if recovering:
+                        self.openF2Book('gray_book_boss')
                     self.open_boss_book('ningsu')
+                    epoch = getattr(self, '_foreground_epoch', 0)
                     self.click_on_book_target(serial_number, self.total_number, self.structure)
                     phase = 'proceed'
+                    if epoch != getattr(self, '_foreground_epoch', 0):
+                        raise ForegroundInputInterrupted('锻造挑战入口已变化')
                 if phase == 'proceed':
                     if not recovering:
                         self.click(.891, .910, after_sleep=1)
                     elif self.find_one(TEAM_SCREEN_FEATURES):
                         pass
-                    elif self._confirm_resumed_skip_dialog():
+                    elif self._confirm_resumed_skip_dialog(expected_prompt=DOMAIN_ENTRY_PROMPT):
                         pass
                     elif proceed := self.find_one('boss_proceed', box=self.box_of_screen(.7, .75, 1, 1)):
                         self.click(proceed, after_sleep=1)
