@@ -31,8 +31,8 @@
 +            "使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续")
 +        options = {'nono': (title, description, None),
 +                   'post_message_test': (
-+                       _t('SelectInteractionListView', '后台测试（启动时单次激活）'),
-+                       _t('SelectInteractionListView', '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复'),
++                       _t('SelectInteractionListView', '后台测试（测试模式不要使用）'),
++                       _t('SelectInteractionListView', '测试模式有概率会导致封号!!!整点会有检测封号，凌晨后风控加强!!!'),
 +                       None)}
 +        names = device_manager.available_interaction_methods(device)
 +        current = getattr(device_manager, 'config', {}).get('interaction')

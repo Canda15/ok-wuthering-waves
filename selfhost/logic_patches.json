@@ -297,7 +297,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/en_US.qm.bin",
       "before_sha256": "d8038299be833e2b27c25acdc2b85a503d859240fb54b6304ebc693b7d19dd4d",
-      "after_sha256": "6d842728dc0590132bb4bb79b245e06ef2060d6f24b99072b0774dd7fea90ba2"
+      "after_sha256": "bd468164235fef5997864ce77205a53115189daa694595f9718a2b70f70f8f2d"
     },
     {
       "path": "ui/qt/i18n/en_US.ts",
@@ -305,7 +305,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/en_US.ts.patch",
       "before_sha256": "94567da283a25ea3e1954f7ca518503d60512d0d69bd8d87913370f7efba76f8",
-      "after_sha256": "dffecce4b037d53b695f15914c01aa217d58cda75f65a2057030a5e31823f77a"
+      "after_sha256": "0194e74d309c2ad220284fc08d82526186bba5bfcdb522da14969ca2669988a5"
     },
     {
       "path": "ui/qt/i18n/es_ES.qm",
@@ -313,7 +313,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/es_ES.qm.bin",
       "before_sha256": "2dc1f0126afec00d575f20cc7ef1caad6a11d653491680d1b07803cc7698eb2b",
-      "after_sha256": "60fd5ec4beb4feb5cf36912ad075134b47e4fb3027f1fd3bbc2cb6ed54e81875"
+      "after_sha256": "b9456c15960c2c9728d549fee0960209b275c69468278c9e785d832bb3ad67b6"
     },
     {
       "path": "ui/qt/i18n/es_ES.ts",
@@ -321,7 +321,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/es_ES.ts.patch",
       "before_sha256": "31c9d50a708feb3b31e87024e566405a97fbdc619b28d636c17bffea1d056652",
-      "after_sha256": "d78678336129a0616787edd0d0028f384bbb4d9e8aed7fe689ac907163ecbc6e"
+      "after_sha256": "dec51a8d8bd332527e9a68be5ca2314eff528fa3a65d405fb97a677fef905b06"
     },
     {
       "path": "ui/qt/i18n/ja_JP.qm",
@@ -329,7 +329,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/ja_JP.qm.bin",
       "before_sha256": "1fdbf9771268d3bfc22012759f5b076f2b942a82a0d0ae7a601c2647e568aec1",
-      "after_sha256": "5d616fce47669ba9f970d30cae5e82f7230b2646be9ec8092e5e2cceddd0d59a"
+      "after_sha256": "86b2ffea006e1ddeff706351909e47d27c124bdbb4d694484a3a6975c6c53acd"
     },
     {
       "path": "ui/qt/i18n/ja_JP.ts",
@@ -337,7 +337,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/ja_JP.ts.patch",
       "before_sha256": "757609d8567b483b463badb586774d516ce9b907cf5cfa30bf8ebd41ec0e022e",
-      "after_sha256": "d571d5b71953b7a0093bee80d758492c5c74d44d05cf7cb003fc8786de659215"
+      "after_sha256": "be73fc1d18d8b6be33e6b81a3c3340081b3666614424c317b58736de3c9964ca"
     },
     {
       "path": "ui/qt/i18n/ko_KR.qm",
@@ -345,7 +345,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/ko_KR.qm.bin",
       "before_sha256": "4b4a455ce57353a63a2fe7561150b3151f9bdaa3db7f29cca139703d24501fdb",
-      "after_sha256": "4dfe688ffa5897796971e106a862b58f7fe4813fd3f06a28d40132585a81756e"
+      "after_sha256": "de36eff85447ff7794ef02fa7fd24df8a222fa69add08aad972ad4767c502448"
     },
     {
       "path": "ui/qt/i18n/ko_KR.ts",
@@ -353,7 +353,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/ko_KR.ts.patch",
       "before_sha256": "85d8fab1d22a3e41f8257de1ff3b86fcc695949dfd7051250798ea6980ac0e1f",
-      "after_sha256": "e22b34f724d6b7ec82e5cf7f628994b5dec8cc22a6de1b7b6739d0ad33ca0656"
+      "after_sha256": "b3d1458d924241bb943edb17f514310bfffcce60ac2ca39cf2979d62a536e23e"
     },
     {
       "path": "ui/qt/i18n/zh_CN.qm",
@@ -361,7 +361,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/zh_CN.qm.bin",
       "before_sha256": "d19a7e5f42026698ffc6889b460e2a8172d6ff32ed32142f510bce42f7f895de",
-      "after_sha256": "23bad9fe5be7d772ffeeb4722b907b5ed25d7036d90fc05b87a7d7b7576fdeb2"
+      "after_sha256": "4c3483f12b1374420b92826bc9276e3552ccb1f01624210f13ea22474477a540"
     },
     {
       "path": "ui/qt/i18n/zh_CN.ts",
@@ -369,7 +369,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/zh_CN.ts.patch",
       "before_sha256": "b331bb76f2ba216553baebf83f95317f6f4ce74ce1acb4d74351857115831776",
-      "after_sha256": "59abe4efe9c95789130e42669e6cce11f85c860eeed183d4ba083b29f40875d5"
+      "after_sha256": "2742d5c87d05a05d64aa358b2b427dd6dad8352866d54ec6827318ac943d5270"
     },
     {
       "path": "ui/qt/i18n/zh_TW.qm",
@@ -377,7 +377,7 @@
       "format": "binary",
       "payload": "patches/ui/qt/i18n/zh_TW.qm.bin",
       "before_sha256": "bf7787d09d679997f829b2cdb870e8e792bc36c92b04174be28397306c51c5f4",
-      "after_sha256": "444995836fd1a20071809b11c74ebe7fb72a1a8e7919527adbfced20ec0fef5a"
+      "after_sha256": "ba7757c935931fc9d5301e5fe7d1240270f208450bb7fc1d21ab590c65d1a419"
     },
     {
       "path": "ui/qt/i18n/zh_TW.ts",
@@ -385,7 +385,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/i18n/zh_TW.ts.patch",
       "before_sha256": "ddea118c532d6ae935fa0d94f183f8648434aa3db8db02499f33fb6501f4ac61",
-      "after_sha256": "14710f2ba32a9b384a0830b7dfc304ccd6d8108f7e55d9567159eea7123bf1a3"
+      "after_sha256": "c1bd5e0c199bc0e8b3d9c90bbf472a5fcf851fb7af7ec6cc6a807e2e9acebe48"
     },
     {
       "path": "ui/qt/resources.py",
@@ -393,7 +393,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/resources.py.patch",
       "before_sha256": "b3381515ccd1740dafbe18b6250abf7eead6fff2f8d362f3cca68e30d6daeb92",
-      "after_sha256": "682015654fcc545ffd065ada8bb4dabd1beab62864868fd1203d0eef211fbce7"
+      "after_sha256": "fddb027af7a5846e8c10f5163ec3eb7fe3ab2bf478bbeead56dc4945a77f95b7"
     },
     {
       "path": "ui/qt/shell/connection.py",
@@ -401,7 +401,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/shell/connection.py.patch",
       "before_sha256": "47deae2fe5809cf96c5a134709176821ee30db98640dababa8a93144496d7708",
-      "after_sha256": "115e503002f67328e781922f9f7f9c557fe06c3cbf701aec44681fd77f315e32"
+      "after_sha256": "de700edf2baaf86487de0071ec95e96cefe14a50ddbeb21dea6db15f5f77ca6d"
     },
     {
       "path": "ui/qt/shell/diagnostics.py",

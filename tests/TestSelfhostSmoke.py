@@ -754,8 +754,8 @@ function gh {
         self.assertEqual(index, 0)
         self.assertEqual(options, [('nono（前台系统键鼠）',
                                    '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续', None),
-                                   ('后台测试（启动时单次激活）',
-                                    '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复', None)])
+                                   ('后台测试（测试模式不要使用）',
+                                    '测试模式有概率会导致封号!!!整点会有检测封号，凌晨后风控加强!!!', None)])
         self.assertIn(('src.task.MouseResetTask', 'MouseResetTask'),
                       [tuple(task) for task in config['trigger_tasks']])
         self.assertTrue((repo_root / 'src' / 'task' / 'MouseResetTask.py').exists())
@@ -1410,8 +1410,8 @@ function gh {
         current = {
             ('SelectInteractionListView', '前台系统键鼠'),
             ('SelectInteractionListView', '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续'),
-            ('SelectInteractionListView', '后台测试（启动时单次激活）'),
-            ('SelectInteractionListView', '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复'),
+            ('SelectInteractionListView', '后台测试（测试模式不要使用）'),
+            ('SelectInteractionListView', '测试模式有概率会导致封号!!!整点会有检测封号，凌晨后风控加强!!!'),
             ('app', '需要已打开的本地 QQ 客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
             ('app', '需要已打开的本地微信客户端；发送时占用真实键鼠和前台，长任务或用户失焦期间可能延后'),
         }

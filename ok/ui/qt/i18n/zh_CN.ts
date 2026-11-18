@@ -3359,12 +3359,12 @@
             <translation>前台系统键鼠</translation>
         </message>
         <message>
-            <source>后台测试（启动时单次激活）</source>
-            <translation>后台测试（启动时单次激活）</translation>
+            <source>后台测试（测试模式不要使用）</source>
+            <translation>后台测试（测试模式不要使用）</translation>
         </message>
         <message>
-            <source>每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复</source>
-            <translation>每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复</translation>
+            <source>测试模式有概率会导致封号!!!整点会有检测封号，凌晨后风控加强!!!</source>
+            <translation>测试模式有概率会导致封号!!!整点会有检测封号，凌晨后风控加强!!!</translation>
         </message>
     </context>
     <context>
