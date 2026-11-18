@@ -26,6 +26,7 @@ from ok.task.exceptions import TaskDisabledException
 logger = logging.getLogger(__name__)
 
 WM_ACTIVATE = 0x0006
+WA_INACTIVE = 0
 WM_KEYDOWN, WM_KEYUP, WM_CHAR = 0x0100, 0x0101, 0x0102
 WM_MOUSEMOVE, WM_MOUSEWHEEL = 0x0200, 0x020A
 _BUTTON_MESSAGES = {
@@ -100,6 +101,21 @@ class Win32MessageBackend:
         result = bool(self.user32.PostMessageW(hwnd, message, wparam, lparam))
         self.last_error = ctypes.get_last_error()
         return result
+
+    def send_inactive_notification(self, hwnd):
+        """独立手动通知：只核验目标并投递一次，不联动任务或输入准备状态。"""
+        identity = self.identity(hwnd)
+        if identity is None:
+            raise ForegroundInputError('游戏窗口已失效，无法发送未激活通知')
+        if self.identity(hwnd) != identity:
+            raise ForegroundInputError('投递前游戏窗口身份已变化，请重新连接')
+        try:
+            accepted = self.post_message(hwnd, WM_ACTIVATE, WA_INACTIVE, 0)
+        except Exception as error:
+            raise ForegroundInputError('未激活通知投递失败') from error
+        if not accepted:
+            raise ForegroundInputError(f'系统拒绝未激活通知，系统错误码：{self.last_error}')
+        return identity
 
     @staticmethod
     def is_visible(hwnd):

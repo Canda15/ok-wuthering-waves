@@ -9,7 +9,7 @@
          if not methods:
              return [(_t("SelectCaptureListView", "Game Window"), "", None)], 0, [None]
          names = [_method_name(method) for method in methods]
-@@ -89,19 +89,22 @@
+@@ -89,24 +89,38 @@
  
  
  def interaction_options(device_manager, device: dict):
@@ -42,20 +42,74 @@
      if device['device'] == "adb":
          return [(_t("SelectInteractionListView", "ADBInteraction"), "", None)], 0, [None]
      if device['device'] == "browser":
-@@ -225,7 +228,7 @@
+         return [(_t("SelectInteractionListView", "BrowserInteraction"), "", None)], 0, [None]
+     return [(_t("SelectInteractionListView", "Default Interaction"), "", None)], 0, [None]
++
++
++def inactive_notification_hwnd(device_manager) -> int:
++    """只读取已连接 Windows 游戏的有效主窗，不受输入模式或任务暂停门禁限制。"""
++    device = device_manager.get_preferred_device()
++    if not device or device.get('device') != 'windows' or not device.get('connected'):
++        return 0
++    window = getattr(device_manager, 'hwnd_window', None)
++    # 该属性实时过滤失效／重用的窗口，不创建输入会话或改变任务状态。
++    target = getattr(window, 'foreground_target', None)
++    return int(getattr(target, 'hwnd', 0) or 0)
+ 
+ 
+ class ConnectionPopover(Popover):
+@@ -150,6 +164,10 @@
+         self.capture_group.selected.connect(self._on_capture_picked)
+         self.interaction_group = OptionGroup()
+         self.interaction_group.selected.connect(self._on_interaction_picked)
++        self.inactive_notification_button = Button(self.tr('发送未激活通知'), size='small')
++        self.inactive_notification_button.setToolTip('向当前连接的游戏投递一次未激活通知')
++        self.inactive_notification_button.setEnabled(False)
++        self.inactive_notification_button.clicked.connect(self._send_inactive_notification)
+ 
+         export_button = Button(_t("StartTab", "Export Logs"), "export", "subtle", "small")
+         export_button.clicked.connect(diagnostics.export_logs)
+@@ -192,6 +210,7 @@
+         layout.addSpacing(4)
+         layout.addWidget(Label(_t("StartTab", "Choose Interaction"), "section"))
+         layout.addWidget(self.interaction_group)
++        layout.addWidget(self.inactive_notification_button, 0, Qt.AlignmentFlag.AlignLeft)
+         layout.addSpacing(4)
+         layout.addLayout(boxes_row)
+         layout.addLayout(tools)
+@@ -225,7 +244,8 @@
          from ok import og
          device_manager = og.device_manager
          device = device_manager.get_preferred_device()
 -        editable = og.executor.paused
++        self.inactive_notification_button.setEnabled(bool(inactive_notification_hwnd(device_manager)))
 +        editable = og.executor.paused and og.executor.current_task is None
          for widget in (self.window_combo, self.capture_group, self.interaction_group):
              widget.setEnabled(editable)
          if device is None:
-@@ -272,6 +275,7 @@
+@@ -272,7 +292,25 @@
          from ok import og
          if index < len(self._interaction_names) and self._interaction_names[index]:
              og.device_manager.set_interaction(self._interaction_names[index])
 +            self._refresh_device_state()
          self.changed.emit()
++
++    def _send_inactive_notification(self) -> None:
++        from ok import og
++        from ok.device.interaction_methods.post_message_test import Win32MessageBackend
++        from ok.ui.qt.util.Alert import alert_error
++        try:
++            hwnd = inactive_notification_hwnd(og.device_manager)
++            if not hwnd:
++                self.inactive_notification_button.setEnabled(False)
++                alert_error('当前没有已连接的 Windows 游戏窗口')
++                return
++            # 每次点击独立发送一次；不经过任务队列、暂停、持有释放或准备状态。
++            Win32MessageBackend().send_inactive_notification(hwnd)
++            logger.info(f'已向当前游戏投递一次未激活通知，HWND={hwnd}')
++        except Exception as error:
++            logger.error('未激活通知投递失败', error)
++            alert_error(f'未激活通知投递失败：{error}')
  
      def _view_log(self) -> None:
+         from ok.ui.qt.Communicate import communicate

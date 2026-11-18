@@ -223,6 +223,47 @@ class TestWin32MessageBackend(unittest.TestCase):
                     self.assertEqual(self.native.identity(self.hwnd), expected)
                 self.assertEqual(get_ids.call_count, 2)
 
+    def test_manual_inactive_notification_posts_once_without_changing_running_input(self):
+        request = StartRequest('受控运行')
+        self.backend.prepare_start(request)
+        self.backend.send_key_down('w')
+        held = dict(self.backend._held)
+        prepared = self.backend._prepared
+        self.drain_messages()
+        self.messages.clear()
+        with patch.object(self.native, 'post_message', wraps=self.native.post_message) as post:
+            self.native.send_inactive_notification(self.hwnd)
+            post.assert_called_once_with(self.hwnd, WM_ACTIVATE, 0, 0)
+        self.drain_messages()
+        self.assertEqual(self.messages, [(self.hwnd, WM_ACTIVATE, 0, 0)])
+        self.assertEqual(self.backend._held, held)
+        self.assertEqual(self.backend._prepared, prepared)
+        self.assertIs(self.backend._active_request, request)
+        self.assertFalse(request.cancelled)
+        self.backend.send_key('esc')
+        self.drain_messages()
+        self.assertEqual([event for event in self.messages if event[1] == WM_ACTIVATE],
+                         [(self.hwnd, WM_ACTIVATE, 0, 0)])
+
+    def test_manual_inactive_notification_rejects_invalid_identity_and_never_retries(self):
+        with patch.object(self.native, 'post_message', wraps=self.native.post_message) as post:
+            with self.assertRaises(ForegroundInputError):
+                self.native.send_inactive_notification(0)
+            post.assert_not_called()
+        identity = self.native.identity(self.hwnd)
+        with patch.object(self.native, 'identity', side_effect=(identity, replace(identity, created_at=1))), \
+                patch.object(self.native, 'post_message') as post:
+            with self.assertRaises(ForegroundInputError):
+                self.native.send_inactive_notification(self.hwnd)
+            post.assert_not_called()
+        for failure in (False, OSError('受控投递失败')):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(self.native, 'post_message', side_effect=[failure]) as post:
+                self.native.last_error = 5
+                with self.assertRaises(ForegroundInputError):
+                    self.native.send_inactive_notification(self.hwnd)
+                post.assert_called_once_with(self.hwnd, WM_ACTIVATE, 0, 0)
+
     def test_identity_rejects_changed_thread_process_and_disappeared_window_and_closes_process(self):
         thread_id, process_id = win32process.GetWindowThreadProcessId(self.hwnd)
         for second in ([thread_id + 1, process_id], [thread_id, process_id + 1], [0, 0]):

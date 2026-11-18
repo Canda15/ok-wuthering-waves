@@ -193,7 +193,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/post_message_test.py.patch",
       "before_sha256": null,
-      "after_sha256": "b7c96bf698fae16372bea50c208978d6edcfc13a9a2b591d56f58f3899476cb0"
+      "after_sha256": "cdeb944562380563af9f5febe5a57150ef58ce70ee5177598bf8dda6470954df"
     },
     {
       "path": "device/interaction_methods/pydirect.py",
@@ -401,7 +401,7 @@
       "format": "unified_diff",
       "payload": "patches/ui/qt/shell/connection.py.patch",
       "before_sha256": "47deae2fe5809cf96c5a134709176821ee30db98640dababa8a93144496d7708",
-      "after_sha256": "393dcf3d8449a7ad7ee3a29b8968994a89c2d19687b3303ff2ef739b0a5bcf4a"
+      "after_sha256": "0672a3519173d55b91b776acc125a2a9eb4d846a5c43198bbfa3eec2f6011847"
     },
     {
       "path": "ui/qt/shell/diagnostics.py",

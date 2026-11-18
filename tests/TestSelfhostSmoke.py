@@ -782,6 +782,82 @@ function gh {
                     kept_task, ['src.task.MouseResetTask', 'MouseResetTask'],
                 ])
 
+    def test_connection_inactive_notification_button_is_available_while_running(self):
+        from PySide6.QtWidgets import QWidget
+        from ok import og
+        from ok.core.start_request import StartRequest
+        from ok.ui.qt.shell.connection import ConnectionPopover
+        device = {'device': 'windows', 'connected': True}
+        manager = SimpleNamespace(
+            get_preferred_device=lambda: device,
+            hwnd_window=SimpleNamespace(foreground_target=SimpleNamespace(hwnd=10)),
+            config={'interaction': 'nono'}, available_capture_methods=lambda device: ['WGC'],
+            get_preferred_capture=lambda: 'WGC',
+            available_interaction_methods=lambda device: ['nono', 'post_message_test'])
+        request = StartRequest('运行中的原请求')
+        task = SimpleNamespace(running=True, request=request)
+        executor = SimpleNamespace(paused=False, current_task=task,
+                                   pause=Mock(), stop=Mock(), release_inputs=Mock())
+        parent = QWidget()
+        self.addCleanup(parent.close)
+        with patch.object(og, 'device_manager', manager), patch.object(og, 'executor', executor), \
+                patch('ok.device.interaction_methods.post_message_test.Win32MessageBackend') as backend:
+            popover = ConnectionPopover(parent)
+            for mode in ('nono', 'post_message_test'):
+                manager.config['interaction'] = mode
+                popover._refresh_device_state()
+                self.assertTrue(popover.inactive_notification_button.isEnabled())
+                popover.inactive_notification_button.click()
+            self.assertEqual(backend.return_value.send_inactive_notification.call_args_list,
+                             [unittest.mock.call(10)] * 2)
+        self.assertIs(executor.current_task, task)
+        self.assertFalse(executor.paused)
+        self.assertFalse(request.cancelled)
+        for action in (executor.pause, executor.stop, executor.release_inputs):
+            action.assert_not_called()
+
+    def test_connection_inactive_notification_button_rejects_unavailable_targets_and_reports_failure(self):
+        from PySide6.QtWidgets import QWidget
+        from ok import og
+        from ok.device.interaction_methods.foreground_input import ForegroundInputError
+        from ok.ui.qt.shell.connection import ConnectionPopover
+        device = {'device': 'windows', 'connected': True}
+        manager = SimpleNamespace(
+            get_preferred_device=Mock(return_value=device),
+            hwnd_window=SimpleNamespace(foreground_target=SimpleNamespace(hwnd=10)),
+            config={'interaction': 'nono'}, available_capture_methods=lambda device: ['WGC'],
+            get_preferred_capture=lambda: 'WGC',
+            available_interaction_methods=lambda device: ['nono', 'post_message_test'])
+        executor = SimpleNamespace(paused=False, current_task=object())
+        parent = QWidget()
+        self.addCleanup(parent.close)
+        with patch.object(og, 'device_manager', manager), patch.object(og, 'executor', executor), \
+                patch('ok.device.interaction_methods.post_message_test.Win32MessageBackend') as backend, \
+                patch('ok.ui.qt.util.Alert.alert_error') as alert:
+            popover = ConnectionPopover(parent)
+            for selected, hwnd in ((None, 10), ({'device': 'windows', 'connected': False}, 10),
+                                   ({'device': 'browser', 'connected': True}, 10), (device, 0)):
+                manager.get_preferred_device.return_value = selected
+                manager.hwnd_window.foreground_target.hwnd = hwnd
+                popover._refresh_device_state()
+                self.assertFalse(popover.inactive_notification_button.isEnabled())
+                popover.inactive_notification_button.click()
+            backend.assert_not_called()
+            manager.get_preferred_device.return_value = device
+            manager.hwnd_window.foreground_target.hwnd = 10
+            popover._refresh_device_state()
+            device['connected'] = False
+            popover.inactive_notification_button.click()
+            backend.assert_not_called()
+            alert.assert_called_once()
+            device['connected'] = True
+            popover._refresh_device_state()
+            alert.reset_mock()
+            backend.return_value.send_inactive_notification.side_effect = ForegroundInputError('受控投递失败')
+            popover.inactive_notification_button.click()
+            backend.return_value.send_inactive_notification.assert_called_once_with(10)
+            alert.assert_called_once()
+
     def test_foreground_sources_remain_inline_and_are_deployed(self):
         """部署白名单或导入来源漂移会让已通过的前台实现在用户包中消失。"""
         import ok
