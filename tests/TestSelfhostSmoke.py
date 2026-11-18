@@ -355,7 +355,6 @@ class TestSelfhostSmoke(unittest.TestCase):
         fixture.git('checkout', 'master')
         ours = dict(base_files)
         ours['config.py'] = base_config.replace("'PostMessage'", "['nono', 'post_message_test']")
-        ours['config.py'] = ours['config.py'].replace("        ['src.task.MouseResetTask', 'MouseResetTask'],\n", '')
         ours['config.py'] = ours['config.py'].replace("    'update_only_game_exit': True,\n", '')
         if variant == 'config_field':
             ours['config.py'] = ours['config.py'].replace('官方标题', '本地修改的标题')
@@ -384,7 +383,9 @@ class TestSelfhostSmoke(unittest.TestCase):
         config = ast.literal_eval(ast.parse((fixture.checkout / 'config.py').read_bytes()).body[0].value)
         self.assertEqual(config['windows'], {'标题': '中文偏移', 'interaction': ['nono', 'post_message_test']})
         self.assertEqual(config['gui_title'], '上游新标题')
-        self.assertEqual(config['trigger_tasks'], [['src.task.KeepTask', 'KeepTask']])
+        self.assertEqual(config['trigger_tasks'], [
+            ['src.task.MouseResetTask', 'MouseResetTask'], ['src.task.KeepTask', 'KeepTask'],
+        ])
         self.assertNotIn('update_only_game_exit', config)
         text = (fixture.checkout / 'pyproject.toml').read_text(encoding='utf-8')
         project = tomllib.loads(text)['project']
@@ -736,8 +737,8 @@ function gh {
         self.assertEqual(framework_patches.missing(repo_root / 'ok'), [],
                          'ok/ 里的品牌补丁没生效,跑一次 python scripts/sync_ok.py')
 
-    def test_default_input_policy_and_mouse_reset_removal(self):
-        """前台默认与显式后台测试均可选，且同步不能恢复游戏自动启动。"""
+    def test_default_input_policy_and_background_mouse_reset_registration(self):
+        """前台默认与后台测试均可选，鼠标保护注册不再被同步策略删除。"""
         from config import config
         from ok.device.DeviceManager import DeviceManager
         from ok.ui.qt.shell.connection import interaction_options
@@ -755,9 +756,9 @@ function gh {
                                    '使用真实键盘和鼠标；失焦释放并等待，回到游戏后自动继续', None),
                                    ('后台测试（启动时单次激活）',
                                     '每次开始或恢复时仅激活一次；运行中不补发，最小化时等待恢复', None)])
-        self.assertNotIn(('src.task.MouseResetTask', 'MouseResetTask'),
-                         [tuple(task) for task in config['trigger_tasks']])
-        self.assertFalse((repo_root / 'src' / 'task' / 'MouseResetTask.py').exists())
+        self.assertIn(('src.task.MouseResetTask', 'MouseResetTask'),
+                      [tuple(task) for task in config['trigger_tasks']])
+        self.assertTrue((repo_root / 'src' / 'task' / 'MouseResetTask.py').exists())
 
     def test_upstream_input_overwrite_preserves_foreground_policy_and_other_settings(self):
         """上游覆盖保留可选模式和捕获参数，但绝不恢复自动启动入口。"""
@@ -777,7 +778,9 @@ function gh {
                     'interaction': ['nono', 'post_message_test'], 'exe': 'fixture.exe', 'capture_method': ['WGC'],
                     'start_exe': False,
                 })
-                self.assertEqual(config['trigger_tasks'], [kept_task])
+                self.assertEqual(config['trigger_tasks'], [
+                    kept_task, ['src.task.MouseResetTask', 'MouseResetTask'],
+                ])
 
     def test_foreground_sources_remain_inline_and_are_deployed(self):
         """部署白名单或导入来源漂移会让已通过的前台实现在用户包中消失。"""

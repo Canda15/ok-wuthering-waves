@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/device/interaction_methods/post_message_test.py
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,787 @@
 +"""后台测试输入：普通窗口消息不激活，每个外部开始请求仅激活主窗一次。"""
 +
 +import ctypes
@@ -21,7 +21,7 @@
 +
 +from ok.device.interaction_methods.base import BaseInteraction
 +from ok.device.interaction_methods.foreground_input import (
-+    ForegroundInputError, ForegroundInputInterrupted, KEY_ALIASES,
++    ForegroundInputError, ForegroundInputInterrupted, KEY_ALIASES, Win32InputBackend,
 +)
 +from ok.device.interaction_methods.keys import MOUSE_BUTTON_MAP, vk_key_dict
 +from ok.task.exceptions import TaskDisabledException
@@ -172,7 +172,8 @@
 +class PostMessageTestInteraction(BaseInteraction):
 +    """保持请求身份与按下台账；首帧、任务排队和暂停恢复由执行器控制。"""
 +
-+    def __init__(self, capture, hwnd_window, *, native=None, clock=time.monotonic, wait=time.sleep):
++    def __init__(self, capture, hwnd_window, *, native=None, cursor_native=None,
++                 clock=time.monotonic, wait=time.sleep):
 +        super().__init__(capture)
 +        self.hwnd_window = hwnd_window
 +        self.native = native if native is not None else Win32MessageBackend()
@@ -187,6 +188,82 @@
 +        self._logical_holds = {}
 +        self._pointer = None
 +        self._cleanup_failed = False
++        self._cursor_native = cursor_native
++        self._mouse_reset_lock = threading.RLock()
++        self._mouse_reset_sample = None
++
++    def clear_mouse_reset_state(self):
++        """关闭保护或切换目标时注销采样，不能把旧位置写回新的窗口状态。"""
++        with self._mouse_reset_lock:
++            self._mouse_reset_sample = None
++
++    def _mouse_reset_valid(self, is_valid):
++        if self.capture is None or is_valid is not None and not is_valid():
++            return False
++        manager = getattr(self.hwnd_window, 'device_manager', None)
++        if manager is not None and manager.interaction is not self:
++            return False
++        return not any(getattr(self.hwnd_window, name).is_set()
++                       for name in ('app_exit_event', 'stop_event')
++                       if getattr(self.hwnd_window, name, None) is not None)
++
++    def _mouse_reset_target(self, cursor):
++        main = self._main_identity()
++        if not self._available(main) or not self.native.is_enabled(main.hwnd):
++            return None
++        foreground = self._identity(cursor.foreground_window())
++        if foreground is None or self._related(foreground, main):
++            return None
++        return main, self.native.client_bounds(main.hwnd), id(self.capture)
++
++    def poll_mouse_reset(self, is_valid=None):
++        """仅纠正后台游戏异常跳回中心；返回真表示本轮实际恢复了光标。"""
++        with self._mouse_reset_lock:
++            # 长按和拖拽优先完成自己的清理，光标观察不得等待整段手势的锁。
++            if not self._lock.acquire(blocking=False):
++                return False
++            try:
++                if not self._mouse_reset_valid(is_valid):
++                    self.clear_mouse_reset_state()
++                    return False
++                if self._cursor_native is None:
++                    # 只复用受检光标边界，不创建前台输入核心、观察线程或键鼠会话。
++                    self._cursor_native = Win32InputBackend()
++                cursor = self._cursor_native
++                target = self._mouse_reset_target(cursor)
++                if target is None:
++                    self.clear_mouse_reset_state()
++                    return False
++                current = cursor.cursor_pos()
++                now, previous = self.clock(), self._mouse_reset_sample
++                self._mouse_reset_sample = (target, current, now)
++                # 覆盖恢复后主动退让的 1 秒；更长的调度停顿则重建基线，避免撤回用户正常移动。
++                if previous is None or previous[0] != target or now - previous[2] > 1.5:
++                    return False
++                left, top, right, bottom = target[1]
++                center = ((left + right) / 2, (top + bottom) / 2)
++                # 沿用原版的明确症状：跃迁超过 200 像素，并落在中心 50 像素内。
++                if math.dist(current, previous[1]) <= 200 or math.dist(current, center) >= 50:
++                    return False
++                # 目标查询也可能与用户移动交错，光标比较必须紧邻实际写回。
++                if (self._mouse_reset_target(cursor) != target or cursor.cursor_pos() != current
++                        or not self._mouse_reset_valid(is_valid)):
++                    self.clear_mouse_reset_state()
++                    return False
++                cursor.set_cursor_pos(*previous[1])
++                # SetCursorPos 成功仍可能被 ClipCursor 裁剪或新输入覆盖；只读确认，不能补写争抢。
++                if cursor.cursor_pos() != previous[1]:
++                    raise ForegroundInputError('无法确认后台鼠标恢复后的实际位置')
++                self._mouse_reset_sample = (target, previous[1], now)
++                logger.info('已恢复后台游戏异常移动的光标')
++                return True
++            except Exception as error:
++                self.clear_mouse_reset_state()
++                if isinstance(error, ForegroundInputError):
++                    raise
++                raise ForegroundInputError('后台鼠标保护查询或恢复失败') from error
++            finally:
++                self._lock.release()
 +
 +    def _identity(self, hwnd):
 +        try:
@@ -263,6 +340,7 @@
 +                return False
 +            if force or self.needs_refresh:
 +                self.release_all()
++                self.clear_mouse_reset_state()
 +                self._expected_generation = self.target_generation
 +                self._pointer = None
 +                self._interrupted = False
@@ -270,6 +348,7 @@
 +
 +    def prepare_start(self, request, cancel_check=None):
 +        with self._lock:
++            self.clear_mouse_reset_state()
 +            self._cancel(cancel_check, preparing=True)
 +            request.check_cancelled()
 +            self.release_all()
@@ -705,4 +784,7 @@
 +        pass
 +
 +    def on_destroy(self):
-+        self.release_all()
++        try:
++            self.release_all()
++        finally:
++            self.clear_mouse_reset_state()

@@ -123,6 +123,29 @@ class FakeWindow:
         pass
 
 
+class FakeCursor:
+    def __init__(self):
+        self.point = (-600, 350)
+        self.foreground = 999
+        self.moves = []
+        self.after_read = None
+        self.reads = 0
+
+    def cursor_pos(self):
+        self.reads += 1
+        point = self.point
+        if self.after_read:
+            self.after_read()
+        return point
+
+    def foreground_window(self):
+        return self.foreground
+
+    def set_cursor_pos(self, x, y):
+        self.point = (x, y)
+        self.moves.append(self.point)
+
+
 def unpack_point(value):
     return tuple(part if part < 0x8000 else part - 0x10000 for part in (value & 0xFFFF, value >> 16 & 0xFFFF))
 
@@ -325,6 +348,174 @@ class TestBackgroundInput(unittest.TestCase):
         self.native.bounds[hwnd] = (-250, 80, -50, 280)
         self.native.parents[hwnd] = parent
         self.window.order.insert(0, hwnd)
+
+    def mouse_protection(self):
+        self.native.identities.setdefault(999, WindowIdentity(999, 9, 900, 999, 'Desktop'))
+        cursor = FakeCursor()
+        backend = PostMessageTestInteraction(self.capture, self.window, native=self.native,
+                                            cursor_native=cursor, clock=self.clock, wait=self.clock.wait)
+        self.addCleanup(backend.on_destroy)
+        return backend, cursor
+
+    def test_mouse_reset_restores_only_large_jumps_to_background_center(self):
+        backend, cursor = self.mouse_protection()
+        self.assertFalse(backend.poll_mouse_reset())
+        cursor.point = (-580, 360)
+        self.assertFalse(backend.poll_mouse_reset())
+        cursor.point = (205, 350)
+        self.assertTrue(backend.poll_mouse_reset())
+        self.assertEqual(cursor.moves, [(-580, 360)])
+        self.clock.value += 1
+        cursor.point = (200, 350)
+        self.assertTrue(backend.poll_mouse_reset(), '主动退让后仍须纠正游戏连续跳回中心')
+        self.assertEqual(cursor.moves, [(-580, 360)] * 2)
+        self.assertFalse(self.native.attempts, '光标恢复不得增加窗口激活或键鼠消息')
+
+    def test_mouse_reset_ignores_foreground_game_and_related_login_window(self):
+        self.add_window(parent=0, class_name='Login')
+        for foreground in (10, 11):
+            with self.subTest(foreground=foreground):
+                backend, cursor = self.mouse_protection()
+                backend.poll_mouse_reset()
+                cursor.foreground = foreground
+                cursor.point = (200, 350)
+                self.assertFalse(backend.poll_mouse_reset())
+                cursor.foreground = 999
+                self.assertFalse(backend.poll_mouse_reset(), '返回后台后不能恢复前台期间的旧位置')
+                self.assertFalse(cursor.moves)
+
+    def test_mouse_reset_drops_baseline_for_target_geometry_identity_and_capture_changes(self):
+        for change in ('geometry', 'identity', 'capture', 'hidden'):
+            with self.subTest(change=change):
+                self.setUp()
+                backend, cursor = self.mouse_protection()
+                backend.poll_mouse_reset()
+                cursor.point = (200, 350)
+                if change == 'geometry':
+                    self.native.bounds[10] = (-290, 50, 710, 650)
+                elif change == 'identity':
+                    self.native.identities[10] = replace(self.native.identities[10], created_at=200)
+                elif change == 'capture':
+                    backend.capture = SimpleNamespace()
+                else:
+                    self.native.hidden.add(10)
+                self.assertFalse(backend.poll_mouse_reset())
+                self.assertFalse(cursor.moves)
+
+    def test_mouse_reset_does_not_overwrite_a_new_user_move_or_invalid_task(self):
+        backend, cursor = self.mouse_protection()
+        backend.poll_mouse_reset()
+        cursor.point = (200, 350)
+        cursor.after_read = lambda: setattr(cursor, 'point', (900, 300))
+        self.assertFalse(backend.poll_mouse_reset())
+        self.assertFalse(cursor.moves)
+        cursor.after_read = None
+        backend.poll_mouse_reset()
+        cursor.point = (200, 350)
+        self.assertFalse(backend.poll_mouse_reset(lambda: False))
+        self.assertFalse(cursor.moves)
+        backend.poll_mouse_reset()
+        cursor.point = (-600, 350)
+        backend.poll_mouse_reset()
+        active = {'enabled': True}
+        cursor.point = (200, 350)
+        cursor.after_read = lambda: active.update(enabled=False)
+        self.assertFalse(backend.poll_mouse_reset(lambda: active['enabled']))
+        self.assertFalse(cursor.moves, '采样期间关闭或切换模式也不能写回')
+
+    def test_mouse_reset_sampling_does_not_wait_for_a_held_gesture(self):
+        backend, cursor = self.mouse_protection()
+        completed = threading.Event()
+        results = []
+
+        def observe():
+            results.append(backend.poll_mouse_reset())
+            completed.set()
+
+        observer = threading.Thread(target=observe)
+        try:
+            with backend._lock:
+                observer.start()
+                self.assertTrue(completed.wait(1), '光标轮询不能等到长手势结束才能返回')
+        finally:
+            observer.join(1)
+        self.assertEqual(results, [False])
+        self.assertEqual(cursor.reads, 0)
+        self.assertFalse(cursor.moves)
+
+    def test_mouse_reset_rechecks_foreground_before_writing(self):
+        backend, cursor = self.mouse_protection()
+        backend.poll_mouse_reset()
+        cursor.point = (200, 350)
+        cursor.after_read = lambda: setattr(cursor, 'foreground', 10)
+        self.assertFalse(backend.poll_mouse_reset())
+        self.assertFalse(cursor.moves)
+
+    def test_mouse_reset_rechecks_user_position_after_target_queries(self):
+        backend, cursor = self.mouse_protection()
+        backend.poll_mouse_reset()
+        cursor.point = (200, 350)
+        identity = self.native.identity
+        foreground_queries = 0
+
+        def move_during_target_check(hwnd):
+            nonlocal foreground_queries
+            if hwnd == cursor.foreground:
+                foreground_queries += 1
+                if foreground_queries == 2:
+                    cursor.point = (900, 300)
+            return identity(hwnd)
+
+        with patch.object(self.native, 'identity', side_effect=move_during_target_check):
+            self.assertFalse(backend.poll_mouse_reset(), '目标复查期间的新用户移动也不得被覆盖')
+        self.assertEqual(cursor.point, (900, 300))
+        self.assertFalse(cursor.moves)
+        self.assertFalse(backend.poll_mouse_reset(), '放弃恢复后必须重建基线')
+
+    def test_mouse_reset_confirms_actual_position_without_repeating_a_write(self):
+        # Windows 可接受 SetCursorPos 后裁剪坐标，也可能立刻收到新的用户输入。
+        for observed in ((200, 350), (900, 300)):
+            with self.subTest(observed=observed):
+                backend, cursor = self.mouse_protection()
+                backend.poll_mouse_reset()
+                cursor.point = (200, 350)
+                move = cursor.set_cursor_pos
+
+                def accept_at_different_position(x, y):
+                    move(x, y)
+                    cursor.point = observed
+
+                with patch.object(cursor, 'set_cursor_pos', side_effect=accept_at_different_position):
+                    with self.assertRaisesRegex(ForegroundInputError, '确认'):
+                        backend.poll_mouse_reset()
+                    self.assertFalse(backend.poll_mouse_reset(), '结果未知时不能再次写回旧位置')
+                self.assertEqual(cursor.moves, [(-600, 350)])
+                self.assertEqual(cursor.point, observed)
+                cursor.point = (-600, 350)
+                backend.poll_mouse_reset()
+                cursor.point = (200, 350)
+                self.assertTrue(backend.poll_mouse_reset(), '新基线仍可处理后续独立异常')
+                self.assertEqual(cursor.moves, [(-600, 350)] * 2)
+
+    def test_mouse_reset_clear_failure_and_stale_sampling_do_not_reuse_old_position(self):
+        backend, cursor = self.mouse_protection()
+        backend.poll_mouse_reset()
+        backend.clear_mouse_reset_state()
+        cursor.point = (200, 350)
+        self.assertFalse(backend.poll_mouse_reset())
+        cursor.point = (-600, 350)
+        backend.poll_mouse_reset()
+        self.clock.value += 2
+        cursor.point = (200, 350)
+        self.assertFalse(backend.poll_mouse_reset())
+        cursor.point = (-600, 350)
+        backend.poll_mouse_reset()
+        cursor.point = (200, 350)
+        with patch.object(cursor, 'set_cursor_pos', side_effect=ForegroundInputError('受控光标失败')):
+            with self.assertRaises(ForegroundInputError):
+                backend.poll_mouse_reset()
+        self.assertFalse(backend.poll_mouse_reset(), '原生失败后必须重新采样而非反复写旧位置')
+        self.assertFalse(cursor.moves)
 
     def test_begin_pause_resume_and_all_inputs_have_exact_activation_counts(self):
         request = self.prepare()
@@ -667,6 +858,113 @@ class TestBackgroundInput(unittest.TestCase):
         self.assertFalse(gesture.is_alive())
         self.assertFalse(preparation.is_alive())
         self.assertEqual([event[1] for event in self.native.messages], [WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_ACTIVATE])
+
+
+class TestBackgroundMouseResetTask(unittest.TestCase):
+    def setUp(self):
+        from src.task.MouseResetTask import MouseResetTask
+        self.native = FakeMessages()
+        self.native.identities[999] = WindowIdentity(999, 9, 900, 999, 'Desktop')
+        self.window = FakeWindow(self.native)
+        self.cursor = FakeCursor()
+        self.backend = PostMessageTestInteraction(SimpleNamespace(), self.window,
+                                                  native=self.native, cursor_native=self.cursor)
+        self.handlers = []
+
+        def new_handler(*args, **kwargs):
+            handler = SimpleNamespace(pending=[], stopped=False)
+
+            def post(callback, delay=0, remove_existing=False):
+                if handler.stopped:
+                    return
+                if remove_existing:
+                    handler.pending[:] = [item for item in handler.pending if item[0] != callback]
+                handler.pending.append((callback, delay))
+                return True
+
+            def stop():
+                handler.stopped = True
+                handler.pending.clear()
+
+            handler.post, handler.stop = post, stop
+            self.handlers.append(handler)
+            return handler
+
+        handler_patch = patch('ok.task.task.Handler', side_effect=new_handler)
+        handler_patch.start()
+        self.addCleanup(handler_patch.stop)
+        executor = SimpleNamespace(
+            interaction=self.backend, exit_event=threading.Event(), exclusive_owner=None,
+            current_task=None, _wake_executor=lambda: None, enqueue_onetime_task=lambda task: None,
+            remove_onetime_task=lambda task: None, scene=None)
+        self.task = MouseResetTask(executor, SimpleNamespace())
+        self.task.config = {'_enabled': True}
+        self.task._enabled = True
+        self.addCleanup(self.task.on_destroy)
+        self.addCleanup(self.backend.on_destroy)
+
+    def tick(self):
+        callback, _delay = self.handlers[-1].pending.pop(0)
+        callback()
+
+    def test_task_polls_only_background_and_clears_state_when_mode_changes(self):
+        self.task.executor.interaction = SimpleNamespace()
+        self.task.run()
+        self.assertFalse(self.handlers)
+        self.assertEqual(self.cursor.reads, 0)
+        self.task.executor.interaction = self.backend
+        self.task.run()
+        self.task.run()
+        self.assertEqual(len(self.handlers[-1].pending), 1)
+        self.tick()
+        self.cursor.point = (200, 350)
+        self.task.executor.interaction = SimpleNamespace()
+        self.tick()
+        self.assertTrue(self.handlers[-1].stopped)
+        self.assertFalse(self.cursor.moves)
+        self.task.executor.interaction = self.backend
+        self.task.run()
+        self.tick()
+        self.assertFalse(self.cursor.moves, '切回后台后先重建基线')
+
+    def test_disable_enable_and_old_callbacks_preserve_a_single_fresh_loop(self):
+        self.task.run()
+        self.tick()
+        old_handler = self.handlers[-1]
+        old_callback = old_handler.pending[0][0]
+        self.cursor.point = (200, 350)
+        self.task.disable()
+        self.assertFalse(self.task.config['_enabled'])
+        self.assertTrue(old_handler.stopped)
+        old_callback()
+        self.assertFalse(self.cursor.moves)
+        self.task.enable()
+        self.assertTrue(self.task.config['_enabled'])
+        self.assertIsNot(self.handlers[-1], old_handler)
+        old_callback()
+        self.assertEqual(len(self.handlers[-1].pending), 1)
+        self.tick()
+        self.assertFalse(self.cursor.moves)
+        self.cursor.point = (-600, 350)
+        self.tick()
+        self.cursor.point = (200, 350)
+        self.tick()
+        self.assertEqual(self.cursor.moves, [(-600, 350)])
+        self.assertEqual(len(self.handlers[-1].pending), 1)
+        self.task.on_destroy()
+        old_callback()
+        self.assertTrue(self.handlers[-1].stopped)
+        self.assertEqual(self.cursor.moves, [(-600, 350)])
+
+    def test_native_failure_is_reported_and_polling_recovers(self):
+        self.task.run()
+        with patch.object(self.cursor, 'cursor_pos', side_effect=ForegroundInputError('受控采样失败')):
+            self.tick()
+        self.assertEqual(self.handlers[-1].pending[0][1], 1)
+        self.tick()
+        self.cursor.point = (200, 350)
+        self.tick()
+        self.assertEqual(self.cursor.moves, [(-600, 350)])
 
 
 if __name__ == '__main__':

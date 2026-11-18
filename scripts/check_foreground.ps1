@@ -61,9 +61,16 @@ $testGroups = if ($Quick) {
             )
         },
         @{
+            Name = 'tests/TestBackgroundInput.py'
+            Targets = @(
+                'tests.TestBackgroundInput.TestBackgroundInput',
+                'tests.TestBackgroundInput.TestBackgroundMouseResetTask'
+            )
+        },
+        @{
             Name = 'tests/TestSelfhostSmoke.py'
             Targets = @(
-                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_default_input_policy_and_mouse_reset_removal',
+                'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_default_input_policy_and_background_mouse_reset_registration',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_xmod_versions_sort_as_branded_releases_in_both_python_consumers',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_main_window_still_consumes_custom_tabs',
                 'tests.TestSelfhostSmoke.TestSelfhostSmoke.test_registered_tabs_instantiate_against_current_framework',

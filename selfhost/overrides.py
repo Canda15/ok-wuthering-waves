@@ -61,11 +61,6 @@ def apply_input_policy(config):
         windows['start_exe'] = False
         windows.pop('launch_arguments', None)
         windows.pop('start_method', None)
-    if 'trigger_tasks' in config:
-        config['trigger_tasks'] = [
-            task for task in config['trigger_tasks']
-            if tuple(task) != ('src.task.MouseResetTask', 'MouseResetTask')
-        ]
 
 
 def apply_branding(config):
