@@ -41,20 +41,24 @@ def make_rechallenge_task(rounds=2, page='arena'):
     task.page = page
     task.now = 0
     task._foreground_epoch = 0
+    task._executor = Mock()
+    task._executor.method.width = 1920
+    task._executor.method.height = 1080
     task.actions = []
     task.after_restart = 'arena'
     task._in_realm = True
     task.has_new_battle = False
     task.controls = {
-        'restart': Box(1010, 868, 250, 72, name='重新挑战'),
-        'exit': Box(1760, 868, 262, 72, name='确定退出'),
-        'cancel': Box(680, 868, 220, 72, name='取消'),
-        'confirm': Box(1580, 868, 240, 72, name='确定'),
+        'left_template': Box(454, 623, 42, 104, name='claim_cancel_button_hcenter_vcenter'),
+        'restart': Box(605, 663, 78, 24, name='重新挑战'),
+        'exit': Box(1210, 663, 90, 24, name='确定退出'),
+        'cancel': Box(620, 663, 50, 24, name='取消'),
+        'confirm': Box(1230, 663, 50, 24, name='确定'),
         'prompt': Box(860, 560, 700, 80, name='是否重新挑战？'),
         'explanation': Box(600, 540, 1300, 80, name='选择重新挑战将重开当前队伍的挑战'),
     }
     task.visible_controls = {
-        'menu': ('restart', 'exit', 'cancel'),
+        'menu': ('restart', 'exit'),
         'confirm': ('prompt', 'confirm', 'cancel'),
         'exit_only': ('exit', 'cancel'),
         'explanation': ('explanation', 'exit', 'cancel'),
@@ -68,6 +72,8 @@ def make_rechallenge_task(rounds=2, page='arena'):
         if isinstance(names, str):
             names = [names]
         if task.page in task.visible_controls:
+            if 'claim_cancel_button_hcenter_vcenter' in names:
+                return task.controls['left_template']
             if any(name.startswith('confirm_btn') for name in names):
                 return task.controls['confirm' if task.page == 'confirm' else 'exit']
             if any('cancel_button' in name for name in names):
@@ -78,10 +84,12 @@ def make_rechallenge_task(rounds=2, page='arena'):
         task.actions.append(('key', key))
         if key == 'esc':
             task.page = 'arena' if task.page == 'menu' else 'menu'
+        task.sleep(kwargs.get('after_sleep', 0))
         return True
 
     def click(control, **kwargs):
-        key = next(key for key, value in task.controls.items() if value is control)
+        key = ('restart' if control.name == '重新挑战'
+               else next(key for key, value in task.controls.items() if value is control))
         task.actions.append(('click', key))
         if key == 'restart':
             task.page = task.after_restart
@@ -110,7 +118,8 @@ def make_rechallenge_task(rounds=2, page='arena'):
     task.ocr = Mock(side_effect=ocr)
     task.find_one = Mock(side_effect=find_one)
     task.send_key = Mock(side_effect=send_key)
-    task.click = Mock(side_effect=click)
+    task.click_box = Mock(side_effect=click)
+    task.click = Mock(side_effect=lambda control, **kw: task.click_box(control, **kw))
     task.combat_once.side_effect = combat_once
     task.in_realm.side_effect = lambda: task.page in ('arena', 'won')
     task.in_world = Mock(side_effect=lambda: task.page == 'world')
@@ -137,12 +146,119 @@ class TestFarmEchoPickup(unittest.TestCase):
         self.assertEqual(task.pick_echo.call_count, 2)
         self.assertEqual(task._farm_state['count'], 2)
 
+    def test_original_control_and_timing_reach_the_input_adapter(self):
+        task = make_rechallenge_task(page='won')
+        # 走真实 click_box → BaseWWTask.click → interaction；按钮文字既不是坐标来源，也不限 OCR 语言。
+        del task.click_box, task.click
+        task.ocr.side_effect = lambda: []
+        sent_at = []
+        observations = []
+        task.next_frame.side_effect = lambda: observations.append((task.page, task.now))
+
+        def delivered(*args, **kwargs):
+            sent_at.append(task.now)
+            task.page = 'arena'
+            task.has_new_battle = True
+
+        task.executor.interaction.click.side_effect = delivered
+        self.assertTrue(task._restart_echo_realm())
+        task.send_key.assert_called_once_with('esc', after_sleep=0.5)
+        first_menu_frame = next(at for page, at in observations if page == 'menu')
+        self.assertEqual(first_menu_frame, 0.5)
+        self.assertGreaterEqual(sent_at[0] - first_menu_frame, 1)
+        self.assertLess(sent_at[0] - first_menu_frame, 1.2)
+        task.executor.interaction.click.assert_called_once_with(
+            538, 675, move_back=False, name='重新挑战', move=True, down_time=0.2, key='left')
+
+    def test_new_dialog_still_vetoes_exit_cancel_or_restart_on_wrong_side(self):
+        for left, right in (('退出', '确认'), ('Cancel', 'Rechallenge'), ('未知用途', 'Confirm')):
+            with self.subTest(left=left, right=right):
+                task = make_rechallenge_task(page='won')
+                task.controls['restart'].name, task.controls['exit'].name = left, right
+                with self.assertRaises(ForegroundInputError):
+                    task._restart_echo_realm(time_out=3)
+                self.assertEqual(task.actions, [('key', 'esc')])
+
+    def test_missing_left_label_must_not_override_a_different_dialog_question(self):
+        for question, expected in (('确认离开', True), ('是否退出当前副本？', False),
+                                   ('是否使用结晶波片领取奖励？', False)):
+            with self.subTest(question=question):
+                task = make_rechallenge_task(page='won')
+                task.controls['prompt'] = Box(740, 490, 440, 56, name=question)
+                task.visible_controls['menu'] = ('prompt', 'confirm')
+                if expected:
+                    self.assertTrue(task._restart_echo_realm(time_out=3))
+                    self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart')])
+                else:
+                    with self.assertRaises(ForegroundInputError):
+                        task._restart_echo_realm(time_out=3)
+                    self.assertEqual(task.actions, [('key', 'esc')])
+
+    def test_matching_template_survives_pixel_jitter_and_clicks_the_latest_frame(self):
+        task = make_rechallenge_task(page='menu')
+        original = task.controls['left_template']
+        find_one = task.find_one.side_effect
+        observed = []
+
+        def jitter(names, **kwargs):
+            box = find_one(names, **kwargs)
+            if box is original:
+                offset = 1 if len(observed) % 2 else -1
+                box = box.copy(x_offset=offset, y_offset=offset)
+                observed.append((task.now, box))
+            return box
+
+        task.find_one.side_effect = jitter
+        self.assertTrue(task._restart_echo_realm(time_out=2))
+        sent_at, latest = observed[-1]
+        self.assertGreaterEqual(sent_at - observed[0][0], 1)
+        self.assertLess(sent_at - observed[0][0], 1.2)
+        task.click_box.assert_called_once()
+        self.assertEqual(task.click_box.call_args.args[0].center(), latest.center())
+
+    def test_template_must_settle_again_after_disappearing_moving_or_resuming(self):
+        for change in ('模板暂失', '按钮移动', '恢复新帧'):
+            with self.subTest(change=change):
+                task = make_rechallenge_task(page='menu')
+                find_one = task.find_one.side_effect
+                changed = False
+                first_new_frame = []
+                sent_at = []
+                click_box = task.click_box.side_effect
+
+                def observed(names, **kwargs):
+                    nonlocal changed
+                    if names == 'claim_cancel_button_hcenter_vcenter' and task.now >= 0.6:
+                        if not changed:
+                            changed = True
+                            if change == '模板暂失':
+                                return None
+                            if change == '按钮移动':
+                                task.controls['left_template'] = task.controls['left_template'].copy(x_offset=8)
+                            else:
+                                task._foreground_epoch += 1
+                                raise ForegroundInputInterrupted()
+                        if not first_new_frame:
+                            first_new_frame.append(task.now)
+                    return find_one(names, **kwargs)
+
+                def record_click(control, **kwargs):
+                    sent_at.append(task.now)
+                    self.assertEqual(control.x, task.controls['left_template'].x)
+                    return click_box(control, **kwargs)
+
+                task.find_one.side_effect = observed
+                task.click_box.side_effect = record_click
+                self.assertTrue(task._restart_echo_realm(time_out=3))
+                self.assertEqual(len(sent_at), 1)
+                self.assertGreaterEqual(sent_at[0] - first_new_frame[0], 1)
+
     def test_first_entry_and_exhausted_rounds_do_not_open_rechallenge(self):
         task = make_rechallenge_task(rounds=1)
         task.do_run()
         self.assertEqual(task.actions, [('fight', 'arena')])
         task.send_key.assert_not_called()
-        task.click.assert_not_called()
+        task.click_box.assert_not_called()
 
     def test_world_round_keeps_existing_treasure_restart_path(self):
         task = make_task()
@@ -176,13 +292,13 @@ class TestFarmEchoPickup(unittest.TestCase):
             with self.subTest(page=page):
                 task = make_rechallenge_task(page=page)
                 with self.assertRaises(ForegroundInputError):
-                    task._restart_echo_realm(time_out=0.3)
-                task.click.assert_not_called()
+                    task._restart_echo_realm(time_out=3)
+                task.click_box.assert_not_called()
                 task.send_key.assert_not_called()
                 task.screenshot.assert_called_once()
 
     def test_restart_label_is_exact_and_duplicate_targets_are_rejected(self):
-        for text in ('重新挑战', '重新挑戰', '再次挑战', 'Rechallenge', 'Restart Challenge'):
+        for text in ('重新挑战', '重新挑戰', '再次挑战', 'Rechallenge', 'Restart Challenge', '再挑戦', '재도전', 'Reintentar'):
             with self.subTest(text=text):
                 task = make_rechallenge_task(page='menu')
                 task.controls['restart'].name = text
@@ -190,17 +306,17 @@ class TestFarmEchoPickup(unittest.TestCase):
         task = make_rechallenge_task(page='menu')
         task.visible_controls['menu'] = ('restart', 'restart', 'exit', 'cancel')
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
-        task.click.assert_not_called()
+            task._restart_echo_realm(time_out=3)
+        task.click_box.assert_not_called()
 
     def test_foreground_change_during_recognition_discards_old_button(self):
         task = make_rechallenge_task(page='menu')
-        old = task.controls['restart']
+        old = task.controls['left_template']
         recognize = task.ocr.side_effect
 
         def interrupted_recognition(*args, **kwargs):
             result = recognize(*args, **kwargs)
-            task.controls['restart'] = Box(1110, 900, 250, 72, name='重新挑战')
+            task.controls['left_template'] = old.copy(x_offset=20)
             task._foreground_epoch += 1
             task.ocr.side_effect = recognize
             return result
@@ -208,7 +324,7 @@ class TestFarmEchoPickup(unittest.TestCase):
         task.ocr.side_effect = interrupted_recognition
         self.assertTrue(task._restart_echo_realm())
         task.wait_foreground_frame.assert_called_once()
-        self.assertIsNot(task.click.call_args.args[0], old)
+        self.assertEqual(task.click_box.call_args.args[0].x, old.x + 20)
 
     def test_foreground_after_restart_click_observes_result_without_replaying(self):
         for following in ('arena', 'confirm'):
@@ -216,14 +332,14 @@ class TestFarmEchoPickup(unittest.TestCase):
                 # 直接重开需有旧通关画面无血条、新战斗出现血条的正向对照。
                 task = make_rechallenge_task(page='won' if following == 'arena' else 'menu')
                 task.after_restart = following
-                click = task.click.side_effect
+                click = task.click_box.side_effect
 
                 def interrupted_click(control, **kwargs):
                     click(control, **kwargs)
-                    task.click.side_effect = click
+                    task.click_box.side_effect = click
                     raise ForegroundInputInterrupted()
 
-                task.click.side_effect = interrupted_click
+                task.click_box.side_effect = interrupted_click
                 self.assertTrue(task._restart_echo_realm())
                 self.assertEqual(task.actions.count(('click', 'restart')), 1)
                 task.wait_foreground_frame.assert_called_once()
@@ -237,7 +353,7 @@ class TestFarmEchoPickup(unittest.TestCase):
             raise ForegroundInputInterrupted('前台守卫在发送按键前中断')
 
         task.send_key.side_effect = interrupted_before_send
-        self.assertTrue(task._restart_echo_realm(time_out=0.3))
+        self.assertTrue(task._restart_echo_realm(time_out=3))
         self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart')])
         self.assertEqual(task.send_key.call_count, 2)
 
@@ -251,13 +367,13 @@ class TestFarmEchoPickup(unittest.TestCase):
             raise ForegroundInputInterrupted()
 
         task.send_key.side_effect = interrupted_after_send
-        self.assertTrue(task._restart_echo_realm(time_out=0.3))
+        self.assertTrue(task._restart_echo_realm(time_out=3))
         self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart')])
         task.send_key.assert_called_once()
 
     def test_unsubmitted_restart_and_closed_menu_are_not_new_realm_evidence(self):
         task = make_rechallenge_task(page='menu')
-        task.click.side_effect = ForegroundInputInterrupted('点击发出前中断')
+        task.click_box.side_effect = ForegroundInputInterrupted('点击发出前中断')
 
         def resume_to_old_cleared_realm():
             task._foreground_epoch += 1
@@ -265,13 +381,13 @@ class TestFarmEchoPickup(unittest.TestCase):
 
         task.wait_foreground_frame.side_effect = resume_to_old_cleared_realm
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [])
 
     def test_old_enemy_health_does_not_prove_an_interrupted_restart(self):
         task = make_rechallenge_task(page='arena')
         task.has_new_battle = True
-        task.click.side_effect = ForegroundInputInterrupted('点击发出前中断')
+        task.click_box.side_effect = ForegroundInputInterrupted('点击发出前中断')
 
         def resume_to_old_battle():
             task._foreground_epoch += 1
@@ -279,12 +395,12 @@ class TestFarmEchoPickup(unittest.TestCase):
 
         task.wait_foreground_frame.side_effect = resume_to_old_battle
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [('key', 'esc')])
 
     def test_recognition_resume_does_not_reuse_new_health_from_old_frame(self):
         task = make_rechallenge_task(page='won')
-        click = task.click.side_effect
+        click = task.click_box.side_effect
         health = task.check_health_bar.side_effect
 
         def interrupted_click(control, **kwargs):
@@ -299,18 +415,18 @@ class TestFarmEchoPickup(unittest.TestCase):
                 task.has_new_battle = False
             return found
 
-        task.click.side_effect = interrupted_click
+        task.click_box.side_effect = interrupted_click
         task.check_health_bar.side_effect = stale_health
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.4)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart')])
 
     def test_unconfirmed_restart_is_not_replayed_or_reported_successful(self):
         task = make_rechallenge_task(page='menu')
-        task.click.side_effect = ForegroundInputInterrupted()
+        task.click_box.side_effect = ForegroundInputInterrupted()
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
-        task.click.assert_called_once()
+            task._restart_echo_realm(time_out=3)
+        task.click_box.assert_called_once()
         task.send_key.assert_not_called()
 
     def test_background_hud_does_not_confirm_an_unrelated_dialog(self):
@@ -319,13 +435,13 @@ class TestFarmEchoPickup(unittest.TestCase):
         task.in_team_and_world.side_effect = None
         task.in_team_and_world.return_value = True
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [('click', 'restart')])
 
     def test_focus_after_confirmation_does_not_submit_twice(self):
         task = make_rechallenge_task(page='won')
         task.after_restart = 'confirm'
-        click = task.click.side_effect
+        click = task.click_box.side_effect
 
         def interrupted_confirmation(control, **kwargs):
             result = click(control, **kwargs)
@@ -333,7 +449,7 @@ class TestFarmEchoPickup(unittest.TestCase):
                 raise ForegroundInputInterrupted()
             return result
 
-        task.click.side_effect = interrupted_confirmation
+        task.click_box.side_effect = interrupted_confirmation
         self.assertTrue(task._restart_echo_realm())
         self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart'), ('click', 'confirm')])
         task.wait_foreground_frame.assert_called_once()
@@ -341,7 +457,7 @@ class TestFarmEchoPickup(unittest.TestCase):
     def test_unsubmitted_confirmation_cannot_reuse_restart_acknowledgement(self):
         task = make_rechallenge_task(page='won')
         task.after_restart = 'confirm'
-        click = task.click.side_effect
+        click = task.click_box.side_effect
 
         def interrupted_confirmation(control, **kwargs):
             if control is task.controls['confirm']:
@@ -352,10 +468,10 @@ class TestFarmEchoPickup(unittest.TestCase):
             task._foreground_epoch += 1
             task.page = 'won'
 
-        task.click.side_effect = interrupted_confirmation
+        task.click_box.side_effect = interrupted_confirmation
         task.wait_foreground_frame.side_effect = resume_to_old_cleared_realm
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.4)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [('key', 'esc'), ('click', 'restart')])
 
     def test_implicit_resume_after_click_preserves_submitted_stage(self):
@@ -364,7 +480,9 @@ class TestFarmEchoPickup(unittest.TestCase):
 
         def resumed_sleep(seconds):
             sleep(seconds)
-            task._foreground_epoch += 1
+            if ('click', 'restart') in task.actions:
+                task._foreground_epoch += 1
+                task.sleep.side_effect = sleep
 
         task.sleep.side_effect = resumed_sleep
         self.assertTrue(task._restart_echo_realm())
@@ -377,11 +495,13 @@ class TestFarmEchoPickup(unittest.TestCase):
 
         def resumed_sleep(seconds):
             sleep(seconds)
-            task._foreground_epoch += 1
+            if ('click', 'restart') in task.actions:
+                task._foreground_epoch += 1
+                task.sleep.side_effect = sleep
 
         task.sleep.side_effect = resumed_sleep
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
+            task._restart_echo_realm(time_out=3)
         self.assertEqual(task.actions, [('click', 'restart')])
 
     def test_skipped_click_does_not_acknowledge_a_restart(self):
@@ -391,10 +511,10 @@ class TestFarmEchoPickup(unittest.TestCase):
             task.page = 'won'
             return False
 
-        task.click.side_effect = skipped_click
+        task.click_box.side_effect = skipped_click
         with self.assertRaises(ForegroundInputError):
-            task._restart_echo_realm(time_out=0.3)
-        task.click.assert_called_once()
+            task._restart_echo_realm(time_out=3)
+        task.click_box.assert_called_once()
 
     def test_world_hud_after_restart_is_not_dungeon_success(self):
         task = make_rechallenge_task(page='menu')
@@ -407,10 +527,10 @@ class TestFarmEchoPickup(unittest.TestCase):
         for error in (TaskDisabledException(), ForegroundInputError('输入失败')):
             with self.subTest(error=type(error).__name__):
                 task = make_rechallenge_task(page='menu')
-                task.click.side_effect = error
+                task.click_box.side_effect = error
                 with self.assertRaises(type(error)):
                     task._restart_echo_realm()
-                task.click.assert_called_once()
+                task.click_box.assert_called_once()
                 task.wait_foreground_frame.assert_not_called()
 
     def test_focus_after_drop_count_continues_wait_without_replaying_combat_or_pickup(self):

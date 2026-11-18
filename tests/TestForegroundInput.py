@@ -250,6 +250,18 @@ class TestForegroundInput(InputFixture):
         self.assertFalse(self.native.calls)
         self.assertFalse(self.native.moves)
 
+    def test_缺少坐标不能中止其它会话的长按(self):
+        self.session.key_down('w')
+        other = self.core.session('另一拥有者', lambda: self.target)
+        held = dict(self.core._held)
+        before = list(self.native.inserted)
+        for invalid in (other.click, other.mouse_down):
+            with self.subTest(method=invalid.__name__), self.assertRaises(ValueError):
+                invalid(x=120)
+            self.assertEqual(self.core._held, held)
+            self.assertEqual(self.native.inserted, before)
+            self.assertIs(self.core._active, self.session)
+
     def test_失焦阻止新输入但仍释放本程序长按(self):
         self.session.key_down('w')
         self.native.foreground = 20
@@ -549,6 +561,50 @@ class TestForegroundLifecycle(InputFixture):
         self.task.on_foreground_resume = Mock()
         executor.current_task = self.task
         executor.onetime_tasks = [self.task]
+
+    def test_游戏定位后按下等待原版时长(self):
+        timeline = []
+        send = self.native.send
+        move = self.native.set_cursor_pos
+
+        def observe_send(events):
+            timeline.extend((self.clock(), '松开' if event.up else '按下') for event in events)
+            return send(events)
+
+        def observe_move(x, y):
+            timeline.append((self.clock(), '移动'))
+            move(x, y)
+
+        with patch.object(self.native, 'send', observe_send), patch.object(self.native, 'set_cursor_pos', observe_move):
+            # 有坐标的前台点击总会移动真实指针；没有坐标时保持原位直接按下。
+            for action, expected in (
+                (lambda: self.adapter.click(20, 40, move=False, down_time=.2),
+                 [(0, '移动'), (20, '按下'), (220, '松开')]),
+                (lambda: self.adapter.click(down_time=.01), [(0, '按下'), (10, '松开')]),
+                (lambda: (self.adapter.mouse_down(20, 40), self.adapter.mouse_up()),
+                 [(0, '移动'), (20, '按下'), (20, '松开')]),
+            ):
+                with self.subTest(expected=expected):
+                    timeline.clear()
+                    started = self.clock()
+                    action()
+                    self.assertEqual([(round((at - started) * 1000), name) for at, name in timeline], expected)
+        self.assertFalse(self.core._held)
+
+    def test_游戏定位后失焦或光标被移走不误点(self):
+        for key, action, interrupt in (
+                ('失焦', lambda: self.adapter.click(20, 40),
+                 lambda: setattr(self.native, 'foreground', 20)),
+                ('同窗口移动光标', lambda: self.adapter.mouse_down(20, 40),
+                 lambda: setattr(self.native, 'position', (0, 0)))):
+            with self.subTest(key=key):
+                self.native.foreground = 10
+                self.adapter.refresh_target(force=True)
+                self.clock.after_wait = interrupt
+                with self.assertRaises(ForegroundInputInterrupted):
+                    action()
+                self.assertFalse(self.native.inserted)
+                self.assertFalse(self.core._held)
 
     def _make_combat_task(self):
         from src.scene.WWScene import WWScene

@@ -386,6 +386,30 @@ class TestBackgroundInput(unittest.TestCase):
     def activations(self):
         return [event for event in self.native.attempts if event[1] == WM_ACTIVATE]
 
+    def test_后台点击的移入与按住时长独立且不补激活(self):
+        self.prepare()
+        timeline = []
+        self.native.after_post = lambda event: timeline.append((self.clock(), event[1:]))
+        # 4C 按钮要求移入；普通普攻只发送按下、松开。
+        for move, hold, expected in (
+                (True, .2, [(0, WM_MOUSEMOVE), (200, win32con.WM_LBUTTONDOWN), (400, win32con.WM_LBUTTONUP)]),
+                (False, .01, [(0, win32con.WM_LBUTTONDOWN), (10, win32con.WM_LBUTTONUP)])):
+            with self.subTest(move=move):
+                timeline.clear()
+                start = self.clock()
+                self.backend.click(50, 50, move=move, down_time=hold)
+                self.assertEqual([(round((at - start) * 1000), msg) for at, (msg, _, _) in timeline], expected)
+                self.assertEqual({point for _, (_, _, point) in timeline}, {(70 << 16) | 70})
+        self.assertEqual(len(self.activations()), 1)
+
+    def test_后台移入期间取消不会投递左键(self):
+        request = self.prepare()
+        self.clock.after_wait = request.cancel
+        with self.assertRaises(TaskDisabledException):
+            self.backend.click(50, 50, move=True, down_time=.2)
+        self.assertEqual([event[1] for event in self.native.messages], [WM_ACTIVATE, WM_MOUSEMOVE])
+        self.assertFalse(self.backend._held)
+
     def add_window(self, hwnd=11, *, parent=10, process_id=1, class_name='Button'):
         self.native.identities[hwnd] = WindowIdentity(hwnd, process_id, 100, 111, class_name)
         self.native.bounds[hwnd] = (-250, 80, -50, 280)

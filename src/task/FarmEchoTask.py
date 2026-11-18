@@ -14,14 +14,20 @@ from src.task.task_icons import task_icon
 
 logger = Logger.get_logger(__name__)
 
-# 只接受按钮本身的文字，不能把退出说明中的“重新挑战”当成点击目标。
+# 弹窗身份与落点分开：文字只能佐证当前菜单，实际点击沿用原版左侧按钮模板。
+_RECHALLENGE_BUTTON = 'claim_cancel_button_hcenter_vcenter'
 _RECHALLENGE_LABEL = re.compile(
-    r'\s*(?:重新挑战|重新挑戰|再次挑战|再次挑戰|Rechallenge|Restart\s*Challenge|Challenge\s*Again)\s*', re.I)
+    r'\s*(?:重新挑战|重新挑戰|再次挑战|再次挑戰|Rechallenge|Restart\s*Challenge|Challenge\s*Again'
+    r'|再挑戦|再チャレンジ|재도전|다시\s*도전|Reintentar)\s*', re.I)
+_OTHER_DIALOG_BUTTON = re.compile(
+    r'\s*(?:确认|確認|确定|確定|取消|退出|离开|離開|领取|領取|Confirm|OK|Cancel|Exit|Leave|Claim'
+    r'|キャンセル|退出する|취소|나가기|Cancelar|Salir)\s*', re.I)
 _RECHALLENGE_CONFIRM_PROMPT = re.compile(
     r'\s*(?:(?:是否|确认|確認|确定|確定)(?:要|进行|進行)?(?:重新挑战|重新挑戰|再次挑战|再次挑戰)'
     r'|Are you sure (?:you want )?to (?:restart|rechallenge)(?: (?:this|the) challenge)?'
     r'|Restart (?:this|the) challenge)[？?]?\s*', re.I)
 _RECHALLENGE_CONFIRM_LABEL = re.compile(r'\s*(?:确认|確認|确定|確定|Confirm|OK)\s*', re.I)
+_RECHALLENGE_MENU_PROMPT = re.compile(r'(?:确认离开|確認離開|Confirm(?:to)?(?:leave|exit))[？?。.]?', re.I)
 
 
 class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
@@ -263,25 +269,35 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                     else:
                         self.scroll_and_click_buttons()
 
-    def _find_echo_rechallenge_state(self):
+    def _find_echo_rechallenge_state(self, opened_epoch=None):
         """在同一前台代次内区分重挑战、专属确认和无弹窗的副本画面。"""
         epoch = getattr(self, '_foreground_epoch', 0)
-        texts = self.ocr()
-        restart = [box for box in texts if _RECHALLENGE_LABEL.fullmatch(box.name)]
-        confirm = [box for box in texts if _RECHALLENGE_CONFIRM_LABEL.fullmatch(box.name)]
-        question = any(_RECHALLENGE_CONFIRM_PROMPT.fullmatch(box.name) for box in texts)
-        dialog = self.find_one([
-            'claim_cancel_button_hcenter_vcenter',
-            'cancel_button_hcenter_vcenter', 'cancel_button_highlight_hcenter_vcenter',
-            'confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter',
-        ])
-        if question:
-            result = ('confirm', confirm[0]) if dialog and len(confirm) == 1 else ('unknown', None)
-        elif restart:
-            result = ('restart', restart[0]) if dialog and len(restart) == 1 else ('unknown', None)
-        elif dialog:
-            # 未识别的弹窗即使露出背景 HUD，也不能被当作副本加载完成。
+        button = self.find_one(_RECHALLENGE_BUTTON)
+        if button is not None or any(self.find_one(name) is not None for name in (
+                'cancel_button_hcenter_vcenter', 'cancel_button_highlight_hcenter_vcenter',
+                'confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter')):
+            # 已打开或中断恢复后出现的双按钮弹窗，外观相似不足以证明是重开或确认。
+            texts = self.ocr()
+            restart = [box for box in texts if _RECHALLENGE_LABEL.fullmatch(box.name)]
+            confirm = [box for box in texts if _RECHALLENGE_CONFIRM_LABEL.fullmatch(box.name)]
+            # 原图案是按钮左端，不是整个按钮。只在左侧同一行核对文字，避免把右侧选项当成重开。
+            left_labels = ([box for box in texts if button.y <= box.center()[1] < button.y + button.height
+                            and button.x <= box.center()[0] < self.width / 2] if button is not None else [])
             result = 'unknown', None
+            if any(_RECHALLENGE_CONFIRM_PROMPT.fullmatch(box.name) for box in texts):
+                if len(confirm) == 1 and confirm[0].center()[0] > self.width / 2:
+                    result = 'confirm', confirm[0]
+            elif (button is not None and len(restart) == 1 and restart[0] in left_labels
+                  and not any(_OTHER_DIALOG_BUTTON.fullmatch(box.name) for box in left_labels)):
+                result = 'restart', button
+            elif button is not None and opened_epoch == epoch and not left_labels and not restart:
+                # 刚按 Esc 且左侧文字漏读时才用原版图案兜底。若已读到不同题干，不能拿它当作重开菜单。
+                # 只看本帧弹窗中央，排除顶端「提示」和底部按钮；允许 OCR 把同一题干切成几个框。
+                question = ''.join(box.name for box in texts if .24 * self.width <= box.center()[0] <= .76 * self.width
+                                   and .34 * self.height <= box.center()[1] <= .56 * self.height)
+                question = ''.join(question.split())
+                if not question or _RECHALLENGE_MENU_PROMPT.fullmatch(question):
+                    result = 'restart', button
         elif self.in_world():
             result = 'world', None
         elif self._in_realm and self.in_team_and_world():
@@ -300,6 +316,9 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         completed_epoch = None
         opened_epoch = None
         cleared_realm_seen = False
+        stable_target = None
+        stable_epoch = None
+        stable_since = 0
 
         def fail(message):
             try:
@@ -320,11 +339,13 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
         while self.business_time() < deadline:
             try:
                 self.next_frame()
-                state, control = self._find_echo_rechallenge_state()
+                state, control = self._find_echo_rechallenge_state(opened_epoch if attempted is None else None)
                 epoch = getattr(self, '_foreground_epoch', 0)
                 remaining = deadline - self.business_time()
                 if remaining <= 0:
                     break
+                if state != 'restart':
+                    stable_target = None
                 if state == 'world':
                     fail('重新挑战过程中已返回大世界，无法确认副本重开，已停止刷取')
                 if state == 'realm':
@@ -336,15 +357,22 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                         cleared_realm_seen = cleared_realm_seen or not has_current_health()
                         if opened_epoch != epoch:
                             # Esc 被守卫提前中断时没有打开菜单；恢复后以新画面重新决定。
-                            opened = self.send_key('esc', after_sleep=0)
+                            opened = self.send_key('esc', after_sleep=0.5)
                             if opened is True and epoch == getattr(self, '_foreground_epoch', 0):
                                 opened_epoch = epoch
+                                continue
                 elif state == 'restart' and attempted is None:
-                    # 记录尝试以免重发；只有完整返回且代次未变，才记为本次调用已完成。
-                    attempted = 'restart'
-                    completed = self.click(control, after_sleep=0)
-                    if completed is True and epoch == getattr(self, '_foreground_epoch', 0):
-                        completed_epoch = epoch
+                    # 模板匹配有像素舍入误差；相对首帧明显移位、控件消失或失焦才重新计时，点击用最新框。
+                    target = (control.x, control.y, control.width, control.height)
+                    now = self.business_time()
+                    if (stable_target is None or stable_epoch != epoch or
+                            any(abs(current - first) > 2 for current, first in zip(target, stable_target))):
+                        stable_target, stable_epoch, stable_since = target, epoch, now
+                    elif now - stable_since >= 1:
+                        attempted = 'restart'
+                        completed = self.click_box(control.copy(name='重新挑战'), relative_x=2, move=True, after_sleep=0)
+                        if completed is True and epoch == getattr(self, '_foreground_epoch', 0):
+                            completed_epoch = epoch
                 elif state == 'confirm' and attempted == 'restart':
                     attempted = 'confirm'
                     completed_epoch = None
@@ -353,6 +381,7 @@ class FarmEchoTask(WWOneTimeTask, BaseCombatTask):
                         completed_epoch = epoch
                 self.sleep(min(0.1, max(0, deadline - self.business_time())))
             except ForegroundInputInterrupted:
+                stable_target = None
                 self.wait_foreground_frame()
         fail('无法确认副本重新挑战的按钮或完成结果，已停止刷取')
 

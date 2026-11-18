@@ -747,6 +747,8 @@ class PostMessageTestInteraction(BaseInteraction):
             target, screen, local = self._pointer_position(x, y)
             if move:
                 self._move_to(target, screen, local)
+                # 原版显式移入后先等一个按住时长，让控件处理移动消息，再投递按下。
+                self._sleep(duration)
             created = self._press(token, (('mouse', code, 0),), target, local)
             try:
                 self._sleep(duration)

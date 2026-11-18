@@ -19,8 +19,9 @@ class NonoInteraction(BaseInteraction):
     def __init__(self, capture: BaseCaptureMethod, hwnd_window):
         super().__init__(capture)
         self.hwnd_window = hwnd_window
+        # 原版前台在指定坐标移动真实鼠标后留 20 毫秒给控件响应；桌面通知不共用这个游戏节奏。
         self._input = get_shared_foreground_input().session(
-            ('game', id(self)), self._target, self._check_cancel)
+            ('game', id(self)), self._target, self._check_cancel, mouse_settle_time=0.02)
 
     def _target(self):
         target = self.hwnd_window.foreground_target
@@ -119,11 +120,7 @@ class NonoInteraction(BaseInteraction):
         return self._input.click(*self._point(x, y), key=key, down_time=down_time, move_back=move_back)
 
     def mouse_down(self, x=-1, y=-1, name=None, key='left'):
-        button = self.get_mouse_button(key)
-        abs_x, abs_y = self._point(x, y)
-        if abs_x is not None:
-            self._input.move(abs_x, abs_y)
-        return self._input.key_down(button)
+        return self._input.mouse_down(*self._point(x, y), key=key)
 
     def get_mouse_button(self, key):
         return {1: Button.left, 2: Button.right, 3: Button.middle,

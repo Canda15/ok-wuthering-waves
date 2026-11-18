@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/device/interaction_methods/foreground_input.py
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,759 @@
 +"""游戏和桌面通知共用的受检前台输入及持有状态。"""
 +
 +import ctypes
@@ -233,11 +233,12 @@
 +class ForegroundInputSession:
 +    """绑定一个拥有者；坐标为屏幕像素，全部时长为秒。"""
 +
-+    def __init__(self, core, owner, target_provider, cancel_check):
++    def __init__(self, core, owner, target_provider, cancel_check, mouse_settle_time=0):
 +        self.core = core
 +        self.owner = owner
 +        self.target_provider = target_provider
 +        self.cancel_check = cancel_check
++        self._mouse_settle_time = _seconds(mouse_settle_time)
 +        self._expected = None
 +        self._interrupted = None
 +        self._revision = 0
@@ -302,10 +303,13 @@
 +    def key_down(self, key):
 +        token, events = self.core._key(key)
 +        with self.core._operation(self) as target:
-+            hold = (self.owner, token)
-+            if hold not in self.core._logical_holds:
-+                self.core._press(self, target, events)
-+                self.core._logical_holds[hold] = events
++            self._hold(target, token, events)
++
++    def _hold(self, target, token, events):
++        hold = (self.owner, token)
++        if hold not in self.core._logical_holds:
++            self.core._press(self, target, events)
++            self.core._logical_holds[hold] = events
 +
 +    def key_up(self, key):
 +        token, events = self.core._key(key)
@@ -333,17 +337,39 @@
 +        with self.core._operation(self) as target:
 +            self.core._move(self, target, point)
 +
++    @staticmethod
++    def _press_point(x, y):
++        # 缺坐标不能先交接输入所有权，否则一次无效调用也会松开其它会话已按住的键。
++        if (x is None) != (y is None):
++            raise ValueError('点击坐标必须同时提供横坐标和纵坐标')
++        return None if x is None else (round(x), round(y))
++
++    def _move_before_press(self, target, point):
++        if point is None:
++            return
++        self.core._move(self, target, point)
++        if self._mouse_settle_time:
++            self.core._wait(self, target, self._mouse_settle_time)
++            # 用户可能在控件移入后挪动真实鼠标；即使仍在游戏里，也不能按到相邻按钮。
++            if self.core.native.cursor_pos() != point:
++                self.core._interrupt(self, '按下前光标已离开目标坐标，请重新识别')
++
++    def mouse_down(self, x=None, y=None, key='left'):
++        button = self.core._button(key)
++        point = self._press_point(x, y)
++        with self.core._operation(self) as target:
++            self._move_before_press(target, point)
++            self._hold(target, ('mouse', button.code), (button,))
++
 +    def click(self, x=None, y=None, key='left', down_time=0.01, move_back=False):
 +        down_time = _seconds(down_time)
 +        event = self.core._button(key)
-+        if (x is None) != (y is None):
-+            raise ValueError('点击坐标必须同时提供横坐标和纵坐标')
++        point = self._press_point(x, y)
 +        acquired = []
 +        with self.core._operation(self) as target:
 +            original = self.core.native.cursor_pos() if move_back else None
 +            try:
-+                if x is not None:
-+                    self.core._move(self, target, (round(x), round(y)))
++                self._move_before_press(target, point)
 +                acquired = self.core._press(self, target, (event,))
 +                self.core._wait(self, target, down_time)
 +            finally:
@@ -430,10 +456,10 @@
 +            self._monitor = threading.Thread(target=self._observe, name='ForegroundInput', daemon=True)
 +            self._monitor.start()
 +
-+    def session(self, owner, target_provider, cancel_check=None):
++    def session(self, owner, target_provider, cancel_check=None, *, mouse_settle_time=0):
 +        if owner is None:
 +            raise ValueError('前台输入必须指定拥有者')
-+        return ForegroundInputSession(self, owner, target_provider, cancel_check)
++        return ForegroundInputSession(self, owner, target_provider, cancel_check, mouse_settle_time)
 +
 +    def _valid(self, target):
 +        return (target.hwnd > 0 and self.native.is_window(target.hwnd)

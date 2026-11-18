@@ -145,7 +145,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/foreground_input.py.patch",
       "before_sha256": null,
-      "after_sha256": "d6429d5dc4a94dc5b2bdc5ee767698d44beb1787a1c49771b98b833c1567a817"
+      "after_sha256": "778a0b71c8ac71b26b49e128ce76bb0a8b49b20b412ebf76e84abeffa0154c29"
     },
     {
       "path": "device/interaction_methods/foreground_post_message.py",
@@ -177,7 +177,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/nono.py.patch",
       "before_sha256": null,
-      "after_sha256": "64808d1dfbc82dde5f7eab39b791ad709edec514688760e283d8d61690598532"
+      "after_sha256": "f7973b07cd54db3abcd205781f17b8f849dc5191e8d6d798a0e88786c30a6dee"
     },
     {
       "path": "device/interaction_methods/post_message.py",
@@ -193,7 +193,7 @@
       "format": "unified_diff",
       "payload": "patches/device/interaction_methods/post_message_test.py.patch",
       "before_sha256": null,
-      "after_sha256": "b966c9478041b32be00368ecb3229956492bd9673666c112769a2e26e17c0267"
+      "after_sha256": "9d3eb3fe84823efb7b378c526f4f66d68aeb7a8347219d9b300fdedc8d739b77"
     },
     {
       "path": "device/interaction_methods/pydirect.py",
