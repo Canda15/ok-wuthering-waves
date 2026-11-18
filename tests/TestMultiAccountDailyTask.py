@@ -4,7 +4,7 @@ import time
 from contextlib import nullcontext
 from ctypes import wintypes
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import src.task.MultiAccountDailyTask as multi_account_module
 from ok import og
@@ -13,7 +13,7 @@ from ok.device.interaction_methods.foreground_input import ForegroundInputError,
 from src.task.BaseWWTask import BaseWWTask, LOGIN_CLICK_SETTLE_TIME, LOGIN_TEXTS
 from src.task.MultiAccountConfigTask import MultiAccountConfigTask
 from src.task.DailyTask import (
-    ADDITIONAL_TASKS, CHECK_WEEKLY_GARDEN, MERGE_ECHO_IF_DISCARDED_OVER_1000,
+    ADDITIONAL_TASKS, AUTO_FARM_NIGHTMARE_NEST, CHECK_WEEKLY_GARDEN, MERGE_ECHO_IF_DISCARDED_OVER_1000,
     TELEPORT_AND_FARM_4C_ECHO, DailyTask,
 )
 from src.task.MultiAccountDailyTask import (
@@ -204,6 +204,37 @@ class TestMultiAccountDailyTask(unittest.TestCase):
         task.claim_battle_pass.assert_called_once()
         task.wait_foreground_frame.assert_called_once()
         self.assertEqual(task._daily_phase, 'completed')
+
+    def test_无梦魇且日活已满只打开一次日常页(self):
+        task = self.make_daily('prepare')
+        task.open_daily.return_value = (180, True)
+        task.get_task_by_class = Mock()
+        task._continue_daily()
+        task.open_daily.assert_called_once_with()
+        task.get_task_by_class.assert_not_called()
+        self.assertNotIn(call(4), task.sleep.call_args_list)
+
+    def test_梦魇结束或读数期间恢复须从新页决定是否花波片(self):
+        for event in ('梦魇', '失焦'):
+            with self.subTest(event=event):
+                task = self.make_daily('prepare')
+                task._foreground_epoch = 0
+                task.get_task_by_class = Mock()
+                task._farm_daily_nightmare = Mock()
+                if event == '梦魇':
+                    task.config[ADDITIONAL_TASKS] = [AUTO_FARM_NIGHTMARE_NEST]
+
+                def read():
+                    if task.open_daily.call_count == 1:
+                        if event == '失焦':
+                            task._foreground_epoch += 1
+                        return 60, False
+                    return 180, True
+                task.open_daily.side_effect = read
+                task._continue_daily()
+                self.assertEqual(task.open_daily.call_count, 2)
+                task.get_task_by_class.assert_not_called()
+                self.assertEqual(task._farm_daily_nightmare.call_count, int(event == '梦魇'))
 
     def test_daily_additional_focus_interruption_keeps_completed_task_index(self):
         task = self.make_daily('additional')

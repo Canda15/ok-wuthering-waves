@@ -92,28 +92,42 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
             return super().resume_after_foreground()
         return self._continue_daily()
 
+    def _read_daily_progress(self):
+        epoch = getattr(self, '_foreground_epoch', 0)
+        progress = self.open_daily()
+        if epoch != getattr(self, '_foreground_epoch', 0):
+            raise ForegroundInputInterrupted('读取日常进度时页面已变化')
+        return epoch, progress
+
     def _continue_daily(self):
         """阶段完成后才推进；恢复不能重新启动已完成的资源任务或附加任务。"""
         additional_tasks = self.config.get(ADDITIONAL_TASKS) or []
         condition1 = AUTO_FARM_NIGHTMARE_NEST in additional_tasks
         condition2 = self.config.get('Farm Nightmare Nest for Daily Echo')
+        progress = None
+        progress_epoch = None
         while self._daily_phase != 'completed':
             try:
                 if self._daily_phase == 'prepare':
                     self.ensure_main(time_out=180)
-                    _, daily_reward_ready = self.open_daily()
+                    progress_epoch, progress = self._read_daily_progress()
+                    _, daily_reward_ready = progress
                     self._daily_need_nightmare = condition1 or (
                         condition2 and not daily_reward_ready
                         and self.config.get('Which to Farm', self.support_tasks[0]) != self.support_tasks[0])
                     self._daily_phase = 'nightmare'
                 if self._daily_phase == 'nightmare':
                     if self._daily_need_nightmare:
+                        progress = None  # 梦魇可能完成日常目标，之后必须重新读数。
                         self._farm_daily_nightmare(condition1)
                     self._daily_phase = 'stamina'
                 if self._daily_phase == 'stamina':
-                    # 梦魇和登录期间日常进度可能变化，资源决策必须重新读取真实 UI。
-                    used_stamina, ready = self.open_daily()
-                    if not ready and used_stamina < 180:
+                    # 正常连续步骤复用刚读到的进度；恢复和梦魇之后不能用旧余额消费。
+                    if progress is None or progress_epoch != getattr(self, '_foreground_epoch', 0):
+                        progress_epoch, progress = self._read_daily_progress()
+                    used_stamina, ready = progress
+                    need_stamina = not ready and used_stamina < 180
+                    if need_stamina:
                         target = self.config.get('Which to Farm', self.support_tasks[0])
                         task_class, method = {
                             self.support_tasks[0]: (TacetTask, 'farm_tacet'),
@@ -125,7 +139,8 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
                         with self.executor.task_context(farm_task):
                             getattr(farm_task, method)(daily=True, used_stamina=used_stamina, config=self.config)
                     self._daily_phase = 'daily'
-                    self.sleep(4)
+                    if need_stamina:
+                        self.sleep(4)
                 if self._daily_phase == 'daily':
                     self.claim_daily()
                     self._daily_phase = 'mail'
@@ -140,6 +155,7 @@ class DailyTask(WWOneTimeTask, BaseCombatTask):
                     self.run_additional_tasks()
                     self._daily_phase = 'completed'
             except ForegroundInputInterrupted:
+                progress = None
                 self.wait_foreground_frame()
         self.log_info(self.tr('Daily Task Completed'), notify=True)
 
